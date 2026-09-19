@@ -24,15 +24,25 @@ use crate::{
 
 mod buddy;
 mod chat;
+#[cfg(all(test, feature = "sqlite"))]
+mod chat_command_tests;
 mod combat;
 mod egg;
 mod email;
 mod gm;
+#[cfg(test)]
+mod nano_acquisition_tests;
 mod group;
 mod item;
+#[cfg(test)]
+mod item_move_tests;
+#[cfg(test)]
+mod xdt_identity_tests;
 mod login;
 mod mission;
 mod nano;
+#[cfg(test)]
+mod nano_tune_tests;
 mod npc;
 mod pc;
 mod racing;

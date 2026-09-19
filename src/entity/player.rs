@@ -808,6 +808,13 @@ impl Player {
     }
 
     pub fn unlock_nano(&mut self, nano_id: i16) -> FFResult<&mut Nano> {
+        tdata_get().get_nano_stats(nano_id)?;
+        if nano_id <= 0 {
+            return Err(FFError::build(
+                Severity::Warning,
+                "Invalid Nano ID".to_string(),
+            ));
+        }
         if self.nano_data.nano_inventory.contains_key(&nano_id) {
             return Err(FFError::build(
                 Severity::Warning,
@@ -1465,6 +1472,14 @@ impl Player {
                     .get_mission_definition(level_up_task_def.mission_id)
                     .unwrap();
 
+                if self
+                    .mission_journal
+                    .is_mission_completed(level_up_task_def.mission_id)
+                    .unwrap_or(true)
+                {
+                    return self.fusion_matter;
+                }
+
                 log(
                     Severity::Info,
                     &format!(
@@ -1473,9 +1488,13 @@ impl Player {
                     ),
                 );
 
-                self.mission_journal
+                let started = self
+                    .mission_journal
                     .start_task(level_up_task_def.into(), self.level)
                     .unwrap();
+                if !started {
+                    return self.fusion_matter;
+                }
 
                 let pkt = sP_FE2CL_REP_PC_TASK_START_SUCC {
                     iTaskNum: level_up_task_id,

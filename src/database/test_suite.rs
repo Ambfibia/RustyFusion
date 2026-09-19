@@ -14,6 +14,7 @@ macro_rules! for_each_db_test {
         $macro!(test_player_init_load);
         $macro!(test_player_save_reload);
         $macro!(test_save_players_batch);
+        $macro!(test_equipment_reload);
         $macro!(test_player_appearance);
         $macro!(test_player_selected);
         $macro!(test_player_delete);
@@ -162,6 +163,44 @@ pub async fn test_player_save_reload<D: DbImpl>(db: &Database<D>) {
         12345,
         "taros should persist across save/load"
     );
+}
+
+/// Post-ITEM_MOVE slot contents (equip, inventory, bank) survive a reload
+/// with identity, stack count, appearance and expiry intact.
+pub async fn test_equipment_reload<D: DbImpl>(db: &Database<D>) {
+    use crate::{
+        defines::{EQUIP_SLOT_HAND_EX, EQUIP_SLOT_UPPERBODY},
+        enums::{ItemLocation, ItemType},
+        item::Item,
+    };
+    let acc = db.create_account("equipper", "h").await.unwrap();
+    let uid: i64 = 2003;
+    db.init_player(acc.id, &make_player(uid, 3)).await.unwrap();
+
+    let mut shirt = Item::new(ItemType::UpperBody, 2);
+    shirt.set_appearance(&Item::new(ItemType::UpperBody, 3));
+    shirt.set_expiry_time(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000));
+    let weapon = Item::new(ItemType::Hand, 1);
+    let mut stack = Item::new(ItemType::General, 1);
+    stack.quantity = 13;
+
+    let mut p = db.load_player(acc.id, uid).await.unwrap().unwrap();
+    let slots = [
+        (ItemLocation::Equip, EQUIP_SLOT_UPPERBODY as usize, Some(shirt)),
+        (ItemLocation::Equip, EQUIP_SLOT_HAND_EX as usize, Some(weapon)),
+        (ItemLocation::Inven, 0, None),
+        (ItemLocation::Inven, 4, Some(stack)),
+        (ItemLocation::Bank, 7, Some(stack)),
+    ];
+    for (loc, slot, item) in slots {
+        p.set_item(loc, slot, item).unwrap();
+    }
+    db.save_player(&p).await.expect("save_player");
+
+    let reloaded = db.load_player(acc.id, uid).await.unwrap().unwrap();
+    for (loc, slot, item) in slots {
+        assert_eq!(*reloaded.get_item(loc, slot).unwrap(), item, "{loc:?}/{slot}");
+    }
 }
 
 pub async fn test_save_players_batch<D: DbImpl>(db: &Database<D>) {

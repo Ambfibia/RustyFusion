@@ -36,7 +36,9 @@ mod postgresql;
 mod sqlite;
 
 #[cfg(test)]
-mod test_suite;
+pub(crate) mod test_suite;
+#[cfg(all(test, feature = "sqlite"))]
+mod nano_persistence_tests;
 
 type Int = i32;
 type BigInt = i64;
@@ -127,6 +129,13 @@ impl<D> Database<D> {
             disconnected: AtomicBool::new(false),
         }
     }
+}
+
+/// Opens an isolated SQLite file for tests outside this module.
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) async fn open_test_sqlite(db_path: &str) -> Database<sqlite::SqliteDatabase> {
+    let cfg = test_suite::build_config(db_path);
+    Database::new(sqlite::SqliteDatabase::connect(&cfg.general).await.unwrap())
 }
 
 /// Defines the `DbImpl` trait and generates a delegating implementation for `Database<D>`.

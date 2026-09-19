@@ -30,19 +30,34 @@ pub fn item_move(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState)
     let pc_id = client.get_player_id()?;
     let player = state.get_player_mut(pc_id)?;
 
-    let location_from = pkt.eFrom.try_into()?;
-    let location_to = pkt.eTo.try_into()?;
+    let location_from = movable_location(pkt.eFrom)?;
+    let location_to = movable_location(pkt.eTo)?;
     // make sure the client can't reach past the end of the bank
     validate_bank_slot(location_from, pkt.iFromSlotNum)?;
     validate_bank_slot(location_to, pkt.iToSlotNum)?;
+    let slot_from = slot_index(pkt.iFromSlotNum)?;
+    let slot_to = slot_index(pkt.iToSlotNum)?;
+    if player.trade_id.is_some() {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!("Player {} tried to move an item while trading", pc_id),
+        ));
+    }
 
-    let mut item_from = player.set_item(location_from, pkt.iFromSlotNum as usize, None)?;
-    let mut item_to = player.set_item(location_to, pkt.iToSlotNum as usize, None)?;
+    // Work on copies and validate the whole outcome before touching the live
+    // slots, so a rejected move can never leave either slot cleared.
+    let mut item_from = *player.get_item(location_from, slot_from)?;
+    let mut item_to = *player.get_item(location_to, slot_to)?;
+    let moved = (location_from, slot_from) != (location_to, slot_to);
+    if moved {
+        Item::transfer_items(&mut item_from, &mut item_to)?;
+        validate_equip_slot(location_from, slot_from, &item_from)?;
+        validate_equip_slot(location_to, slot_to, &item_to)?;
+        player.set_item(location_from, slot_from, item_from)?;
+        player.set_item(location_to, slot_to, item_to)?;
+    }
 
-    Item::transfer_items(&mut item_from, &mut item_to)?;
-    player.set_item(location_from, pkt.iFromSlotNum as usize, item_from)?;
-    player.set_item(location_to, pkt.iToSlotNum as usize, item_to)?;
-
+    // Each (location, slot, item) triple is that slot's post-move content.
     let resp = sP_FE2CL_PC_ITEM_MOVE_SUCC {
         eFrom: pkt.eFrom,
         iFromSlotNum: pkt.iFromSlotNum,
@@ -54,25 +69,26 @@ pub fn item_move(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState)
 
     client.send_packet(P_FE2CL_PC_ITEM_MOVE_SUCC, &resp);
 
-    let entity_id = player.get_id();
-    if location_from == ItemLocation::Equip {
-        state.entity_map.for_each_around(entity_id, |c| {
-            let pkt = sP_FE2CL_PC_EQUIP_CHANGE {
-                iPC_ID: pc_id,
-                iEquipSlotNum: pkt.iFromSlotNum,
-                EquipSlotItem: item_to.into_proto(),
-            };
-
-            c.send_packet(P_FE2CL_PC_EQUIP_CHANGE, &pkt);
-        });
+    if !moved {
+        return Ok(());
     }
 
+    // EQUIP_CHANGE carries what the equip slot holds now (OpenFusion sends
+    // the item that landed in the slot, never the one that left it).
+    let entity_id = player.get_id();
+    let mut equip_changes = Vec::with_capacity(2);
+    if location_from == ItemLocation::Equip {
+        equip_changes.push((pkt.iFromSlotNum, item_from));
+    }
     if location_to == ItemLocation::Equip {
+        equip_changes.push((pkt.iToSlotNum, item_to));
+    }
+    for (slot_num, item) in equip_changes {
         state.entity_map.for_each_around(entity_id, |c| {
             let pkt = sP_FE2CL_PC_EQUIP_CHANGE {
                 iPC_ID: pc_id,
-                iEquipSlotNum: pkt.iToSlotNum,
-                EquipSlotItem: item_from.into_proto(),
+                iEquipSlotNum: slot_num,
+                EquipSlotItem: item.into_proto(),
             };
 
             c.send_packet(P_FE2CL_PC_EQUIP_CHANGE, &pkt);
@@ -81,8 +97,8 @@ pub fn item_move(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState)
 
     // dismount vehicle
     let player = state.get_player_mut(pc_id).unwrap();
-    if ((location_from == ItemLocation::Equip && pkt.iFromSlotNum == EQUIP_SLOT_VEHICLE as i32)
-        || (location_to == ItemLocation::Equip && pkt.iToSlotNum == EQUIP_SLOT_VEHICLE as i32))
+    if ((location_from == ItemLocation::Equip && slot_from == EQUIP_SLOT_VEHICLE as usize)
+        || (location_to == ItemLocation::Equip && slot_to == EQUIP_SLOT_VEHICLE as usize))
         && player.vehicle_speed.is_some()
     {
         player.vehicle_speed = None;
@@ -93,6 +109,45 @@ pub fn item_move(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState)
             .send_packet(P_FE2CL_PC_VEHICLE_OFF_SUCC, &pkt);
     }
 
+    Ok(())
+}
+
+/// Item moves only address slot-indexed storage; quest items have no slots.
+fn movable_location(raw: i32) -> FFResult<ItemLocation> {
+    match raw.try_into()? {
+        ItemLocation::QInven => Err(FFError::build(
+            Severity::Warning,
+            "Quest inventory items can't be moved by slot".to_owned(),
+        )),
+        location => Ok(location),
+    }
+}
+
+fn slot_index(slot_num: i32) -> FFResult<usize> {
+    usize::try_from(slot_num)
+        .map_err(|_| FFError::build(Severity::Warning, format!("Bad slot number: {slot_num}")))
+}
+
+/// Mirrors OpenFusion's itemMoveHandler: slots 0-6 take their own item type,
+/// the secondary hand slot takes weapons and the vehicle slot takes vehicles.
+fn validate_equip_slot(location: ItemLocation, slot_num: usize, item: &Option<Item>) -> FFResult<()> {
+    let Some(item) = item else {
+        return Ok(());
+    };
+    if location != ItemLocation::Equip {
+        return Ok(());
+    }
+    let fits = match slot_num as u32 {
+        EQUIP_SLOT_HAND_EX => item.ty == ItemType::Hand,
+        EQUIP_SLOT_VEHICLE => item.ty == ItemType::Vehicle,
+        slot => item.ty as u32 == slot && slot <= EQUIP_SLOT_END,
+    };
+    if !fits {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!("Item {:?} can't be equipped in slot {}", item, slot_num),
+        ));
+    }
     Ok(())
 }
 

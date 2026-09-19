@@ -12,7 +12,10 @@ use crate::{
     util,
 };
 
-const CUSTOM_COMMAND_PREFIX: char = '!';
+/// FFOneClient forwards unrecognized `/` commands as FreeChat, matching the
+/// local OpenFusion `CMD_PREFIX`. `!` remains accepted for existing users.
+const CUSTOM_COMMAND_PREFIX: char = '/';
+const CUSTOM_COMMAND_PREFIXES: [char; 2] = [CUSTOM_COMMAND_PREFIX, '!'];
 
 pub async fn send_freechat_message(
     pkt: Packet,
@@ -23,7 +26,7 @@ pub async fn send_freechat_message(
 
     (async {
         let msg = util::parse_utf16(&pkt.szFreeChat)?;
-        if let Some(cmdstr) = msg.strip_prefix(CUSTOM_COMMAND_PREFIX) {
+        if let Some(cmdstr) = msg.strip_prefix(CUSTOM_COMMAND_PREFIXES) {
             let tokens = cmdstr.split_whitespace().collect::<Vec<_>>();
             if !tokens.is_empty() {
                 return commands::handle_custom_command(tokens, clients, state).await;
@@ -31,17 +34,6 @@ pub async fn send_freechat_message(
         }
 
         let client = clients.get_sender();
-        if msg.starts_with('/') {
-            return send_system_message(
-                client,
-                &format!(
-                    "You mistyped your built-in command!\n\
-                        Or if you meant to use a custom command, try {}help",
-                    CUSTOM_COMMAND_PREFIX
-                ),
-            );
-        }
-
         let pc_id = client.get_player_id()?;
         let player = state.get_player(pc_id)?;
         if player.freechat_muted {
@@ -551,8 +543,11 @@ mod commands {
 
     fn init_commands() -> HashMap<&'static str, Command> {
         #[rustfmt::skip]
-        let commands: [(&'static str, &'static str, CommandHandler); 15] = [
+        let commands: [(&'static str, &'static str, CommandHandler); 18] = [
             ("about", "Show information about the server", cmd_about),
+            ("level", "Change your character's level", cmd_level),
+            ("levelx", "Change your character's level", cmd_level), // for Academy
+            ("whois", "Describe the nearest NPC", cmd_whois),
             ("ban_a", "Ban an account", cmd_ban),
             ("ban_i", "Ban a player and their account", cmd_ban),
             ("unban", "Unban an account", cmd_unban),
@@ -627,6 +622,145 @@ mod commands {
                     LIB_VERSION, PROTOCOL_VERSION, DB_VERSION,
                 ),
             )
+        })
+    }
+
+    // OpenFusion registers /level, /levelx and /whois for accountLevel <= 50.
+    const NO_ACCESS: &str = "You don't have access to that command!";
+
+    fn cmd_level<'a>(
+        tokens: Vec<&'a str>,
+        clients: &'a ClientMap<'a>,
+        state: &'a mut ShardServerState,
+    ) -> Pin<Box<dyn Future<Output = FFResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let client = clients.get_sender();
+            let pc_id = client.get_player_id()?;
+            let player = state.get_player_mut(pc_id)?;
+            if player.perms > CN_ACCOUNT_LEVEL__DEVELOPER as i16 {
+                return send_system_message(client, NO_ACCESS);
+            }
+
+            let usage = format!(
+                "Usage: {}{} <level 1-{}>",
+                CUSTOM_COMMAND_PREFIX, tokens[0], PC_LEVEL_MAX
+            );
+            let Some(arg) = tokens.get(1) else {
+                return send_system_message(
+                    client,
+                    &format!(
+                        "{}{}: no level specified\n{}",
+                        CUSTOM_COMMAND_PREFIX, tokens[0], usage
+                    ),
+                );
+            };
+            if tokens.len() > 2 {
+                return send_system_message(client, &usage);
+            }
+            // OpenFusion echoes out-of-range levels to accountLevel <= 30
+            // without storing them; reject instead so client and server agree.
+            let level = match arg.parse::<i16>() {
+                Ok(level) if (1..=PC_LEVEL_MAX as i16).contains(&level) => level,
+                Ok(_) => {
+                    return send_system_message(
+                        client,
+                        &format!("Level out of range [1, {}]", PC_LEVEL_MAX),
+                    )
+                }
+                Err(_) => {
+                    return send_system_message(
+                        client,
+                        &format!("Invalid level: {}\n{}", arg, usage),
+                    )
+                }
+            };
+
+            let old_level = player.get_level();
+            // Max HP/FM limits are read from the level's stats row; Nanos are
+            // a separate contract and are not granted here.
+            let new_level = player.set_level(level)?;
+            log(
+                Severity::Info,
+                &format!(
+                    "{} changed level {} -> {} via command",
+                    player, old_level, new_level
+                ),
+            );
+
+            let resp = sP_FE2CL_REP_PC_CHANGE_LEVEL {
+                iPC_ID: pc_id,
+                iPC_Level: new_level,
+            };
+            // Includes the sender, who is always in its own view.
+            state
+                .entity_map
+                .for_each_around(EntityID::Player(pc_id), |c| {
+                    c.send_packet(P_FE2CL_REP_PC_CHANGE_LEVEL, &resp)
+                });
+            send_system_message(
+                client,
+                &format!("Level changed from {} to {}", old_level, new_level),
+            )
+        })
+    }
+
+    fn cmd_whois<'a>(
+        _tokens: Vec<&'a str>,
+        clients: &'a ClientMap<'a>,
+        state: &'a mut ShardServerState,
+    ) -> Pin<Box<dyn Future<Output = FFResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let client = clients.get_sender();
+            let pc_id = client.get_player_id()?;
+            let player = state.get_player(pc_id)?;
+            if player.perms > CN_ACCOUNT_LEVEL__DEVELOPER as i16 {
+                return send_system_message(client, NO_ACCESS);
+            }
+
+            // Like OpenFusion's NPCManager::getNearestNPC: every NPC in the
+            // player's view, by 3D distance, with no interaction-range cap.
+            let player_pos = player.get_position();
+            let nearest = state
+                .entity_map
+                .get_around_entity(EntityID::Player(pc_id))
+                .into_iter()
+                .filter_map(|eid| match eid {
+                    EntityID::NPC(npc_id) => state.get_npc(npc_id).ok(),
+                    _ => None,
+                })
+                .min_by_key(|npc| (player_pos.distance_to(&npc.get_position()), npc.id));
+            let Some(npc) = nearest else {
+                return send_system_message(client, "[WHOIS] No NPCs found nearby");
+            };
+
+            let pos = npc.get_position();
+            let chunk = npc.get_chunk_coords();
+            let lines = [
+                format!("ID: {}", npc.id),
+                format!("Type: {}", npc.ty),
+                format!("Name: {}", npc.get_name()),
+                format!("HP: {}", npc.get_hp()),
+                "EntityType: NPC".to_string(),
+                format!("X: {}", pos.x),
+                format!("Y: {}", pos.y),
+                format!("Z: {}", pos.z),
+                format!("Angle: {}", npc.get_rotation()),
+                format!("Chunk: {{{}, {}}}", chunk.x, chunk.y),
+                format!("MapNum: {}", chunk.i.map_num),
+                format!(
+                    "Instance: {}",
+                    chunk
+                        .i
+                        .instance_num
+                        .map_or("None".to_string(), |i| i.to_string())
+                ),
+                format!("Channel: {}", chunk.i.channel_num),
+                format!("Distance: {}", player_pos.distance_to(&pos)),
+            ];
+            for line in lines {
+                send_system_message(client, &format!("[WHOIS] {}", line))?;
+            }
+            Ok(())
         })
     }
 

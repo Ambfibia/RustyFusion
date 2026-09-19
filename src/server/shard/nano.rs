@@ -1,6 +1,6 @@
 use crate::{
     defines::*,
-    entity::{Combatant, Entity, EntityID},
+    entity::{Combatant, Entity, EntityID, Player},
     enums::*,
     error::*,
     item::Item,
@@ -12,25 +12,30 @@ use crate::{
     tabledata::tdata_get,
 };
 
+/// Staff may use nano station actions anywhere; everyone else must stand at one.
+fn at_nano_station(state: &ShardServerState, player: &Player) -> bool {
+    player.perms as u32 <= CN_ACCOUNT_LEVEL__DEVELOPER
+        || !state
+            .entity_map
+            .find_npcs(|npc| {
+                npc.ty == TYPE_NANO_MACHINE
+                    && npc.get_position().distance_to(&player.get_position()) <= RANGE_INTERACT
+                    && npc.instance_id == player.instance_id
+            })
+            .is_empty()
+}
+
 pub fn nano_equip(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) -> FFResult<()> {
     let client = clients.get_sender();
     let pc_id = client.get_player_id()?;
     let pkt: &sP_CL2FE_REQ_NANO_EQUIP = pkt.get()?;
 
     let player = state.get_player(pc_id)?;
-    if player.perms as u32 > CN_ACCOUNT_LEVEL__DEVELOPER {
-        // check for nano station
-        let nano_station_ids = state.entity_map.find_npcs(|npc| {
-            npc.ty == TYPE_NANO_MACHINE
-                && npc.get_position().distance_to(&player.get_position()) <= RANGE_INTERACT
-                && npc.instance_id == player.instance_id
-        });
-        if nano_station_ids.is_empty() {
-            return Err(FFError::build(
-                Severity::Warning,
-                format!("{} tried to equip a nano without a nano station", player),
-            ));
-        }
+    if !at_nano_station(state, player) {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!("{} tried to equip a nano without a nano station", player),
+        ));
     }
 
     let player = state.get_player_mut(pc_id)?;
@@ -191,9 +196,44 @@ pub fn nano_tune(pkt: Packet, client: &FFClient, state: &mut ShardServerState) -
     let pkt: &sP_CL2FE_REQ_NANO_TUNE = pkt.get()?;
     let pc_id = client.get_player_id()?;
     (|| {
-        let player = state.get_player_mut(pc_id)?;
+        // The client sends the row's tune number; the tuning row names the
+        // skill it grants (OpenFusion Nanos.cpp setNanoSkill).
         let tuning = tdata_get().get_nano_tuning(pkt.iTuneID)?;
+        if !tdata_get()
+            .get_nano_stats(pkt.iNanoID)?
+            .tunes
+            .contains(&pkt.iTuneID)
+        {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Tune {} doesn't belong to nano {}", pkt.iTuneID, pkt.iNanoID),
+            ));
+        }
         let skill_id = tuning.skill_id;
+
+        let player = state.get_player(pc_id)?;
+        let current_skill = player
+            .get_nano(pkt.iNanoID)
+            .ok_or(FFError::build(
+                Severity::Warning,
+                format!("Player does not have nano {}", pkt.iNanoID),
+            ))?
+            .selected_skill;
+        // also absorbs a repeated request, which would otherwise pay again
+        if current_skill == Some(skill_id) {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Nano {} already has skill {}", pkt.iNanoID, skill_id),
+            ));
+        }
+        // the first tuning is free; changing a skill is a nano station service
+        let free = current_skill.is_none();
+        if !free && !at_nano_station(state, player) {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("{} tried to retune a nano without a nano station", player),
+            ));
+        }
 
         // check for + consume tuning items
         let mut item_slots = [-1; 10];
@@ -201,23 +241,16 @@ pub fn nano_tune(pkt: Packet, client: &FFClient, state: &mut ShardServerState) -
         let mut quantity_left = tuning.req_item_quantity;
 
         let mut player_working = player.clone();
-        if player_working
-            .get_nano(pkt.iNanoID)
-            .ok_or(FFError::build(
-                Severity::Warning,
-                format!("Player does not have nano {}", pkt.iNanoID),
-            ))?
-            .selected_skill
-            .is_some()
-        {
-            // existing skill = not free. consume items
+        if !free {
             for (i, slot_num) in pkt.aiNeedItemSlotNum.iter().enumerate() {
                 if quantity_left == 0 {
                     break;
                 }
 
                 let slot = player_working.get_item_mut(ItemLocation::Inven, *slot_num as usize)?;
-                if slot.is_some_and(|stack| stack.id == tuning.req_item_id) {
+                if slot.is_some_and(|stack| {
+                    stack.ty == ItemType::General && stack.id == tuning.req_item_id
+                }) {
                     let removed = Item::split_items(slot, quantity_left);
                     quantity_left -= removed.unwrap().quantity;
                     item_slots[i] = *slot_num;
@@ -236,25 +269,59 @@ pub fn nano_tune(pkt: Packet, client: &FFClient, state: &mut ShardServerState) -
                 ));
             }
 
-            // consume FM
-            if player_working.get_fusion_matter() < tuning.fusion_matter_cost {
+            // consume FM; the price follows the player's level, not the tune
+            let fm_cost = tdata_get()
+                .get_player_stats(player_working.get_level())?
+                .req_fm_nano_tune;
+            if player_working.get_fusion_matter() < fm_cost {
                 return Err(FFError::build(
                     Severity::Warning,
                     format!(
                         "Not enough fusion matter to tune nano {} ({} < {})",
                         pkt.iNanoID,
                         player_working.get_fusion_matter(),
-                        tuning.fusion_matter_cost
+                        fm_cost
                     ),
                 ));
             }
-            player_working
-                .set_fusion_matter(player_working.get_fusion_matter() - tuning.fusion_matter_cost);
+            player_working.set_fusion_matter(player_working.get_fusion_matter() - fm_cost);
         }
 
+        // Recall a nano whose skill changes, or its old passive buff would
+        // outlive it (OpenFusion unsummons it before retuning).
+        let recalled = player_working
+            .get_active_nano()
+            .is_some_and(|nano| nano.get_id() == pkt.iNanoID);
+        if recalled {
+            player_working.deactivate_nano();
+        }
         player_working.tune_nano(pkt.iNanoID, Some(skill_id))?;
+        let player = state.get_player_mut(pc_id)?;
         *player = player_working; // commit changes
 
+        if recalled {
+            let condition_bit_flag = player.get_condition_bit_flag();
+            client.send_packet(
+                P_FE2CL_REP_NANO_ACTIVE_SUCC,
+                &sP_FE2CL_REP_NANO_ACTIVE_SUCC {
+                    iActiveNanoSlotNum: NANO_SLOT_NONE,
+                    eCSTB___Add: 0,
+                },
+            );
+            let bcast = sP_FE2CL_NANO_ACTIVE {
+                iPC_ID: pc_id,
+                Nano: None.into_proto(),
+                iConditionBitFlag: condition_bit_flag,
+                eCSTB___Add: 0,
+            };
+            state
+                .entity_map
+                .for_each_around(EntityID::Player(pc_id), |c| {
+                    c.send_packet(P_FE2CL_NANO_ACTIVE, &bcast);
+                });
+        }
+
+        let player = state.get_player(pc_id)?;
         let resp = sP_FE2CL_REP_NANO_TUNE_SUCC {
             iNanoID: pkt.iNanoID,
             iSkillID: skill_id,

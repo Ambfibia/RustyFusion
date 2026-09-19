@@ -1,7 +1,4 @@
-use std::{
-    cmp::max,
-    time::{Duration, SystemTime},
-};
+use std::time::{Duration, SystemTime};
 
 use crate::{
     chunk::{InstanceID, TickMode},
@@ -118,14 +115,24 @@ pub fn gm_pc_give_nano(
     state: &mut ShardServerState,
 ) -> FFResult<()> {
     let pkt: &sP_CL2FE_REQ_PC_GIVE_NANO = pkt.get()?;
-
+    // 0104 NANO_CREATE_FAIL: 0 = other failure, 1 = unknown ID, 2 = owned.
+    let mut error_code = 0;
     (|| {
         let client = clients.get_sender();
         let pc_id = helpers::validate_perms(client, state, CN_ACCOUNT_LEVEL__DEVELOPER as i16)?;
         let nano_id = pkt.iNanoID;
         let player = state.get_player_mut(pc_id)?;
-        let new_level = max(player.get_level(), nano_id);
-        player.set_level(new_level)?;
+        if nano_id <= 0 || tdata_get().get_nano_stats(nano_id).is_err() {
+            error_code = 1;
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Unknown Nano ID {}", nano_id),
+            ));
+        }
+        if player.get_nano(nano_id).is_some() {
+            error_code = 2;
+        }
+        let new_level = player.get_level();
         let fusion_matter = player.get_fusion_matter();
         let nano = player.unlock_nano(nano_id)?;
 
@@ -139,23 +146,13 @@ pub fn gm_pc_give_nano(
 
         client.send_packet(P_FE2CL_REP_PC_NANO_CREATE_SUCC, &resp);
 
-        let bcast = sP_FE2CL_REP_PC_CHANGE_LEVEL {
-            iPC_ID: pc_id,
-            iPC_Level: new_level,
-        };
-
-        state
-            .entity_map
-            .for_each_around(EntityID::Player(pc_id), |c| {
-                c.send_packet(P_FE2CL_REP_PC_CHANGE_LEVEL, &bcast);
-            });
         Ok(())
     })()
     .catch_fail(|| {
         let client = clients.get_sender();
         let resp = sP_FE2CL_REP_PC_NANO_CREATE_FAIL {
             iPC_ID: client.get_player_id().unwrap(),
-            iErrorCode: unused!(),
+            iErrorCode: error_code,
         };
 
         client.send_packet(P_FE2CL_REP_PC_NANO_CREATE_FAIL, &resp);

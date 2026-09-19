@@ -98,7 +98,10 @@ impl Item {
         }
 
         let max_stack_size = to_stack.get_stats()?.max_stack_size;
-        let num_to_move = min(max_stack_size - to_stack.quantity, from_stack.quantity);
+        let num_to_move = min(
+            max_stack_size.saturating_sub(to_stack.quantity),
+            from_stack.quantity,
+        );
         to_stack.quantity += num_to_move;
         from_stack.quantity -= num_to_move;
         if from_stack.quantity == 0 {

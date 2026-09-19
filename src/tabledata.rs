@@ -5,7 +5,7 @@ use rand::{rngs::ThreadRng, thread_rng, Rng};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::OnceLock,
     time::{Duration, SystemTime},
 };
@@ -67,7 +67,27 @@ impl XDTData {
                 .map_err(|e| format!("Error loading player data: {}", e))?,
             npc_data: load_npc_data(&root).map_err(|e| format!("Error loading NPC data: {}", e))?,
         })
+        .and_then(|data| {
+            validate_nano_skills(&data.nano_data, &data.skill_data)
+                .map_err(|e| format!("Error validating nano data: {}", e))?;
+            Ok(data)
+        })
     }
+}
+
+/// Every tune a nano offers must grant a skill the XDT defines.
+fn validate_nano_skills(nano_data: &NanoData, skill_data: &SkillData) -> Result<(), String> {
+    for (nano_id, stats) in &nano_data.nano_stats {
+        for (tune, skill) in stats.tunes.iter().zip(stats.skills) {
+            if !skill_data.defined.contains(&skill) {
+                return Err(format!(
+                    "Nano {} tune {} grants skill {} which doesn't exist",
+                    nano_id, tune, skill
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -158,6 +178,8 @@ struct NanoData {
 
 struct SkillData {
     skills: HashMap<i16, Skill>,
+    /// Every skill ID the XDT defines, including types the server can't run.
+    defined: HashSet<i16>,
 }
 
 struct MissionData {
@@ -1415,56 +1437,10 @@ fn load_instance_data(root: &Map<String, Value>) -> Result<InstanceData, String>
 fn load_nano_data(root: &Map<String, Value>) -> Result<NanoData, String> {
     const NANO_TABLE_KEY: &str = "m_pNanoTable";
 
-    fn load_stats(table: &Map<String, Value>) -> Result<HashMap<i16, NanoStats>, String> {
-        const NANO_TABLE_NANO_DATA_KEY: &str = "m_pNanoData";
-
-        #[derive(Debug, Deserialize)]
-        struct NanoStatsEntry {
-            m_iNanoNumber: i32,
-            m_iNanoName: i32,
-            m_iComment: i32,
-            m_iNanoBattery1: i32,
-            m_iNanoBattery2: i32,
-            m_iNanoBattery3: i32,
-            m_iNanoDrain: i32,
-            m_iBatteryRecharge: i32,
-            m_iStyle: i32,
-            m_iNanoSet: i32,
-            m_iPower: i32,
-            m_iAccuracy: i32,
-            m_iProtection: i32,
-            m_iDodge: i32,
-            m_iNeedQItemID: i32,
-            m_iNeedFusionMatterCnt: i32,
-            m_iTune: [i16; 3],
-            m_iMesh: i32,
-            m_iIcon1: i32,
-            m_iEffect1: i32,
-            m_iSound: i32,
-        }
-
-        let nano_data = get_array(table, NANO_TABLE_NANO_DATA_KEY)?;
-        let mut nano_table = HashMap::new();
-        for v in nano_data {
-            let nano_data_entry: NanoStatsEntry = serde_json::from_value(v.clone())
-                .map_err(|e| format!("Malformed nano data entry: {} {}", e, v))?;
-            let key = nano_data_entry.m_iNanoNumber as i16;
-            if key == 0 {
-                continue;
-            }
-            let nano_data_entry = NanoStats {
-                style: nano_data_entry
-                    .m_iStyle
-                    .try_into()
-                    .map_err(|e: FFError| e.get_msg().to_string())?,
-                skills: nano_data_entry.m_iTune,
-            };
-            nano_table.insert(key, nano_data_entry);
-        }
-        Ok(nano_table)
-    }
-
-    pub fn load_tunings(table: &Map<String, Value>) -> Result<HashMap<i16, NanoTuning>, String> {
+    // Tuning rows in table order. `m_iTune` selects a row, while the client
+    // sends that row's `m_iTuneNumber`; extended XDTs make them differ
+    // (OpenFusion TableData.cpp, "m_iTune selects an array row").
+    fn load_tuning_rows(table: &Map<String, Value>) -> Result<Vec<(i16, NanoTuning)>, String> {
         const NANO_TABLE_NANO_TUNE_DATA_KEY: &str = "m_pNanoTuneData";
 
         #[derive(Debug, Deserialize)]
@@ -1476,30 +1452,103 @@ fn load_nano_data(root: &Map<String, Value>) -> Result<NanoData, String> {
             m_iSkillID: i32,
         }
 
-        let nano_tuning = get_array(table, NANO_TABLE_NANO_TUNE_DATA_KEY)?;
+        get_array(table, NANO_TABLE_NANO_TUNE_DATA_KEY)?
+            .into_iter()
+            .enumerate()
+            .map(|(row, v)| {
+                let entry: NanoTuningEntry = serde_json::from_value(v.clone())
+                    .map_err(|e| format!("Malformed nano tuning entry: {} {}", e, v))?;
+                let out_of_range = || format!("Nano tuning row {} exceeds i16 IDs: {}", row, v);
+                Ok((
+                    i16::try_from(entry.m_iTuneNumber).map_err(|_| out_of_range())?,
+                    NanoTuning {
+                        fusion_matter_cost: entry.m_iReqFusionMatter as u32,
+                        req_item_id: entry.m_iReqItemID as i16,
+                        req_item_quantity: entry.m_iReqItemCount as u16,
+                        skill_id: i16::try_from(entry.m_iSkillID).map_err(|_| out_of_range())?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn load_stats(
+        table: &Map<String, Value>,
+        tuning_rows: &[(i16, NanoTuning)],
+    ) -> Result<HashMap<i16, NanoStats>, String> {
+        const NANO_TABLE_NANO_DATA_KEY: &str = "m_pNanoData";
+
+        #[derive(Debug, Deserialize)]
+        struct NanoStatsEntry {
+            m_iNanoNumber: i32,
+            m_iStyle: i32,
+            m_iTune: [i32; SIZEOF_NANO_SKILLS],
+        }
+
+        let nano_data = get_array(table, NANO_TABLE_NANO_DATA_KEY)?;
+        let mut nano_table = HashMap::new();
+        for (row, v) in nano_data.into_iter().enumerate() {
+            let entry: NanoStatsEntry = serde_json::from_value(v.clone())
+                .map_err(|e| format!("Malformed nano data entry: {} {}", e, v))?;
+            // number 0 marks an empty or retired slot
+            if entry.m_iNanoNumber == 0 {
+                continue;
+            }
+            let key = i16::try_from(entry.m_iNanoNumber)
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or(format!("Nano row {} has invalid ID {}", row, entry.m_iNanoNumber))?;
+
+            let mut tunes = [0; SIZEOF_NANO_SKILLS];
+            let mut skills = [0; SIZEOF_NANO_SKILLS];
+            for (i, &tune_row) in entry.m_iTune.iter().enumerate() {
+                let (tune_number, tuning) = usize::try_from(tune_row)
+                    .ok()
+                    .and_then(|r| tuning_rows.get(r))
+                    .filter(|(tune_number, _)| *tune_number > 0)
+                    .ok_or(format!(
+                        "Nano {} selects tuning row {} which doesn't exist",
+                        key, tune_row
+                    ))?;
+                tunes[i] = *tune_number;
+                skills[i] = tuning.skill_id;
+            }
+
+            let stats = NanoStats {
+                style: entry
+                    .m_iStyle
+                    .try_into()
+                    .map_err(|e: FFError| e.get_msg().to_string())?,
+                tunes,
+                skills,
+            };
+            if nano_table.insert(key, stats).is_some() {
+                return Err(format!("Duplicate nano ID {} at row {}", key, row));
+            }
+        }
+        Ok(nano_table)
+    }
+
+    fn index_tunings(
+        tuning_rows: Vec<(i16, NanoTuning)>,
+    ) -> Result<HashMap<i16, NanoTuning>, String> {
         let mut nano_tuning_table = HashMap::new();
-        for v in nano_tuning {
-            let nano_tuning_entry: NanoTuningEntry = serde_json::from_value(v.clone())
-                .map_err(|e| format!("Malformed nano tuning entry: {} {}", e, v))?;
-            let key = nano_tuning_entry.m_iTuneNumber as i16;
+        for (row, (key, tuning)) in tuning_rows.into_iter().enumerate() {
             if key == 0 {
                 continue;
             }
-            let nano_tuning_entry = NanoTuning {
-                fusion_matter_cost: nano_tuning_entry.m_iReqFusionMatter as u32,
-                req_item_id: nano_tuning_entry.m_iReqItemID as i16,
-                req_item_quantity: nano_tuning_entry.m_iReqItemCount as u16,
-                skill_id: nano_tuning_entry.m_iSkillID as i16,
-            };
-            nano_tuning_table.insert(key, nano_tuning_entry);
+            if nano_tuning_table.insert(key, tuning).is_some() {
+                return Err(format!("Duplicate nano tuning number {} at row {}", key, row));
+            }
         }
         Ok(nano_tuning_table)
     }
 
     let table = get_object(root, NANO_TABLE_KEY)?;
+    let tuning_rows = load_tuning_rows(table)?;
     Ok(NanoData {
-        nano_stats: load_stats(table)?,
-        nano_tunings: load_tunings(table)?,
+        nano_stats: load_stats(table, &tuning_rows)?,
+        nano_tunings: index_tunings(tuning_rows)?,
     })
 }
 
@@ -1543,14 +1592,29 @@ fn load_skill_data(root: &Map<String, Value>) -> Result<SkillData, String> {
     let table = get_object(root, SKILL_TABLE_KEY)?;
     let skill_data = get_array(table, SKILL_TABLE_SKILL_DATA_KEY)?;
     let mut skill_table = HashMap::new();
+    let mut skill_rows: HashMap<i32, &Value> = HashMap::new();
+    let mut defined = HashSet::new();
     for v in skill_data {
         let skill_data_entry: SkillDataEntry = serde_json::from_value(v.clone())
             .map_err(|e| format!("Malformed skill data entry: {} {}", e, v))?;
 
-        let key = skill_data_entry.m_iSkillNumber as i16;
-        if key == 0 {
+        if skill_data_entry.m_iSkillNumber == 0 {
             continue;
         }
+        // extended XDTs repeat some skills verbatim at later rows; only a
+        // conflicting redefinition is an error
+        if let Some(first) = skill_rows.insert(skill_data_entry.m_iSkillNumber, v) {
+            if first != v {
+                return Err(format!(
+                    "Conflicting definitions for skill {}",
+                    skill_data_entry.m_iSkillNumber
+                ));
+            }
+            continue;
+        }
+        let key = i16::try_from(skill_data_entry.m_iSkillNumber)
+            .map_err(|_| format!("Skill ID {} exceeds i16", skill_data_entry.m_iSkillNumber))?;
+        defined.insert(key);
 
         let Ok(skill_type) = skill_data_entry.m_iSkillType.try_into() else {
             continue;
@@ -1582,6 +1646,7 @@ fn load_skill_data(root: &Map<String, Value>) -> Result<SkillData, String> {
     }
     Ok(SkillData {
         skills: skill_table,
+        defined,
     })
 }
 
@@ -2033,7 +2098,9 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
             name: npc_string_entry.m_strName,
         };
 
-        npc_data_table.insert(key, npc_data);
+        if npc_data_table.insert(key, npc_data).is_some() {
+            return Err(format!("Duplicate NPC type {}", key));
+        }
     }
 
     Ok(npc_data_table)
@@ -2532,5 +2599,151 @@ mod tests {
     #[test]
     fn test_load() {
         tdata_init().expect("Failed to load tabledata");
+    }
+
+    fn nano_root(nanos: Value, tunes: Value) -> Map<String, Value> {
+        let root = serde_json::json!({
+            "m_pNanoTable": { "m_pNanoData": nanos, "m_pNanoTuneData": tunes }
+        });
+        root.as_object().unwrap().clone()
+    }
+
+    fn tune(number: i32, skill: i32) -> Value {
+        serde_json::json!({
+            "m_iTuneNumber": number, "m_iReqFusionMatter": 100,
+            "m_iReqItemID": 37, "m_iReqItemCount": 5, "m_iSkillID": skill
+        })
+    }
+
+    fn nano(number: i32, tune_rows: [i32; 3]) -> Value {
+        serde_json::json!({ "m_iNanoNumber": number, "m_iStyle": 0, "m_iTune": tune_rows })
+    }
+
+    #[test]
+    fn nano_tune_rows_resolve_to_tune_numbers_and_skills() {
+        // row 3 carries tune number 7, as in extended XDTs
+        let tunes = serde_json::json!([tune(0, 0), tune(1, 1), tune(2, 13), tune(7, 122)]);
+        let root = nano_root(
+            serde_json::json!([nano(0, [0, 0, 0]), nano(5, [1, 2, 3]), nano(0, [0, 0, 0])]),
+            tunes,
+        );
+        let data = load_nano_data(&root).unwrap();
+        let stats = &data.nano_stats[&5];
+        assert_eq!(stats.tunes, [1, 2, 7]);
+        assert_eq!(stats.skills, [1, 13, 122]);
+        assert_eq!(data.nano_stats.len(), 1, "empty slots must not load");
+        assert_eq!(data.nano_tunings[&7].skill_id, 122);
+    }
+
+    #[test]
+    fn nano_table_rejects_broken_references_and_duplicates() {
+        let tunes = || serde_json::json!([tune(0, 0), tune(1, 1), tune(2, 2)]);
+        let err = |root: Map<String, Value>| load_nano_data(&root).err().unwrap();
+
+        let missing_row = nano_root(serde_json::json!([nano(5, [1, 2, 9])]), tunes());
+        assert!(err(missing_row).contains("Nano 5 selects tuning row 9"));
+
+        let empty_row = nano_root(serde_json::json!([nano(5, [0, 1, 2])]), tunes());
+        assert!(err(empty_row).contains("tuning row 0"));
+
+        let dup_nano = nano_root(
+            serde_json::json!([nano(5, [1, 1, 1]), nano(5, [2, 2, 2])]),
+            tunes(),
+        );
+        assert!(err(dup_nano).contains("Duplicate nano ID 5"));
+
+        // the collapse the bundled table had before T02: rows 1 and 2 both claim tune 1
+        let dup_tune = nano_root(
+            serde_json::json!([nano(5, [1, 1, 1])]),
+            serde_json::json!([tune(0, 0), tune(1, 1), tune(1, 2)]),
+        );
+        assert!(err(dup_tune).contains("Duplicate nano tuning number 1"));
+    }
+
+    #[test]
+    fn nano_skills_must_exist() {
+        let root = nano_root(
+            serde_json::json!([nano(5, [1, 1, 1])]),
+            serde_json::json!([tune(0, 0), tune(1, 122)]),
+        );
+        let nano_data = load_nano_data(&root).unwrap();
+        let skill_data = SkillData {
+            skills: HashMap::new(),
+            defined: HashSet::new(),
+        };
+        let e = validate_nano_skills(&nano_data, &skill_data).unwrap_err();
+        assert!(e.contains("grants skill 122 which doesn't exist"), "{e}");
+    }
+
+    #[test]
+    fn skill_table_tolerates_only_identical_duplicates() {
+        let skill = |number: i32, cool_time: i32| {
+            serde_json::json!({
+                "m_iSkillNumber": number, "m_iSkillType": 1, "m_iEffectTarget": 1,
+                "m_iEffectType": 1, "m_iTargetType": 1, "m_iValueA_Type": 0,
+                "m_iValueA": [0, 0, 0, 0], "m_iValueB_Type": 0, "m_iValueB": [0, 0, 0, 0],
+                "m_iValueC_Type": 0, "m_iValueC": [0, 0, 0, 0], "m_iEffectRange": 0,
+                "m_iEffectAngle": 0, "m_iEffectArea": 0, "m_iCoolTime": cool_time,
+                "m_iTargetNumber": 1, "m_iBatteryDrainType": 1,
+                "m_iBatteryDrainUse": [0, 0, 0, 0], "m_iInitialTime": 0,
+                "m_iDeleverTime": 0, "m_iDelayTime": 0, "m_iDurationTime": [0, 0, 0, 0],
+                "m_iDBType": 0, "m_iIcon": 0, "m_iEffect": 0, "m_iTargetEffect": 0,
+                "m_iBuffEffect": 0, "m_iSound": 0, "m_iCoolType": 0
+            })
+        };
+        let root = |rows: Value| {
+            serde_json::json!({ "m_pSkillTable": { "m_pSkillData": rows } })
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        let same = load_skill_data(&root(serde_json::json!([skill(13, 5), skill(13, 5)])));
+        assert!(same.unwrap().skills.contains_key(&13));
+        let conflict = load_skill_data(&root(serde_json::json!([skill(13, 5), skill(13, 6)])));
+        assert!(conflict.err().unwrap().contains("Conflicting definitions for skill 13"));
+    }
+
+    /// Accepted native identities (FusionForge accepted-native-identities.json
+    /// and the 20260913/20260915 Nano publications) as served by the bundled
+    /// tabledata. Server-side definitions only; services and placements are
+    /// covered elsewhere.
+    #[test]
+    fn bundled_tabledata_has_accepted_npc_and_nano_identities() {
+        let tdata = tdata_init().expect("Failed to load tabledata");
+
+        // Omniverse variants 3464-3468 and Retrobution rows remapped 3430-3450 -> 3469-3489
+        for ty in 3464..=3489 {
+            tdata.get_npc_stats(ty).unwrap();
+        }
+        assert_eq!(tdata.get_npc_stats(3470).unwrap().service_category, 28);
+        assert_eq!(tdata.get_npc_name(3470).unwrap(), "Уборщик Джонни");
+        // pre-existing identities keep their numbers
+        assert_eq!(tdata.get_npc_name(3463).unwrap(), "Otto");
+        let e = tdata.get_npc_stats(3490).err().unwrap();
+        assert_eq!(e.get_msg(), "NPC stats for type 3490 don't exist");
+
+        // Unstable Nano 41: tunes 288-290, all granting skill 122
+        let unstable = tdata.get_nano_stats(41).unwrap();
+        assert_eq!(unstable.tunes, [288, 289, 290]);
+        assert_eq!(unstable.skills, [122; 3]);
+        tdata.get_skill(122).unwrap();
+        // Coop keeps its powers under 67; Ben/Ghostfreak/Upgrade share 285-287
+        assert_eq!(tdata.get_nano_stats(67).unwrap().tunes, [210, 211, 212]);
+        for id in 68..=70 {
+            assert_eq!(tdata.get_nano_stats(id).unwrap().tunes, [285, 286, 287]);
+        }
+        // Flapjack/Johnny Bravo active; Johnny Bravo tunes 201-203 reuse skills 13/4/22
+        tdata.get_nano_stats(37).unwrap();
+        assert_eq!(tdata.get_nano_stats(38).unwrap().skills, [13, 4, 22]);
+        // retired alias 52 is an empty slot, Van Kleiss 66 survives
+        assert!(tdata.get_nano_stats(52).is_err());
+        tdata.get_nano_stats(66).unwrap();
+        assert_eq!(tdata.get_nano_book_size(), 71);
+
+        // tune numbers are unique, so rows past 110 no longer collapse onto tune 1
+        for tune in 111..=290 {
+            tdata.get_nano_tuning(tune).unwrap();
+        }
+        assert_eq!(tdata.get_nano_tuning(1).unwrap().skill_id, 1);
     }
 }

@@ -59,7 +59,9 @@ placements with RustyFusion's different dataset to hide the failure.
 
 RustyFusion's JSON loader also still has `TODO patching`; OpenFusion has a patch
 application path. Patch behavior must be accounted for when preparing the
-effective server dataset.
+effective server dataset. As of T02 (2026-09-19) neither OpenFusion `bin/` nor
+`tdata/` enables patches (`patchdir`/`enabledpatches` are commented out and no
+patch folder exists), so the effective OpenFusion XDT is `bin/tdata/xdt.json`.
 
 ### 2. Bundled content is different
 
@@ -67,15 +69,18 @@ Counts below are source rows, not supported-feature counts:
 
 | Dataset | Current OpenFusion `bin/tdata` | RustyFusion `tabledata` |
 | --- | ---: | ---: |
-| Nano data rows | 71 | 48 |
-| Nano tuning rows | 291 | 109 |
+| Nano data rows | 71 | 71 (48 before T02) |
+| Nano tuning rows | 291 | 291 (228 rows / 134 distinct numbers before T02) |
+| NPC type rows | 3490 | 3490 (3464 before T02) |
 | NPC placements | 3013 | 2807 |
 | Mob placements | 6862 | 9032 |
 | Mob groups | 385 | 784 |
 | NPC path entries | 7 | 104 |
 
-OpenFusion Nano IDs missing from RustyFusion's source rows:
-`41–46, 48–51, 53–70`. Shared IDs `1–38` also have differing row values.
+T02 transferred the accepted NPC 3464–3489 (incl. barber 3470), Nano 37/38/41/
+48–70 (52 is the retired empty slot), tune 111–290 identities and skills 228–286
+from `bin/tdata` into RustyFusion's XDT, with RU text from FFOneClient `ru.json`.
+Mesh/icon rows (client-native assets) and item tables were not transferred.
 Do not interpret the extra rows on either side as automatically approved content.
 The `drops.json` files match byte-for-byte. `eggs.json` differs in formatting but
 its parsed JSON values match. XDT, NPCs, mobs and paths differ semantically.
@@ -104,12 +109,12 @@ OpenFusion's `src/servers/CNLoginServer.cpp` and sent by FFOne.
 
 ### 4. Nano behavior is not equivalent
 
-- OpenFusion treats `m_iTune` as **tuning IDs**, validates the requested tuning
-  against the Nano's list, then maps through `m_iSkillID`. RustyFusion stores
-  `m_iTune` in `NanoStats.skills` and compares the resolved **skill ID** to that
-  list in `Player::tune_nano`. This fails when tuning IDs and skill IDs differ,
-  as allowed by our content contract. The deployed XDT contains 58 such Nano/tune
-  associations; e.g. Nano 38 maps tuning 201 to skill 13.
+- Resolved in T02: RustyFusion now follows OpenFusion's contract. `m_iTune`
+  selects tuning rows, `NanoStats.tunes` holds their `m_iTuneNumber` (validated
+  against the request in `nano_tune`) and `NanoStats.skills` their `m_iSkillID`
+  (validated in `Player::tune_nano`); e.g. Nano 38 maps tuning 201 to skill 13.
+  Loading rejects duplicate Nano/tune/NPC numbers, conflicting skill rows and
+  tunes whose row or skill doesn't exist.
 - Preserve the owner's distinction: some Nano acquisition paths advance a
   level, while other quest/item rewards are gated by level without advancing
   progression. Do not remove all Nano level-ups. Our OpenFusion explicitly
@@ -120,9 +125,14 @@ OpenFusion's `src/servers/CNLoginServer.cpp` and sent by FFOne.
   `max(current_level, nano_id)` in **both** `gm_pc_give_nano` and Nano mission
   completion, and the latter always subtracts the growth FM cost. Migrate the
   acquisition-path distinction and prerequisites, not a global level-up policy.
-- Paid tuning uses the current AvatarGrowth level's cost in our OpenFusion,
-  whereas RustyFusion uses the tuning row's cost. Free first tuning is present
-  in both, but that alone does not establish tuning parity.
+- Resolved in T04: a paid retune charges the current level's
+  `AvatarGrowth.m_iReqBlob_NanoTune` FM (as `Nanos.cpp::setNanoSkill`) plus the
+  tune row's general items, all-or-nothing; the first tuning stays free.
+  Retuning the active Nano recalls it first, as OpenFusion does. Deliberately
+  stricter than OpenFusion: missing items or item slots fail instead of
+  tuning for free, a retune needs a nano station, and re-selecting the
+  current skill is rejected so a repeated request cannot pay twice.
+  FFOneClient's station has no retune UI yet; only free first tuning is sent.
 - RustyFusion's `pc_regen` still uses `todo!()` for `HereByPhoenix` and
   `HereByPhoenixGroup`. Our OpenFusion handles both revive modes. A matching
   packet ID does not make those paths usable; they currently panic.

@@ -145,6 +145,10 @@ impl FromProto<Option<&Nano>> for sNano {
 #[derive(Debug)]
 pub struct NanoStats {
     pub style: CombatStyle,
+    /// Tune numbers the client may request for this nano (`m_iTuneNumber` of
+    /// the rows selected by `m_iTune`).
+    pub tunes: [i16; SIZEOF_NANO_SKILLS],
+    /// Skill IDs those tunes grant, in the same order.
     pub skills: [i16; SIZEOF_NANO_SKILLS],
 }
 

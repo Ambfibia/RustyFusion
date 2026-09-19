@@ -59,6 +59,21 @@ pub struct TaskDefinition {
     pub barks: Vec<i32>,                   // m_iHBarkerTextID
 }
 
+impl TaskDefinition {
+    /// OpenFusion Missions::isGrowthNanoMission: identify the mission through
+    /// AvatarGrowth's starting task, never through its reward Nano's ID.
+    pub fn is_growth_nano_mission(&self) -> bool {
+        (1..36).any(|level| {
+            tdata_get()
+                .get_player_stats(level)
+                .ok()
+                .and_then(|stats| stats.nano_quest_task_id)
+                .and_then(|id| tdata_get().get_task_definition(id).ok())
+                .is_some_and(|start| start.mission_id == self.mission_id)
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Task {
     task_id: i32,
@@ -287,9 +302,12 @@ impl MissionJournal {
 
     pub fn start_task(&mut self, task: Task, player_level: i16) -> FFResult<bool> {
         let mission_def = task.get_mission_def();
+        if self.is_mission_completed(mission_def.mission_id)? {
+            return Ok(false);
+        }
 
         // Ensure correct nano mission
-        if mission_def.mission_type == MissionType::Nano {
+        if task.get_task_def().is_growth_nano_mission() {
             let expected_mission_id = tdata_get()
                 .get_player_stats(player_level)
                 .expect("Player loads with valid level")

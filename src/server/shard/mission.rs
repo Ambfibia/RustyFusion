@@ -341,6 +341,60 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
 
         let task_def = task.get_task_def();
 
+        if task.completed
+            || player
+                .mission_journal
+                .is_mission_completed(task_def.mission_id)?
+        {
+            return Err(FFError::build(
+                Severity::Warning,
+                "Task reward already committed".to_string(),
+            ));
+        }
+
+        // Validate the acquisition before committing items, rewards or completed flags.
+        // A Nano previously obtained by GM does not skip this mission's progression.
+        let nano_progression = if task_def.succ_task_id.is_none() {
+            if let Some(nano_id) = task_def.succ_nano_id {
+                tdata_get().get_nano_stats(nano_id)?;
+                if nano_id <= 0
+                    || task_def
+                        .prereq_level
+                        .is_some_and(|min| player.get_level() < min)
+                {
+                    return Err(FFError::build(
+                        Severity::Warning,
+                        "Nano reward prerequisites not met".to_string(),
+                    ));
+                }
+                if task_def.is_growth_nano_mission() {
+                    let stats = tdata_get().get_player_stats(player.get_level())?;
+                    let current_mission = stats
+                        .nano_quest_task_id
+                        .and_then(|id| tdata_get().get_task_definition(id).ok())
+                        .map(|start| start.mission_id);
+                    if current_mission != Some(task_def.mission_id)
+                        || player.get_fusion_matter() < stats.req_fm_nano_create
+                        || player.get_level() >= 36
+                    {
+                        return Err(FFError::build(
+                            Severity::Warning,
+                            "Growth Nano prerequisites not met".to_string(),
+                        ));
+                    }
+                    let next_level = player.get_level() + 1;
+                    tdata_get().get_player_stats(next_level)?;
+                    Some((next_level, stats.req_fm_nano_create))
+                } else {
+                    Some((player.get_level(), 0))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // check target npc type + proximity
         if let Some(target_npc_type) = task_def.obj_npc_type {
             let target_npc_id = pkt.iNPC_ID;
@@ -489,7 +543,7 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
 
             for (qitem_id, qitem_count_mod) in &task_def.succ_qitems {
                 let curr_count = player.get_quest_item_count(*qitem_id) as isize;
-                let new_count = (curr_count + *qitem_count_mod) as usize;
+                let new_count = (curr_count + *qitem_count_mod).max(0) as usize;
                 let qitem_slot = player.set_quest_item_count(*qitem_id, new_count).unwrap();
                 qitem_pkt.push(&sItemReward {
                     sItem: sItemBase {
@@ -572,41 +626,40 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
                 ),
             );
             if let Some(nano_id) = task_def.succ_nano_id {
-                let player_stats = tdata_get().get_player_stats(player.get_level()).unwrap();
-                match player.unlock_nano(nano_id).cloned() {
-                    Ok(nano) => {
-                        player.set_fusion_matter(
-                            player.get_fusion_matter() - player_stats.req_fm_nano_create,
-                        );
-                        let new_level = std::cmp::max(player.get_level(), nano_id);
-                        let resp = sP_FE2CL_REP_PC_NANO_CREATE_SUCC {
-                            iPC_FusionMatter: player.get_fusion_matter() as i32,
-                            iQuestItemSlotNum: -1,
-                            QuestItem: None.into_proto(),
-                            Nano: Some(&nano).into_proto(),
-                            iPC_Level: match player.set_level(new_level) {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    log_error(e);
-                                    player.get_level()
-                                }
-                            },
-                        };
-                        clients
-                            .get_sender()
-                            .send_packet(P_FE2CL_REP_PC_NANO_CREATE_SUCC, &resp);
+                let nano = match player.get_nano(nano_id).cloned() {
+                    Some(nano) => nano,
+                    None => player
+                        .unlock_nano(nano_id)
+                        .expect("Nano reward validated")
+                        .clone(),
+                };
+                let (new_level, fm_cost) = nano_progression.expect("Nano progression validated");
+                let old_level = player.get_level();
+                // FM can auto-start the next mission: publish the completed flag and
+                // new level first so it cannot resurrect the mission just finished.
+                player.set_level(new_level).expect("Growth level validated");
+                player.set_fusion_matter(player.get_fusion_matter() - fm_cost);
+                let resp = sP_FE2CL_REP_PC_NANO_CREATE_SUCC {
+                    iPC_FusionMatter: player.get_fusion_matter() as i32,
+                    iQuestItemSlotNum: -1,
+                    QuestItem: None.into_proto(),
+                    Nano: Some(&nano).into_proto(),
+                    iPC_Level: new_level,
+                };
+                clients
+                    .get_sender()
+                    .send_packet(P_FE2CL_REP_PC_NANO_CREATE_SUCC, &resp);
 
-                        let bcast = sP_FE2CL_REP_PC_CHANGE_LEVEL {
-                            iPC_ID: pc_id,
-                            iPC_Level: new_level,
-                        };
-                        state
-                            .entity_map
-                            .for_each_around(EntityID::Player(pc_id), |c| {
-                                c.send_packet(P_FE2CL_REP_PC_CHANGE_LEVEL, &bcast)
-                            });
-                    }
-                    Err(e) => log_error(e),
+                if new_level != old_level {
+                    let bcast = sP_FE2CL_REP_PC_CHANGE_LEVEL {
+                        iPC_ID: pc_id,
+                        iPC_Level: new_level,
+                    };
+                    state
+                        .entity_map
+                        .for_each_around(EntityID::Player(pc_id), |c| {
+                            c.send_packet(P_FE2CL_REP_PC_CHANGE_LEVEL, &bcast)
+                        });
                 }
             }
         }
