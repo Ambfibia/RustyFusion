@@ -52,6 +52,12 @@ pub struct NPC {
     buffs: BuffContainer,
 }
 impl NPC {
+    /// The NPC table's `m_iPower`, with no flat bonus. OpenFusion's
+    /// `Combat::npcAttackPc` hits players with exactly this value.
+    pub fn get_table_power(&self) -> i32 {
+        tdata_get().get_npc_stats(self.ty).unwrap().power
+    }
+
     pub fn new(
         id: i32,
         ty: i32,
@@ -415,10 +421,11 @@ impl Combatant for NPC {
         self.buffs.has_buff(buff_id, buff_type)
     }
 
+    // Only NPC-vs-NPC fights (escorts, friendly fighters) use this. Mobs hitting
+    // players use the bare table power; see `NPC::get_table_power`.
     fn get_single_power(&self) -> i32 {
         const NPC_BASE_POWER: i32 = 450;
-        let stats = tdata_get().get_npc_stats(self.ty).unwrap();
-        NPC_BASE_POWER + stats.power
+        NPC_BASE_POWER + self.get_table_power()
     }
 
     fn get_multi_power(&self) -> i32 {

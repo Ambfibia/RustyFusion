@@ -586,6 +586,18 @@ pub fn do_basic_attack(
         attack_style: attacker.get_style(),
         charged,
     };
+    // OpenFusion Combat::npcAttackPc: a mob hits a player with its table power
+    // alone, no weapon boost, no nano-style RPS and no difficulty term. A flat
+    // power bonus overwhelms low-level players (level-2 power 198 became 648).
+    let npc_vs_player_attack = match attacker_id {
+        EntityID::NPC(npc_id) => Some(BasicAttack {
+            power: state.get_npc(npc_id)?.get_table_power(),
+            crit_chance: Some(CRIT_CHANCE),
+            attack_style: None,
+            charged: false,
+        }),
+        _ => None,
+    };
 
     let mut pc_attack_results = Vec::new();
     let mut npc_attack_results = Vec::new();
@@ -607,7 +619,12 @@ pub fn do_basic_attack(
             );
             continue;
         }
-        let result = handle_basic_attack(attacker_id, target, &basic_attack);
+        let result = match (&npc_vs_player_attack, target_id) {
+            (Some(attack), EntityID::Player(_)) => {
+                handle_basic_attack(attacker_id, target, attack, Some(0))
+            }
+            _ => handle_basic_attack(attacker_id, target, &basic_attack, None),
+        };
         match target_id {
             EntityID::Player(_) => pc_attack_results.push(result),
             EntityID::NPC(_) => npc_attack_results.push(result),
@@ -899,19 +916,38 @@ pub fn apply_skill_buff(
     Ok(buff_id)
 }
 
+/// Random inputs to one damage roll, split out so tests can pin them.
+#[derive(Debug, Clone, Copy)]
+struct DamageRolls {
+    /// Variance in whole percent, 0..40 (OpenFusion `Rand::rand(40)`).
+    variance: i32,
+    crit: bool,
+}
+
+impl DamageRolls {
+    fn roll(crit_chance: Option<f32>) -> Self {
+        let mut rng = rand::thread_rng();
+        Self {
+            variance: rng.gen_range(0..40),
+            crit: crit_chance.is_some_and(|chance| rng.gen::<f32>() < chance),
+        }
+    }
+}
+
+/// OpenFusion `getDamage`, 1:1. `difficulty` is the level term that eats into
+/// damage when defense outweighs power.
 fn calculate_damage(
     attack: &BasicAttack,
     defense: i32,
     defense_style: Option<CombatStyle>,
-    defense_level: i16,
+    difficulty: i16,
+    rolls: DamageRolls,
 ) -> (i32, bool) {
-    // this formula is taken basically 1:1 from OpenFusion
-    let mut rng = rand::thread_rng();
     let BasicAttack {
         power: attack,
-        crit_chance,
         attack_style,
         charged,
+        ..
     } = attack;
 
     // base damage + variability
@@ -922,9 +958,9 @@ fn calculate_damage(
     let mut damage = attack * attack / (attack + defense);
     damage = std::cmp::max(
         10 + attack / 10,
-        damage - (defense - attack / 6) * defense_level as i32 / 100,
+        damage - (defense - attack / 6) * difficulty as i32 / 100,
     );
-    damage = (damage as f32 * (rng.gen_range(0.8..1.2))) as i32;
+    damage = damage * (rolls.variance + 80) / 100;
 
     // rock-paper-scissors
     let rps = do_rps(attack_style, &defense_style);
@@ -944,26 +980,25 @@ fn calculate_damage(
     }
 
     // crit
-    let crit = match crit_chance {
-        Some(crit_chance) => rng.gen::<f32>() < *crit_chance,
-        None => false,
-    };
-    if crit {
+    if rolls.crit {
         damage *= 2;
     }
 
-    (damage, crit)
+    (damage, rolls.crit)
 }
 
+/// `difficulty` overrides the default level term (the target's level).
 fn handle_basic_attack(
     from: EntityID,
     to: &mut dyn Combatant,
     attack: &BasicAttack,
+    difficulty: Option<i16>,
 ) -> sAttackResult {
     let defense = to.get_defense();
     let defense_style = to.get_style();
-    let defense_level = to.get_level();
-    let (damage, crit) = calculate_damage(attack, defense, defense_style, defense_level);
+    let difficulty = difficulty.unwrap_or_else(|| to.get_level());
+    let rolls = DamageRolls::roll(attack.crit_chance);
+    let (damage, crit) = calculate_damage(attack, defense, defense_style, difficulty, rolls);
     let dealt = to.take_damage(damage, Some(from));
 
     let mut hit_flag = HF_BIT_NORMAL as i8;
@@ -1328,3 +1363,7 @@ fn do_rps(us: &Option<CombatStyle>, them: &Option<CombatStyle>) -> RpsResult {
         },
     }
 }
+
+#[cfg(test)]
+#[path = "skills_damage_tests.rs"]
+mod damage_tests;

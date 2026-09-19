@@ -2154,7 +2154,8 @@ impl Combatant for Player {
     }
 
     fn get_defense(&self) -> i32 {
-        let base_defense = self.level as i32 * 2 + 16;
+        // OpenFusion Items::setItemStats
+        let base_defense = self.level as i32 * 4 + 16;
         let mut total_from_armor = 0;
         for item in self.get_equipped().iter().flatten() {
             total_from_armor += item.get_stats().unwrap().defense.unwrap_or(0);
