@@ -21,6 +21,7 @@ use crate::{
     mission::{MissionDefinition, TaskDefinition},
     nano::{NanoStats, NanoTuning},
     path::{Path, PathPoint},
+    racing::RaceData,
     skills::Skill,
     util, Position,
 };
@@ -132,6 +133,7 @@ pub struct WarpData {
 pub struct MapData {
     pub ep_id: Option<u32>,
     pub map_square: (i32, i32),
+    pub max_score: i32,
 }
 
 pub struct WorldNameData {
@@ -187,6 +189,7 @@ struct PlayerData {
 
 #[derive(Debug)]
 pub struct NPCStats {
+    pub service_category: i32,
     pub team: CombatantTeam,
     pub style: CombatStyle,
     pub level: i16,
@@ -298,6 +301,7 @@ struct EggData {
 }
 
 struct DropData {
+    race_data: HashMap<i32, RaceData>,
     crate_drop_chances: HashMap<i32, CrateDropChance>,
     crate_drop_types: HashMap<i32, CrateDropType>,
     crate_data: HashMap<i32, CrateData>,
@@ -441,6 +445,18 @@ impl TableData {
             ))
     }
 
+    /// How many entries the client's nano book needs to hold, i.e. one past
+    /// the highest nano ID the XDT defines.
+    pub fn get_nano_book_size(&self) -> usize {
+        self.xdt_data
+            .nano_data
+            .nano_stats
+            .keys()
+            .max()
+            .map_or(0, |max_id| *max_id as usize + 1)
+            .max(SIZEOF_NANO_BANK_SLOT as usize)
+    }
+
     pub fn get_nano_tuning(&self, tuning_id: i16) -> FFResult<&NanoTuning> {
         self.xdt_data
             .nano_data
@@ -461,6 +477,14 @@ impl TableData {
                 Severity::Warning,
                 format!("Skill with id {} doesn't exist", skill_id),
             ))
+    }
+
+    /// Race configuration for an Infected Zone, keyed by its EP id.
+    pub fn get_race_data(&self, ep_id: i32) -> FFResult<&RaceData> {
+        self.drop_data.race_data.get(&ep_id).ok_or(FFError::build(
+            Severity::Warning,
+            format!("Race data for EP {} doesn't exist", ep_id),
+        ))
     }
 
     pub fn get_map_data(&self, map_num: u32) -> FFResult<&MapData> {
@@ -953,6 +977,18 @@ fn get_object<'a>(
         })
 }
 
+fn get_table_values<'a>(
+    root: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Vec<&'a Value>, String> {
+    match root.get(key) {
+        Some(Value::Object(table)) => Ok(table.values().collect()),
+        Some(Value::Array(table)) => Ok(table.iter().collect()),
+        Some(_) => Err(format!("Value is not an object or array: {}", key)),
+        None => Err(format!("Key missing: {}", key)),
+    }
+}
+
 fn get_array<'a>(
     root: &'a Map<String, Value>,
     key: &'static str,
@@ -1067,6 +1103,11 @@ fn load_item_data(
                 gender: data.m_iReqSex.map(|v| v as i8),
                 single_power: data.m_iPointRat,
                 multi_power: data.m_iGroupRat,
+                target_mode: match data.m_iTargetMode {
+                    Some(v) => Some(v.try_into().map_err(|e: FFError| e.get_msg().to_string())?),
+                    None => None,
+                },
+                projectile_time: data.m_iDeliverTime.map(|v| Duration::from_millis(v as u64)),
                 defense: data.m_iDefenseRat,
                 speed: data.m_iUp_runSpeed,
             };
@@ -1341,6 +1382,7 @@ fn load_instance_data(root: &Map<String, Value>) -> Result<InstanceData, String>
             m_iIsEP: u32,
             m_iZoneX: i32,
             m_iZoneY: i32,
+            m_ScoreMax: i32,
         }
 
         let data = get_array(table, INSTANCE_DATA_KEY)?;
@@ -1356,6 +1398,7 @@ fn load_instance_data(root: &Map<String, Value>) -> Result<InstanceData, String>
                     Some(map_data_entry.m_iIsEP as u32)
                 },
                 map_square: (map_data_entry.m_iZoneX, map_data_entry.m_iZoneY),
+                max_score: map_data_entry.m_ScoreMax,
             };
             map_map.insert(key, map_data_entry);
         }
@@ -1912,6 +1955,7 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
 
     #[derive(Deserialize)]
     struct NPCStatsEntry {
+        m_iNpcType: i32,
         m_iNpcNumber: i32,
         m_iNpcName: i32,
         m_iTeam: i32,
@@ -1947,6 +1991,7 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
             .map_err(|e| format!("Malformed NPC data entry: {} {}", e, v))?;
         let key = entry.m_iNpcNumber;
         let npc_stats = NPCStats {
+            service_category: entry.m_iNpcType,
             team: entry
                 .m_iTeam
                 .try_into()
@@ -1994,6 +2039,18 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
     Ok(npc_data_table)
 }
 
+// Match OpenFusion's conversion of JSON spawn coordinates to integer positions.
+fn deserialize_spawn_integer<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<i32, D::Error> {
+    let value = f64::deserialize(deserializer)?;
+    let truncated = value.trunc();
+    if !value.is_finite() || truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+        return Err(serde::de::Error::custom("spawn coordinate outside i32 range"));
+    }
+    Ok(truncated as i32)
+}
+
 fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
     const NPC_TABLE_KEY: &str = "NPCs";
     const MOB_TABLE_KEY: &str = "mobs";
@@ -2006,18 +2063,24 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
         #[derive(Deserialize)]
         struct FollowerDataEntry {
             iNPCType: i32,
+            #[serde(deserialize_with = "deserialize_spawn_integer")]
             iOffsetX: i32,
+            #[serde(deserialize_with = "deserialize_spawn_integer")]
             iOffsetY: i32,
         }
 
         #[derive(Deserialize)]
         struct NPCSpawnDataEntry {
             aFollowers: Option<Vec<FollowerDataEntry>>,
+            #[serde(deserialize_with = "deserialize_spawn_integer")]
             iAngle: i32,
             iMapNum: Option<u32>,
             iNPCType: i32,
+            #[serde(deserialize_with = "deserialize_spawn_integer")]
             iX: i32,
+            #[serde(deserialize_with = "deserialize_spawn_integer")]
             iY: i32,
+            #[serde(deserialize_with = "deserialize_spawn_integer")]
             iZ: i32,
         }
 
@@ -2073,6 +2136,8 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
 }
 
 fn load_drop_data() -> Result<DropData, String> {
+    const RACING_TABLE_KEY: &str = "Racing";
+    const RACING_ID_KEY: &str = "EPID";
     const CRATE_DROP_CHANCES_TABLE_KEY: &str = "CrateDropChances";
     const CRATE_DROP_TYPES_TABLE_KEY: &str = "CrateDropTypes";
     const CRATE_DATA_TABLE_KEY: &str = "Crates";
@@ -2128,8 +2193,15 @@ fn load_drop_data() -> Result<DropData, String> {
     let rarity_weights_table = get_object(&drop_root, RARITY_WEIGHTS_TABLE_KEY)?;
     let item_sets_table = get_object(&drop_root, ITEM_SETS_TABLE_KEY)?;
     let item_references_table = get_object(&drop_root, ITEM_REFERENCES_TABLE_KEY)?;
+    let racing_table = get_object(&drop_root, RACING_TABLE_KEY)?;
+
+    let race_data: HashMap<i32, RaceData> = load_drop_table(racing_table, RACING_ID_KEY)?;
+    for race in race_data.values() {
+        race.validate()?;
+    }
 
     Ok(DropData {
+        race_data,
         crate_drop_chances: load_drop_table(crate_drop_chances_table, CRATE_DROP_CHANCES_ID_KEY)?,
         crate_drop_types: load_drop_table(crate_drop_types_table, CRATE_DROP_TYPES_ID_KEY)?,
         crate_data: load_drop_table(crate_data_table, CRATE_DATA_ID_KEY)?,
@@ -2150,7 +2222,7 @@ fn load_egg_data() -> Result<EggData, String> {
     const EGG_TYPES_TABLE_KEY: &str = "EggTypes";
     const EGG_TABLE_KEY: &str = "Eggs";
 
-    fn load_egg_stats(table: &Map<String, Value>) -> Result<HashMap<i32, EggStats>, String> {
+    fn load_egg_stats(table: Vec<&Value>) -> Result<HashMap<i32, EggStats>, String> {
         #[derive(Deserialize)]
         struct EggStatsEntry {
             Id: i32,
@@ -2161,7 +2233,7 @@ fn load_egg_data() -> Result<EggData, String> {
         }
 
         let mut egg_stats = HashMap::new();
-        for (_, v) in table {
+        for v in table {
             let egg_stats_entry: EggStatsEntry = serde_json::from_value(v.clone())
                 .map_err(|e| format!("Malformed egg stats entry: {} {}", e, v))?;
             let key = egg_stats_entry.Id;
@@ -2182,7 +2254,7 @@ fn load_egg_data() -> Result<EggData, String> {
         Ok(egg_stats)
     }
 
-    fn load_eggs(table: &Map<String, Value>) -> Result<Vec<EggSpawnData>, String> {
+    fn load_eggs(table: Vec<&Value>) -> Result<Vec<EggSpawnData>, String> {
         #[derive(Deserialize)]
         struct EggSpawnDataEntry {
             iType: i32,
@@ -2193,7 +2265,7 @@ fn load_egg_data() -> Result<EggData, String> {
         }
 
         let mut eggs = Vec::new();
-        for (_, v) in table {
+        for v in table {
             let egg_data_entry: EggSpawnDataEntry = serde_json::from_value(v.clone())
                 .map_err(|e| format!("Malformed egg data entry: {} {}", e, v))?;
             let egg_data_entry = EggSpawnData {
@@ -2212,8 +2284,8 @@ fn load_egg_data() -> Result<EggData, String> {
 
     let egg_root = load_json("eggs.json")?;
 
-    let egg_types_table = get_object(&egg_root, EGG_TYPES_TABLE_KEY)?;
-    let eggs_table = get_object(&egg_root, EGG_TABLE_KEY)?;
+    let egg_types_table = get_table_values(&egg_root, EGG_TYPES_TABLE_KEY)?;
+    let eggs_table = get_table_values(&egg_root, EGG_TABLE_KEY)?;
 
     Ok(EggData {
         egg_stats: load_egg_stats(egg_types_table)?,
@@ -2421,6 +2493,41 @@ fn load_world_name_data() -> Result<WorldNameDataContainer, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_numbers_match_openfusion_integer_conversion() {
+        #[derive(Deserialize)]
+        struct Spawn {
+            #[serde(deserialize_with = "deserialize_spawn_integer")]
+            coordinate: i32,
+        }
+        for (input, expected) in [
+            ("54727.996826171875", 54727),
+            ("-54727.996826171875", -54727),
+            ("42", 42),
+            ("2147483647", i32::MAX),
+            ("-2147483648", i32::MIN),
+        ] {
+            let spawn: Spawn = serde_json::from_str(&format!("{{\"coordinate\":{input}}}")).unwrap();
+            assert_eq!(spawn.coordinate, expected);
+        }
+        for input in ["2147483648", "-2147483649", "\"42\"", "null"] {
+            assert!(serde_json::from_str::<Spawn>(&format!("{{\"coordinate\":{input}}}")).is_err());
+        }
+    }
+
+    #[test]
+    fn egg_tables_accept_objects_and_arrays_without_dropping_rows() {
+        let object = serde_json::json!({"Eggs": {"0": {"iType": 60}, "1": {"iType": 61}}});
+        let array = serde_json::json!({"Eggs": [{"iType": 60}, {"iType": 61}]});
+        assert_eq!(
+            get_table_values(object.as_object().unwrap(), "Eggs").unwrap(),
+            get_table_values(array.as_object().unwrap(), "Eggs").unwrap(),
+        );
+        let malformed = serde_json::json!({"Eggs": null});
+        assert!(get_table_values(malformed.as_object().unwrap(), "Eggs").is_err());
+        assert!(get_table_values(malformed.as_object().unwrap(), "EggTypes").is_err());
+    }
 
     #[test]
     fn test_load() {

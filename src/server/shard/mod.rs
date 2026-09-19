@@ -25,6 +25,8 @@ use crate::{
 mod buddy;
 mod chat;
 mod combat;
+mod egg;
+mod email;
 mod gm;
 mod group;
 mod item;
@@ -33,6 +35,7 @@ mod mission;
 mod nano;
 mod npc;
 mod pc;
+mod racing;
 mod trade;
 mod transport;
 
@@ -98,6 +101,19 @@ pub fn handle_packet<'a>(
             P_CL2FE_REQ_PC_MOVETRANSPORTATION => {
                 pc::pc_movetransportation(pkt, &clients, state, time)
             }
+            P_CL2FE_REQ_PC_JUMPPAD => pc::pc_jumppad(pkt, &clients, state, time),
+            P_CL2FE_REQ_PC_LAUNCHER => pc::pc_launcher(pkt, &clients, state, time),
+            P_CL2FE_REQ_PC_ZIPLINE => pc::pc_zipline(pkt, &clients, state, time),
+            P_CL2FE_REQ_PC_MOVEPLATFORM => pc::pc_moveplatform(pkt, &clients, state, time),
+            P_CL2FE_REQ_PC_SLOPE => pc::pc_slope(pkt, &clients, state, time),
+            P_CL2FE_REQ_IM_CHANGE_SWITCH_STATUS => {
+                pc::pc_change_switch_status(pkt, &clients, state)
+            }
+            //
+            P_CL2FE_REQ_EP_RACE_START => racing::race_start(pkt, &clients, state),
+            P_CL2FE_REQ_EP_GET_RING => racing::race_get_ring(pkt, &clients, state),
+            P_CL2FE_REQ_EP_RACE_CANCEL => racing::race_cancel(pkt, &clients, state),
+            P_CL2FE_REQ_EP_RACE_END => racing::race_end(pkt, &clients, state).await,
             P_CL2FE_REQ_PC_TRANSPORT_WARP => {
                 pc::pc_transport_warp(pkt, clients.get_sender(), state)
             }
@@ -142,8 +158,13 @@ pub fn handle_packet<'a>(
             P_CL2FE_REQ_NPC_UNSUMMON => gm::gm_npc_unsummon(pkt, &clients, state),
             P_CL2FE_REQ_SHINY_SUMMON => gm::gm_shiny_summon(pkt, &clients, state),
             //
+            P_CL2FE_REQ_SHINY_PICKUP => egg::shiny_pickup(pkt, &clients, state),
+            //
             P_CL2FE_REQ_NPC_INTERACTION => npc::npc_interaction(pkt, clients.get_sender(), state),
             P_CL2FE_REQ_BARKER => npc::npc_bark(pkt, clients.get_sender(), state),
+            P_CL2FE_REQ_PC_BARBER_OPEN => crate::barber::open(pkt, clients.get_sender(), state),
+            P_CL2FE_REQ_PC_BARBER_CONFIRM => crate::barber::confirm(pkt, &clients, state),
+            P_CL2FE_REQ_PRESENT_NPC_TYPES => npc::present_npc_types(pkt, &clients, state),
             //
             P_CL2FE_REQ_SEND_FREECHAT_MESSAGE => {
                 chat::send_freechat_message(pkt, &clients, state).await
@@ -166,6 +187,18 @@ pub fn handle_packet<'a>(
             P_CL2FE_REQ_PC_ATTACK_NPCs => combat::pc_attack_npcs(pkt, &clients, state),
             P_CL2FE_REQ_PC_ATTACK_CHARs => combat::pc_attack_pcs(pkt, &clients, state),
             P_CL2FE_REQ_NANO_SKILL_USE => combat::nano_skill_use(pkt, &clients, state),
+            P_CL2FE_REQ_PC_ROCKET_STYLE_READY => {
+                combat::pc_rocket_style_ready(pkt, &clients, state)
+            }
+            P_CL2FE_REQ_PC_ROCKET_STYLE_FIRE => combat::pc_rocket_style_fire(pkt, &clients, state),
+            P_CL2FE_REQ_PC_ROCKET_STYLE_HIT => combat::pc_projectile_hit(pkt, &clients, state),
+            P_CL2FE_REQ_PC_GRENADE_STYLE_READY => {
+                combat::pc_grenade_style_ready(pkt, &clients, state)
+            }
+            P_CL2FE_REQ_PC_GRENADE_STYLE_FIRE => {
+                combat::pc_grenade_style_fire(pkt, &clients, state)
+            }
+            P_CL2FE_REQ_PC_GRENADE_STYLE_HIT => combat::pc_projectile_hit(pkt, &clients, state),
             //
             P_CL2FE_REQ_ITEM_MOVE => item::item_move(pkt, &clients, state),
             P_CL2FE_REQ_PC_ITEM_DELETE => item::item_delete(pkt, clients.get_sender(), state),
@@ -173,6 +206,9 @@ pub fn handle_packet<'a>(
                 item::item_combination(pkt, clients.get_sender(), state)
             }
             P_CL2FE_REQ_ITEM_CHEST_OPEN => item::item_chest_open(pkt, clients.get_sender(), state),
+            P_CL2FE_REQ_ITEM_USE => item::item_use(pkt, &clients, state),
+            P_CL2FE_REQ_PC_BANK_OPEN => item::bank_open(pkt, &clients, state),
+            P_CL2FE_REQ_PC_BANK_CLOSE => item::bank_close(pkt, &clients, state),
             P_CL2FE_REQ_PC_VENDOR_START => item::vendor_start(pkt, clients.get_sender(), state),
             P_CL2FE_REQ_PC_VENDOR_TABLE_UPDATE => {
                 item::vendor_table_update(pkt, clients.get_sender())
@@ -209,6 +245,25 @@ pub fn handle_packet<'a>(
             }
             P_CL2FE_REQ_GET_BUDDY_STATE => buddy::get_buddy_state(&clients, state),
             P_CL2FE_REQ_PC_BUDDY_WARP => buddy::pc_buddy_warp(pkt, &clients, state),
+            P_CL2FE_REQ_GET_BUDDY_STYLE => buddy::get_buddy_style(pkt, &clients, state),
+            P_CL2FE_REQ_SET_BUDDY_BLOCK => buddy::set_buddy_block(pkt, &clients, state).await,
+            P_CL2FE_REQ_REMOVE_BUDDY => buddy::remove_buddy(pkt, &clients, state).await,
+            P_CL2FE_REQ_SET_PC_BLOCK => buddy::set_pc_block(pkt, &clients, state).await,
+            //
+            P_CL2FE_REQ_PC_EMAIL_UPDATE_CHECK => email::email_update_check(&clients, state).await,
+            P_CL2FE_REQ_PC_RECV_EMAIL_PAGE_LIST => {
+                email::email_receive_page_list(pkt, &clients, state).await
+            }
+            P_CL2FE_REQ_PC_READ_EMAIL => email::email_read(pkt, &clients, state).await,
+            P_CL2FE_REQ_PC_RECV_EMAIL_CANDY => {
+                email::email_receive_taros(pkt, &clients, state).await
+            }
+            P_CL2FE_REQ_PC_RECV_EMAIL_ITEM => email::email_receive_item(pkt, &clients, state).await,
+            P_CL2FE_REQ_PC_RECV_EMAIL_ITEM_ALL => {
+                email::email_receive_item_all(pkt, &clients, state).await
+            }
+            P_CL2FE_REQ_PC_DELETE_EMAIL => email::email_delete(pkt, &clients, state).await,
+            P_CL2FE_REQ_PC_SEND_EMAIL => email::email_send(pkt, &clients, state).await,
             //
             P_CL2FE_REQ_PC_TRADE_OFFER => trade::trade_offer(pkt, &clients, state),
             P_CL2FE_REQ_PC_TRADE_OFFER_REFUSAL => trade::trade_offer_refusal(pkt, &clients, state),

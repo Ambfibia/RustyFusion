@@ -10,7 +10,6 @@ use std::{
 };
 
 use parking_lot as pl;
-use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use self::packet::{
@@ -23,18 +22,37 @@ use crate::{
     net::packet::Packet,
 };
 
-#[allow(non_camel_case_types)]
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
-pub enum FFProtocol {
-    #[default]
-    v0104,
-    v1013,
+/// Bits of the wire packet ID field that actually hold the packet ID.
+/// The remaining bits (12..24) carry a checksum over the packet body.
+const PACKET_TYPE_MASK: u32 = 0xFF000FFF;
+const PACKET_TYPE_FLAG_SHIFT: u32 = 12;
+
+/// Strips the checksum bits from a wire packet ID.
+fn unwrap_packet_id(raw: u32) -> u32 {
+    raw & PACKET_TYPE_MASK
+}
+
+/// Computes the wire packet ID for a packet whose body (excluding the
+/// 4-byte ID field itself) is `body`.
+fn wrap_packet_id(id: u32, body: &[u8]) -> u32 {
+    (id & PACKET_TYPE_MASK) | (packet_checksum(body) << PACKET_TYPE_FLAG_SHIFT)
+}
+
+/// Fletcher-style 12-bit checksum, ripped from the client.
+fn packet_checksum(body: &[u8]) -> u32 {
+    let mut sum_a: u32 = 0;
+    let mut sum_b: u32 = 0;
+    for b in body {
+        sum_a = (sum_a + *b as u32) % 0xff;
+        sum_b = (sum_b + sum_a) % 0xff;
+    }
+    ((sum_b << 8) | sum_a) & 0xfff
 }
 
 const PACKET_BUFFER_SIZE: usize = 4096; // payload buffer size; includes ID, but not length
 const PACKET_LENGTH_SIZE: usize = size_of::<u32>(); // not encrypted
 const PACKET_ID_SIZE: usize = size_of::<u32>(); // encrypted
-const PACKET_BODY_SIZE: usize = PACKET_BUFFER_SIZE - PACKET_ID_SIZE;
+pub const PACKET_BODY_SIZE: usize = PACKET_BUFFER_SIZE - PACKET_ID_SIZE;
 
 const UNKNOWN_CT_ALLOWED_PACKETS: [PacketID; 3] = [
     P_FE2LS_REQ_AUTH_CHALLENGE,

@@ -152,7 +152,11 @@ pub fn update_login_info_succ(
         })
         .unwrap();
     client.send_packet(P_LS2CL_REP_SHARD_SELECT_SUCC, &resp);
-    client.disconnect();
+    // FFOne keeps the authenticated login connection alongside the shard.
+    // Its reader handles keepalives, tutorial completion and later character
+    // selection on this socket. Closing it here makes a successful WorldReady
+    // immediately followed by LoginTransportFailed, tearing down gameplay.
+    // Let the client close the retained session explicitly, as in OpenFusion.
 
     Ok(())
 }

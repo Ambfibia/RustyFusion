@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    chunk::{EntityMap, InstanceID, TickMode},
+    chunk::{InstanceID, TickMode},
     defines::*,
     entity::{Combatant, Egg, Entity, EntityID, PlayerSearchQuery, NPC},
     enums::*,
@@ -722,7 +722,7 @@ pub fn gm_npc_summon(
     for _ in 0..count {
         let npc_id = entity_map.gen_next_npc_id();
         let npc = NPC::new(npc_id, npc_type, spawn_pos, spawn_angle, spawn_instance_id).unwrap();
-        helpers::spawn_temp_npc(entity_map, npc);
+        crate::helpers::spawn_temp_npc(entity_map, npc);
     }
 
     Ok(())
@@ -750,7 +750,7 @@ pub fn gm_npc_group_summon(
         npc.set_position(spawn_pos);
         npc.set_rotation(spawn_angle);
         npc.instance_id = spawn_instance_id;
-        helpers::spawn_temp_npc(entity_map, npc);
+        crate::helpers::spawn_temp_npc(entity_map, npc);
     }
 
     Ok(())
@@ -775,7 +775,6 @@ pub fn gm_npc_unsummon(
 }
 
 mod helpers {
-    use crate::ai;
 
     use super::*;
 
@@ -807,15 +806,6 @@ mod helpers {
         };
         client.send_packet(P_FE2CL_ANNOUNCE_MSG, &pkt);
         FFError::build(Severity::Warning, err_msg)
-    }
-
-    pub fn spawn_temp_npc(entity_map: &mut EntityMap, mut npc: NPC) {
-        npc.summoned = true;
-        let (ai, tick_mode) = ai::make_for_npc(&npc, true);
-        npc.ai = ai;
-        let chunk_coords = npc.get_chunk_coords();
-        let eid = entity_map.track(Box::new(npc), tick_mode);
-        entity_map.update(eid, Some(chunk_coords), true);
     }
 
     pub fn remove_temp_npc(state: &mut ShardServerState, npc_id: i32) {

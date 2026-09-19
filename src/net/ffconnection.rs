@@ -25,8 +25,9 @@ use crate::{
             Packet, PacketID, PACKET_MASK_CL2FE, PACKET_MASK_CL2LS, PACKET_MASK_FE2LS,
             PACKET_MASK_LS2FE,
         },
-        ClientType, FFClient, LiveCheckCallback, PacketBuffer, PacketCallback, PACKET_BUFFER_SIZE,
-        PACKET_LENGTH_SIZE, SILENCED_PACKETS, UNKNOWN_CT_ALLOWED_PACKETS,
+        unwrap_packet_id, wrap_packet_id, ClientType, FFClient, LiveCheckCallback, PacketBuffer,
+        PacketCallback, PACKET_BUFFER_SIZE, PACKET_ID_SIZE, PACKET_LENGTH_SIZE, SILENCED_PACKETS,
+        UNKNOWN_CT_ALLOWED_PACKETS,
     },
 };
 
@@ -292,6 +293,13 @@ impl<S: Send + 'static> FFConnection<S> {
             self.sock.read_exact(&mut in_buf.buf[..sz]).await?;
             in_buf.cursor = sz;
             crypto::decrypt_payload(&mut in_buf.buf[..sz], self.e_key);
+            if sz >= PACKET_ID_SIZE {
+                // The client stuffs a body checksum into the high bits of the
+                // packet ID field. Strip it before we decode the ID.
+                let raw = u32::from_le_bytes(in_buf.buf[..PACKET_ID_SIZE].try_into().unwrap());
+                let id = unwrap_packet_id(raw);
+                in_buf.buf[..PACKET_ID_SIZE].copy_from_slice(&id.to_le_bytes());
+            }
             in_buf.peek_packet_id()?
         };
 
@@ -328,6 +336,13 @@ impl<S: Send + 'static> FFConnection<S> {
         // prepare buffers
         let sz_buf: [u8; 4] = u32::to_le_bytes(sz as u32);
         let send_buf = &mut self.out_buf.buf[..sz];
+
+        // stamp the body checksum into the packet ID field
+        if sz >= PACKET_ID_SIZE {
+            let id = u32::from_le_bytes(send_buf[..PACKET_ID_SIZE].try_into().unwrap());
+            let wire_id = wrap_packet_id(id, &send_buf[PACKET_ID_SIZE..]);
+            send_buf[..PACKET_ID_SIZE].copy_from_slice(&wire_id.to_le_bytes());
+        }
 
         // encrypt the payload (client decrypts with either E or FE key)
         match self.enc_mode {

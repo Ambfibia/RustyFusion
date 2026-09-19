@@ -11,7 +11,7 @@ use crate::{
     config::config_get,
     defines::*,
     entity::{Combatant, Egg, Entity, EntityID, Group, Player, Slider, NPC},
-    enums::ItemType,
+    enums::{BuffID, ItemType},
     error::{log, log_if_failed, FFError, FFResult, Severity},
     helpers,
     item::Item,
@@ -19,6 +19,7 @@ use crate::{
         packet::{PacketID::*, *},
         LoginData,
     },
+    racing::RaceState,
     skills::BuffEffect,
     tabledata::tdata_get,
     trade::TradeContext,
@@ -35,6 +36,8 @@ pub struct ShardServerState {
     pub player_uid_to_id: HashMap<i64, i32>,
     pub pending_entering_uids: HashSet<i64>,
     pub pending_buff_effects: Vec<BuffEffect>,
+    /// Infected Zone races currently being run, keyed by player ID.
+    pub ongoing_races: HashMap<i32, RaceState>,
 }
 impl Default for ShardServerState {
     fn default() -> Self {
@@ -49,6 +52,7 @@ impl Default for ShardServerState {
             player_uid_to_id: HashMap::new(),
             pending_entering_uids: HashSet::new(),
             pending_buff_effects: Vec::new(),
+            ongoing_races: HashMap::new(),
         };
 
         let num_channels = config_get().shard.num_channels.get();
@@ -360,6 +364,43 @@ impl ShardServerState {
                 } => {
                     if let Some(combatant) = log_if_failed(self.get_combatant_mut(target)) {
                         combatant.take_damage(damage, source);
+                    }
+                }
+                BuffEffect::DrainEntity {
+                    target,
+                    source,
+                    percent_max_hp,
+                } => {
+                    if let Some(combatant) = log_if_failed(self.get_combatant_mut(target)) {
+                        let damage = combatant.get_max_hp() * percent_max_hp / 100;
+                        let dealt = combatant.take_damage(damage, source);
+                        let tick_pkt = sP_FE2CL_CHAR_TIME_BUFF_TIME_TICK {
+                            eCT: combatant.get_char_type() as i32,
+                            iID: match target {
+                                EntityID::Player(id)
+                                | EntityID::NPC(id)
+                                | EntityID::Slider(id)
+                                | EntityID::Egg(id) => id,
+                            },
+                            iTB_ID: BuffID::BoundingBall as i16,
+                        };
+                        let damage_result = sSkillResult_Damage {
+                            eCT: tick_pkt.eCT,
+                            iID: tick_pkt.iID,
+                            bProtected: (dealt <= 0) as i32,
+                            iDamage: dealt,
+                            iHP: combatant.get_hp(),
+                        };
+                        if let Some(pkt) = log_if_failed(
+                            PacketBuilder::new(P_FE2CL_CHAR_TIME_BUFF_TIME_TICK)
+                                .with(&tick_pkt)
+                                .with(&damage_result)
+                                .build(),
+                        ) {
+                            self.entity_map.for_each_around(target, |c| {
+                                c.send_payload(pkt.clone());
+                            });
+                        }
                     }
                 }
             }

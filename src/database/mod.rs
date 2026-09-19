@@ -10,22 +10,24 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::config::{config_get, GeneralConfig};
+use crate::email::Email;
 use crate::entity::Player;
 use crate::error::*;
+use crate::racing::RaceResult;
 use crate::state::Account;
 
 #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
 compile_error!(
     "A database backend must be enabled for compilation. \
-     Use `--no-default-features --features sqlite` to select SQLite, \
-     or use the default features for the default PostgreSQL backend."
+     Use the default features for SQLite, \
+     or `--no-default-features --features postgres` for PostgreSQL."
 );
 
 #[cfg(all(feature = "postgres", feature = "sqlite"))]
 compile_error!(
     "Only one database backend can be enabled for compilation. \
-     Use `--no-default-features --features sqlite` to select SQLite, \
-     or use the default features for the default PostgreSQL backend."
+     Use the default features for SQLite, \
+     or `--no-default-features --features postgres` for PostgreSQL."
 );
 
 #[cfg(feature = "postgres")]
@@ -202,6 +204,16 @@ define_db_api! {
     load_player(&self, acc_id: BigInt, pc_uid: BigInt) -> Option<Player>;
     load_players(&self, acc_id: BigInt) -> Vec<Player>;
     delete_player(&self, pc_uid: BigInt) -> ();
+    //
+    get_unread_email_count(&self, pc_uid: BigInt) -> Int;
+    load_emails(&self, pc_uid: BigInt, page_num: Int) -> Vec<Email>;
+    load_email(&self, pc_uid: BigInt, msg_index: Int) -> Option<Email>;
+    update_email(&self, email: &Email) -> ();
+    delete_emails(&self, pc_uid: BigInt, msg_indices: &[i64]) -> ();
+    send_email(&self, email: &Email) -> Int;
+    //
+    save_race_result(&self, result: &RaceResult) -> ();
+    load_best_race_result(&self, ep_id: Int, pc_uid: BigInt) -> Option<RaceResult>;
 }
 
 fn format_db_conn_error(parent_error: FFError) -> FFError {

@@ -1,7 +1,8 @@
 use crate::{
     chunk::InstanceID,
+    database::{db_get, DbImpl as _},
     defines::*,
-    entity::{BuddyListEntry, Entity, EntityID, PlayerSearchQuery},
+    entity::{BuddyListEntry, Entity, EntityID, Player, PlayerSearchQuery},
     error::{codes::BuddyWarpErr, *},
     net::{
         packet::{PacketID::*, *},
@@ -73,6 +74,9 @@ pub fn request_make_buddy(
         ));
     }
 
+    let player_uid = player.get_uid();
+    let player_has_blocked_buddy = player.has_blocked(buddy_uid);
+
     let req_pkt = sP_FE2CL_REP_REQUEST_MAKE_BUDDY_SUCC_TO_ACCEPTER {
         iRequestID: pc_id,
         iBuddyID: buddy_id,
@@ -92,7 +96,10 @@ pub fn request_make_buddy(
         ));
     }
 
-    if buddy.get_num_buddies() >= SIZEOF_BUDDYLIST_SLOT as usize {
+    if buddy.get_num_buddies() >= SIZEOF_BUDDYLIST_SLOT as usize
+        || buddy.has_blocked(player_uid)
+        || player_has_blocked_buddy
+    {
         // instant deny
         let deny_pkt = sP_FE2CL_REP_ACCEPT_MAKE_BUDDY_FAIL {
             iBuddyID: buddy_id,
@@ -151,7 +158,12 @@ pub fn find_name_make_buddy(
         ));
     }
 
-    if buddy.get_num_buddies() >= SIZEOF_BUDDYLIST_SLOT as usize {
+    if buddy.get_num_buddies() >= SIZEOF_BUDDYLIST_SLOT as usize
+        || buddy.has_blocked(pc_uid)
+        || state
+            .get_player(pc_id)
+            .is_ok_and(|player| player.has_blocked(buddy_uid))
+    {
         // instant deny
         let deny_pkt = sP_FE2CL_REP_PC_FIND_NAME_MAKE_BUDDY_FAIL {
             iErrorCode: ERROR_CODE_BUDDY_DENY,
@@ -499,4 +511,269 @@ pub fn pc_buddy_warp(
             .get_sender()
             .send_packet(P_FE2CL_REP_PC_BUDDY_WARP_FAIL, &response);
     })
+}
+
+/// Blocks an existing buddy. The client keeps them in the list with the
+/// blocked flag set; the friendship itself is dissolved on both sides.
+pub async fn set_buddy_block(
+    pkt: Packet,
+    clients: &ClientMap<'_>,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_SET_BUDDY_BLOCK = pkt.get()?;
+    let buddy_uid = pkt.iBuddyPCUID;
+    let slot_num = pkt.iBuddySlot;
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+
+    (|| {
+        let player = state.get_player_mut(pc_id)?;
+        let pc_uid = player.get_uid();
+        validate_buddy_slot(player, slot_num, buddy_uid)?;
+        player.block_player(buddy_uid)?;
+
+        let resp = sP_FE2CL_REP_SET_BUDDY_BLOCK_SUCC {
+            iBuddyPCUID: buddy_uid,
+            iBuddySlot: slot_num,
+        };
+        client.send_packet(P_FE2CL_REP_SET_BUDDY_BLOCK_SUCC, &resp);
+
+        // the block is one-sided, but the friendship isn't: drop us from
+        // their list too so they don't keep a dangling buddy entry
+        remove_from_other_side(buddy_uid, pc_uid, state);
+        Ok(())
+    })()
+    .catch_fail(|| {
+        let resp = sP_FE2CL_REP_SET_BUDDY_BLOCK_FAIL {
+            iBuddyPCUID: buddy_uid,
+            iErrorCode: ERROR_CODE_BUDDY_DENY,
+        };
+        client.send_packet(P_FE2CL_REP_SET_BUDDY_BLOCK_FAIL, &resp);
+    })
+}
+
+/// Blocks someone who isn't on the buddy list yet. They get added to the list
+/// in the blocked state, which is how the client models it.
+pub async fn set_pc_block(
+    pkt: Packet,
+    clients: &ClientMap<'_>,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_SET_PC_BLOCK = pkt.get()?;
+    let block_id = pkt.iBlock_ID;
+    let block_uid = pkt.iBlock_PCUID;
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+
+    (async {
+        let player = state.get_player(pc_id)?;
+        if player.get_uid() == block_uid {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Player {} tried to block themselves", pc_id),
+            ));
+        }
+        if player.get_num_buddies() >= SIZEOF_BUDDYLIST_SLOT as usize {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("{} has no free buddy list slots to block with", player),
+            ));
+        }
+
+        // resolve the entry without holding a shared borrow of the state
+        // across the DB await
+        let cached = state.get_player_by_uid(block_uid).map(BuddyListEntry::new);
+        let entry = match cached {
+            Some(entry) => entry,
+            None => lookup_buddy_entry(block_uid).await?,
+        };
+        let player = state.get_player_mut(pc_id)?;
+        let slot_num = player.add_blocked_player(entry)?;
+
+        let resp = sP_FE2CL_REP_SET_PC_BLOCK_SUCC {
+            iBlock_ID: block_id,
+            iBlock_PCUID: block_uid,
+            iBuddySlot: slot_num as i8,
+        };
+        client.send_packet(P_FE2CL_REP_SET_PC_BLOCK_SUCC, &resp);
+        Ok(())
+    })
+    .await
+    .catch_fail(|| {
+        let resp = sP_FE2CL_REP_SET_PC_BLOCK_FAIL {
+            iBlock_ID: block_id,
+            iBlock_PCUID: block_uid,
+            iErrorCode: ERROR_CODE_BUDDY_DENY,
+        };
+        client.send_packet(P_FE2CL_REP_SET_PC_BLOCK_FAIL, &resp);
+    })
+}
+
+/// Removes a buddy list entry. The client uses this for un-buddying *and*
+/// for unblocking, so we handle both.
+pub async fn remove_buddy(
+    pkt: Packet,
+    clients: &ClientMap<'_>,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_REMOVE_BUDDY = pkt.get()?;
+    let buddy_uid = pkt.iBuddyPCUID;
+    let slot_num = pkt.iBuddySlot;
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+
+    (|| {
+        let player = state.get_player_mut(pc_id)?;
+        let pc_uid = player.get_uid();
+        validate_buddy_slot(player, slot_num, buddy_uid)?;
+        let was_blocked = player.has_blocked(buddy_uid);
+        player.remove_buddy(buddy_uid)?;
+
+        let resp = sP_FE2CL_REP_REMOVE_BUDDY_SUCC {
+            iBuddyPCUID: buddy_uid,
+            iBuddySlot: slot_num,
+        };
+        client.send_packet(P_FE2CL_REP_REMOVE_BUDDY_SUCC, &resp);
+
+        // unblocking doesn't touch the other player; un-buddying does
+        if !was_blocked {
+            remove_from_other_side(buddy_uid, pc_uid, state);
+        }
+        Ok(())
+    })()
+    .catch_fail(|| {
+        let resp = sP_FE2CL_REP_REMOVE_BUDDY_FAIL {
+            iBuddyPCUID: buddy_uid,
+            iErrorCode: ERROR_CODE_BUDDY_DENY,
+        };
+        client.send_packet(P_FE2CL_REP_REMOVE_BUDDY_FAIL, &resp);
+    })
+}
+
+/// Sends a buddy's appearance so the client can render their portrait.
+pub fn get_buddy_style(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_GET_BUDDY_STYLE = pkt.get()?;
+    let buddy_uid = pkt.iBuddyPCUID;
+    let slot_num = pkt.iBuddySlot;
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+
+    (|| {
+        let player = state.get_player(pc_id)?;
+        let entry = player
+            .get_buddy_at_slot(slot_num as usize)
+            .filter(|entry| entry.pc_uid == buddy_uid)
+            .ok_or_else(|| {
+                FFError::build(
+                    Severity::Warning,
+                    format!("No buddy {} in slot {}", buddy_uid, slot_num),
+                )
+            })?;
+
+        let style = sPCStyle {
+            iPC_UID: entry.pc_uid,
+            iNameCheck: entry.name_check as i8,
+            szFirstName: util::encode_utf16(&entry.first_name)?,
+            szLastName: util::encode_utf16(&entry.last_name)?,
+            iGender: entry.style.gender,
+            iFaceStyle: entry.style.face_style,
+            iHairStyle: entry.style.hair_style,
+            iHairColor: entry.style.hair_color,
+            iSkinColor: entry.style.skin_color,
+            iEyeColor: entry.style.eye_color,
+            iHeight: entry.style.height,
+            iBody: entry.style.body,
+            iClass: unused!(),
+        };
+
+        // equipment is only known for buddies who are online on this shard;
+        // the client tolerates an empty set for everyone else
+        let mut equip: [sItemBase; SIZEOF_EQUIP_SLOT as usize] = Default::default();
+        if let Some(buddy) = state.get_player_by_uid(buddy_uid) {
+            for (i, item) in buddy.get_equipped().iter().enumerate() {
+                equip[i] = (*item).into_proto();
+            }
+        }
+
+        let resp = sP_FE2CL_REP_GET_BUDDY_STYLE_SUCC {
+            iBuddyPCUID: buddy_uid,
+            iBuddySlot: slot_num,
+            sBuddyStyle: sBuddyStyleInfo {
+                sBuddyStyle: style,
+                aEquip: equip,
+            },
+        };
+        client.send_packet(P_FE2CL_REP_GET_BUDDY_STYLE_SUCC, &resp);
+        Ok(())
+    })()
+    .catch_fail(|| {
+        let resp = sP_FE2CL_REP_GET_BUDDY_STYLE_FAIL {
+            iBuddyPCUID: buddy_uid,
+            iErrorCode: ERROR_CODE_BUDDY_DENY,
+        };
+        client.send_packet(P_FE2CL_REP_GET_BUDDY_STYLE_FAIL, &resp);
+    })
+}
+
+fn validate_buddy_slot(player: &Player, slot_num: i8, buddy_uid: i64) -> FFResult<()> {
+    if slot_num < 0 || slot_num as u32 >= SIZEOF_BUDDYLIST_SLOT {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!("Bad buddy slot {}", slot_num),
+        ));
+    }
+    match player.get_buddy_at_slot(slot_num as usize) {
+        Some(entry) if entry.pc_uid == buddy_uid => Ok(()),
+        _ => Err(FFError::build(
+            Severity::Warning,
+            format!("Buddy {} is not in slot {}", buddy_uid, slot_num),
+        )),
+    }
+}
+
+/// Drops `pc_uid` from `other_uid`'s buddy list, if they're online here.
+/// Their DB row follows on their next save.
+fn remove_from_other_side(other_uid: i64, pc_uid: i64, state: &mut ShardServerState) {
+    let Some(other_id) = PlayerSearchQuery::ByUID(other_uid).execute(state) else {
+        return;
+    };
+    let Ok(other) = state.get_player_mut(other_id) else {
+        return;
+    };
+    let Some(slot_num) = other.get_buddy_slot_num(pc_uid) else {
+        return;
+    };
+    if other.has_blocked(pc_uid) {
+        // their block on us outranks our un-buddying
+        return;
+    }
+    if other.remove_buddy(pc_uid).is_err() {
+        return;
+    }
+    if let Some(other_client) = other.get_client() {
+        let resp = sP_FE2CL_REP_REMOVE_BUDDY_SUCC {
+            iBuddyPCUID: pc_uid,
+            iBuddySlot: slot_num as i8,
+        };
+        other_client.send_packet(P_FE2CL_REP_REMOVE_BUDDY_SUCC, &resp);
+    }
+}
+
+/// Builds a buddy list entry for a player who isn't on this shard by loading
+/// them from the database.
+async fn lookup_buddy_entry(pc_uid: i64) -> FFResult<BuddyListEntry> {
+    let db = db_get();
+    let account = db
+        .find_account_from_player(pc_uid)
+        .await?
+        .ok_or_else(|| FFError::build(Severity::Warning, format!("Player {} not found", pc_uid)))?;
+    let player = db
+        .load_player(account.id, pc_uid)
+        .await?
+        .ok_or_else(|| FFError::build(Severity::Warning, format!("Player {} not found", pc_uid)))?;
+    Ok(BuddyListEntry::new(&player))
 }

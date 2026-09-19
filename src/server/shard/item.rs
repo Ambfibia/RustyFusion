@@ -8,7 +8,7 @@ use rand::random;
 use crate::{
     config::config_get,
     defines::*,
-    entity::{Entity, EntityID},
+    entity::{Combatant, Entity, EntityID},
     enums::*,
     error::*,
     helpers,
@@ -17,6 +17,7 @@ use crate::{
         packet::{PacketID::*, *},
         ClientMap, FFClient,
     },
+    skills,
     state::ShardServerState,
     tabledata::tdata_get,
     util,
@@ -30,9 +31,12 @@ pub fn item_move(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState)
     let player = state.get_player_mut(pc_id)?;
 
     let location_from = pkt.eFrom.try_into()?;
-    let mut item_from = player.set_item(location_from, pkt.iFromSlotNum as usize, None)?;
-
     let location_to = pkt.eTo.try_into()?;
+    // make sure the client can't reach past the end of the bank
+    validate_bank_slot(location_from, pkt.iFromSlotNum)?;
+    validate_bank_slot(location_to, pkt.iToSlotNum)?;
+
+    let mut item_from = player.set_item(location_from, pkt.iFromSlotNum as usize, None)?;
     let mut item_to = player.set_item(location_to, pkt.iToSlotNum as usize, None)?;
 
     Item::transfer_items(&mut item_from, &mut item_to)?;
@@ -92,6 +96,23 @@ pub fn item_move(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState)
     Ok(())
 }
 
+/// Rejects bank slots that don't exist.
+fn validate_bank_slot(location: ItemLocation, slot_num: i32) -> FFResult<()> {
+    if location != ItemLocation::Bank {
+        return Ok(());
+    }
+    if slot_num < 0 || slot_num as u32 >= SIZEOF_BANK_SLOT {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!(
+                "Bank slot {} is out of range (max {})",
+                slot_num, SIZEOF_BANK_SLOT
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn item_delete(pkt: Packet, client: &FFClient, state: &mut ShardServerState) -> FFResult<()> {
     let pc_id = client.get_player_id()?;
     let pkt: &sP_CL2FE_REQ_PC_ITEM_DELETE = pkt.get()?;
@@ -125,6 +146,9 @@ pub fn item_combination(
     let pkt: &sP_CL2FE_REQ_PC_ITEM_COMBINATION = pkt.get()?;
     (|| {
         let player = state.get_player_mut(client.get_player_id()?)?;
+        if pkt.iCostumeItemSlot==pkt.iStatItemSlot || pkt.iCashItemSlot1!=0 || pkt.iCashItemSlot2!=0 || player.trade_id.is_some() {
+            return Err(FFError::build(Severity::Warning,"Invalid Croc Pot slots or active trade".to_owned()));
+        }
 
         let looks_item = player
             .get_item(ItemLocation::Inven, pkt.iCostumeItemSlot as usize)?
@@ -146,6 +170,9 @@ pub fn item_combination(
                 Severity::Warning,
                 format!("Stats item (slot {}) empty", pkt.iStatItemSlot),
             ))?;
+        if looks_item.ty!=stats_item.ty || !(0..=3).contains(&(looks_item.ty as i32)) {
+            return Err(FFError::build(Severity::Warning,"Croc Pot requires matching equipment types".to_owned()));
+        }
         let stats_item_stats = stats_item.get_stats()?;
         let stats_item_rarity = stats_item_stats.rarity.ok_or(FFError::build(
             Severity::Warning,
@@ -162,8 +189,9 @@ pub fn item_combination(
         }
 
         let crocpot_data = tdata_get().get_crocpot_data(level_gap)?;
-        let cost = (looks_item_stats.buy_price * crocpot_data.price_multiplier_looks)
-            + (stats_item_stats.buy_price * crocpot_data.price_multiplier_stats);
+        let cost = looks_item_stats.buy_price.checked_mul(crocpot_data.price_multiplier_looks)
+            .and_then(|looks| stats_item_stats.buy_price.checked_mul(crocpot_data.price_multiplier_stats).and_then(|stats|looks.checked_add(stats)))
+            .ok_or_else(||FFError::build(Severity::Warning,"Croc Pot cost overflow".to_owned()))?;
         if player.get_taros() < cost {
             return Err(FFError::build(
                 Severity::Warning,
@@ -180,7 +208,7 @@ pub fn item_combination(
             .set_item(ItemLocation::Inven, pkt.iCostumeItemSlot as usize, None)
             .unwrap()
             .unwrap();
-        let mut stats_item = player
+        let stats_item = player
             .set_item(ItemLocation::Inven, pkt.iStatItemSlot as usize, None)
             .unwrap()
             .unwrap();
@@ -191,14 +219,14 @@ pub fn item_combination(
         let succeeded = roll < success_chance;
         if succeeded {
             // set the appearance of the stats item
-            stats_item.set_appearance(&looks_item);
+            let combined_item = looks_item.combine_stats(&stats_item);
 
             // put it back (where the looks item came from, since that's what the client expects)
             player
                 .set_item(
                     ItemLocation::Inven,
                     pkt.iCostumeItemSlot as usize,
-                    Some(stats_item),
+                    Some(combined_item),
                 )
                 .unwrap();
         } else {
@@ -221,7 +249,7 @@ pub fn item_combination(
 
         let resp = sP_FE2CL_REP_PC_ITEM_COMBINATION_SUCC {
             iNewItemSlot: pkt.iCostumeItemSlot,
-            sNewItem: Some(stats_item).into_proto(),
+            sNewItem: (*player.get_item(ItemLocation::Inven, pkt.iCostumeItemSlot as usize)?).into_proto(),
             iStatItemSlot: pkt.iStatItemSlot,
             iCashItemSlot1: pkt.iCashItemSlot1,
             iCashItemSlot2: pkt.iCashItemSlot2,
@@ -707,4 +735,264 @@ fn validate_vendor(
                 ))
             })
     }
+}
+
+//
+// Usable general items.
+//
+
+/// Skill that backs a gumball's nano boost (`NanoStimPak`).
+const SKILL_ID_NANO_STIMPAK: i16 = 144;
+
+/// Uses a general item out of the main inventory. Right now that means
+/// gumballs; Nanocom boosters need three extra equip slots the client doesn't
+/// have, so they're politely rejected.
+pub fn item_use(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_ITEM_USE = pkt.get()?;
+    let slot_num = pkt.iSlotNum;
+    let nano_slot = pkt.iNanoSlot;
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+
+    (|| {
+        let location: ItemLocation = pkt.eIL.try_into()?;
+        if location != ItemLocation::Inven {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!(
+                    "Items can only be used from the inventory (got {:?})",
+                    location
+                ),
+            ));
+        }
+        if slot_num < 0 || slot_num >= SIZEOF_INVEN_SLOT as i32 {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Bad inventory slot {}", slot_num),
+            ));
+        }
+        let slot_num = slot_num as usize;
+
+        let player = state.get_player(pc_id)?;
+        let item = player
+            .get_item(ItemLocation::Inven, slot_num)?
+            .ok_or_else(|| {
+                FFError::build(
+                    Severity::Warning,
+                    format!("No item in slot {} to use", slot_num),
+                )
+            })?;
+        if item.ty != ItemType::General {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Item {:?} isn't usable", item),
+            ));
+        }
+
+        match item.id {
+            id if (ID_GUMBALL..ID_GUMBALL + 3).contains(&id) => {
+                use_gumball(pc_id, slot_num, nano_slot, id, clients, state)
+            }
+            other => Err(FFError::build(
+                Severity::Warning,
+                format!("General item {} is not usable", other),
+            )),
+        }
+    })()
+    .catch_fail(|| {
+        let resp = sP_FE2CL_REP_PC_ITEM_USE_FAIL {
+            iErrorCode: unused!(),
+        };
+        client.send_packet(P_FE2CL_REP_PC_ITEM_USE_FAIL, &resp);
+    })
+}
+
+/// Eats a gumball, boosting the nano in `nano_slot` for the skill table's
+/// duration. The gumball's flavor has to match the nano's style.
+fn use_gumball(
+    pc_id: i32,
+    slot_num: usize,
+    nano_slot: i16,
+    gumball_id: i16,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    if !(0..SIZEOF_NANO_CARRY_SLOT as i16).contains(&nano_slot) {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!("Bad nano slot {}", nano_slot),
+        ));
+    }
+
+    let required_style = match gumball_id - ID_GUMBALL {
+        0 => CombatStyle::Adaptium,
+        1 => CombatStyle::Blastons,
+        _ => CombatStyle::Cosmix,
+    };
+
+    let player = state.get_player(pc_id)?;
+    let nano_id = player
+        .get_equipped_nano_id(nano_slot as usize)
+        .ok_or_else(|| {
+            FFError::build(
+                Severity::Warning,
+                format!("No nano equipped in slot {}", nano_slot),
+            )
+        })?;
+    let nano_style = tdata_get().get_nano_stats(nano_id)?.style;
+    if nano_style != required_style {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!(
+                "Gumball {} ({:?}) doesn't match nano {} ({:?})",
+                gumball_id, required_style, nano_id, nano_style
+            ),
+        ));
+    }
+
+    let skill = tdata_get().get_skill(SKILL_ID_NANO_STIMPAK)?;
+    let buff_id = match nano_slot {
+        0 => BuffID::StimPakSlot1,
+        1 => BuffID::StimPakSlot2,
+        _ => BuffID::StimPakSlot3,
+    };
+
+    // consume one gumball
+    let player = state.get_player_mut(pc_id)?;
+    let slot = player.get_item_mut(ItemLocation::Inven, slot_num)?;
+    Item::split_items(slot, 1).ok_or_else(|| {
+        FFError::build(
+            Severity::Warning,
+            format!("Couldn't consume the gumball in slot {}", slot_num),
+        )
+    })?;
+    let remaining = *player.get_item(ItemLocation::Inven, slot_num)?;
+
+    let player_eid = player.get_id();
+    skills::apply_skill_buff(
+        player,
+        skill,
+        0,
+        BuffType::CashItem,
+        Some(buff_id),
+        Some(player_eid),
+    )?;
+
+    let resp = PacketBuilder::new(P_FE2CL_REP_PC_ITEM_USE_SUCC)
+        .with(&sP_FE2CL_REP_PC_ITEM_USE_SUCC {
+            iPC_ID: pc_id,
+            eIL: ItemLocation::Inven as i32,
+            iSlotNum: slot_num as i32,
+            RemainItem: remaining.into_proto(),
+            iSkillID: SKILL_ID_NANO_STIMPAK,
+            eST: skill.skill_type as i32,
+            iTargetCnt: 1,
+        })
+        .with(&sSkillResult_Buff {
+            eCT: player.get_char_type() as i32,
+            iID: pc_id,
+            bProtected: unused!(),
+            iConditionBitFlag: player.get_condition_bit_flag(),
+        })
+        .build()?;
+    clients.get_sender().send_payload(resp);
+
+    // everyone nearby should see the nano light up
+    let bcast = sP_FE2CL_PC_ITEM_USE {
+        iPC_ID: pc_id,
+        iSkillID: SKILL_ID_NANO_STIMPAK,
+        eST: skill.skill_type as i32,
+        iTargetCnt: 1,
+    };
+    state.entity_map.for_each_around(player_eid, |c| {
+        c.send_packet(P_FE2CL_PC_ITEM_USE, &bcast);
+    });
+
+    Ok(())
+}
+
+//
+// Banking.
+//
+
+/// Error code the client shows when a bank is locked behind a membership card.
+const ERROR_CODE_BANK_NO_MEMBERSHIP: i32 = 2;
+
+/// Which bank a banker NPC opens, and the membership card it requires.
+/// The main bank (0) has no banker of its own and no card.
+fn bank_for_npc_type(npc_type: i32) -> Option<(usize, i16)> {
+    match npc_type {
+        TYPE_GOLD_BANKER => Some((1, ID_GOLD_MEMBERSHIP_CARD)),
+        TYPE_EMERALD_BANKER => Some((2, ID_EMERALD_MEMBERSHIP_CARD)),
+        TYPE_RUBY_BANKER => Some((3, ID_RUBY_MEMBERSHIP_CARD)),
+        TYPE_SAPPHIRE_BANKER => Some((4, ID_SAPPHIRE_MEMBERSHIP_CARD)),
+        _ => None,
+    }
+}
+
+pub fn bank_open(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+    let pkt: &sP_CL2FE_REQ_PC_BANK_OPEN = pkt.get()?;
+    // which banker was talked to decides which bank opens
+    let npc_id = pkt.iNPC_ID;
+
+    (|| {
+        // work out which bank was asked for
+        let bank_num = if npc_id == 0 {
+            0
+        } else {
+            let npc_type = state.get_npc(npc_id)?.ty;
+            match bank_for_npc_type(npc_type) {
+                Some((bank_num, card_id)) => {
+                    let player = state.get_player(pc_id)?;
+                    if !player.has_item_anywhere(ItemType::General, card_id) {
+                        // a locked membership bank gets its own error code so
+                        // the client explains why
+                        let resp = sP_FE2CL_REP_PC_BANK_OPEN_FAIL {
+                            iErrorCode: ERROR_CODE_BANK_NO_MEMBERSHIP,
+                        };
+                        client.send_packet(P_FE2CL_REP_PC_BANK_OPEN_FAIL, &resp);
+                        return Ok(());
+                    }
+                    bank_num
+                }
+                // any other NPC just opens the ordinary bank
+                None => 0,
+            }
+        };
+
+        let player = state.get_player_mut(pc_id)?;
+        player.set_active_bank(bank_num)?;
+
+        let mut resp = sP_FE2CL_REP_PC_BANK_OPEN_SUCC {
+            iExtraBank: bank_num as i32,
+            ..Default::default()
+        };
+        for (slot_num, item) in resp.aBank.iter_mut().enumerate() {
+            *item = (*player.get_bank_slot(bank_num, slot_num)?).into_proto();
+        }
+        client.send_packet(P_FE2CL_REP_PC_BANK_OPEN_SUCC, &resp);
+        Ok(())
+    })()
+    .catch_fail(|| {
+        let resp = sP_FE2CL_REP_PC_BANK_OPEN_FAIL {
+            iErrorCode: unused!(),
+        };
+        client.send_packet(P_FE2CL_REP_PC_BANK_OPEN_FAIL, &resp);
+    })
+}
+
+pub fn bank_close(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) -> FFResult<()> {
+    let _pkt: &sP_CL2FE_REQ_PC_BANK_CLOSE = pkt.get()?;
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+
+    // fall back to the main bank so a later item move can't land in a
+    // membership bank the player no longer has open
+    state.get_player_mut(pc_id)?.set_active_bank(0)?;
+
+    let resp = sP_FE2CL_REP_PC_BANK_CLOSE_SUCC { iPC_ID: pc_id };
+    client.send_packet(P_FE2CL_REP_PC_BANK_CLOSE_SUCC, &resp);
+    Ok(())
 }

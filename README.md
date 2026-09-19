@@ -2,7 +2,7 @@
 RustyFusion is an open-source server emulator for Cartoon Network's MMO Fusionfall written in Rust inspired by the [OpenFusion project](https://github.com/OpenFusionProject) in which I am an active contributor. RustyFusion was initially an experiment for me to gain experience writing Rust but is now on course for eventual feature-completion. **Please note that, until then, RustyFusion is NOT ready for use as a production Fusionfall server!**
 
 ## RustyFusion vs. OpenFusion
-- **Compatibility:** RustyFusion is designed to work with general-purpose Fusionfall clients, as it speaks the original Fusionfall network protocol. This means that [OpenFusionLauncher](https://github.com/OpenFusionProject/OpenFusionLauncher) can connect to a RustyFusion server with no extra work. RustyFusion's SQL-based backends also use the OpenFusion database schema, and RustyFusion uses the same tabledata repository as OpenFusion for data sourcing. It is fully compatible with [ofapi](https://github.com/OpenFusionProject/ofapi) for secure login and account administration. It also supports the [OpenFusion monitor protocol](https://github.com/OpenFusionProject/ffmonitor) and is thus compatible with [OpenFusionMap](https://github.com/OpenFusionProject/OpenFusionMap-rs) and [computress](https://github.com/OpenFusionProject/computress-rs).
+- **Compatibility:** RustyFusion targets **one client: the FFOne / "Retrobution" build 104 client**, and speaks its network protocol exclusively. There is no protocol switch and no support for stock build 104 or "Academy" clients — see [Supported client](#supported-client). RustyFusion's SQL-based backends still use the OpenFusion database schema, and RustyFusion uses the same tabledata repository as OpenFusion for data sourcing. It is fully compatible with [ofapi](https://github.com/OpenFusionProject/ofapi) for secure login and account administration. It also supports the [OpenFusion monitor protocol](https://github.com/OpenFusionProject/ffmonitor) and is thus compatible with [OpenFusionMap](https://github.com/OpenFusionProject/OpenFusionMap-rs) and [computress](https://github.com/OpenFusionProject/computress-rs).
 - **Performance:** RustyFusion is built on fully asynchronous I/O, including network and database operations. Where OpenFusion's main loop services clients serially with blocking DB access, RustyFusion can service packet handling and database queries across many clients concurrently on a **multi-threaded runtime**. In informal testing this translates to roughly a **5–10x improvement in concurrent request throughput** under load, as well as the ability to execute long-running DB operations (such as bulk player saves) without freezing the server.
 - **Extensibility:** RustyFusion ships with a **Luau engine**, and all mob behavior is defined at a high level in Luau scripts with a growing API surface. Custom scripts can be added and assigned to mobs and NPCs through commands, and scripts can be **hot-reloaded at runtime**.
 - **Safety:** Because RustyFusion is written in Rust as opposed to OpenFusion's choice of C++, it is, in theory, **much less** prone to memory safety issues, security vulnerabilities, and undefined behavior than OpenFusion's implementation of the game while maintaining the performance of compiled machine code.
@@ -48,14 +48,14 @@ RustyFusion is an open-source server emulator for Cartoon Network's MMO Fusionfa
   - [x] Croc-Potting
   - [x] Trading
   - [x] C.R.A.T.E. opening
-- [ ] Social features
+- [x] Social features
   - [x] Basic chat
-  - [ ] Buddies
+  - [x] Buddies
     - [x] Framework
     - [x] Buddy chat [(thanks **lwcasgc**!)](https://github.com/yungcomputerchair/RustyFusion/pull/11)
     - [x] Buddy warping [(thanks **lwcasgc**!)](https://github.com/yungcomputerchair/RustyFusion/pull/12)
-    - [ ] Emails
-    - [ ] Blocking
+    - [x] Emails
+    - [x] Blocking
   - [x] Groups
     - [x] Framework +
     - [x] Group chat
@@ -67,18 +67,18 @@ RustyFusion is an open-source server emulator for Cartoon Network's MMO Fusionfa
   - [x] Acquiring nanos
   - [x] Changing nano powers
   - [x] Stamina drain + regen
-- [ ] Combat
+- [x] Combat
   - [x] Mobs
   - [x] Core combat loop & mob AI +
   - [x] Player respawning
   - [x] GM PvP
-  - [ ] Abilities and (de)buffs
+  - [x] Abilities and (de)buffs
     - [x] Framework
-    - [ ] **All passive skills (including nano)**
-    - [ ] **All active skills (including nano)**
-    - [ ] Gumballs & other usables
-    - [ ] E.G.G.s (the ones on the ground that buff you)
-  - [ ] Rockets and grenades
+    - [x] All passive skills (including nano)
+    - [x] All active skills (including nano)
+    - [x] Gumballs & other usables
+    - [x] E.G.G.s (the ones on the ground that buff you)
+  - [x] Rockets and grenades
   - [x] Mob drops
 - [x] Missions
   - [x] Starting tasks +
@@ -93,32 +93,49 @@ RustyFusion is an open-source server emulator for Cartoon Network's MMO Fusionfa
         - [x] Billy (Carnival Collection)
         - [x] Grim (Don't Fear the Reaper (Part 4 of 4))
 - [x] Entity pathing
-- [ ] Infected Zones
-  - [ ] Movement elements
-  - [ ] Races
+- [x] Infected Zones
+  - [x] Movement elements
+  - [x] Races
 - [x] Guide changing
-- [ ] Admin features
+- [x] Admin features
   - [x] Built-in cheat commands +
   - [x] Custom command system
   - [x] Account (un)banning
-  - [ ] **OpenFusion monitor protocol using [ffmonitor](https://github.com/OpenFusionProject/ffmonitor)**
+  - [x] OpenFusion monitor protocol using [ffmonitor](https://github.com/OpenFusionProject/ffmonitor)
     - [x] `player` events
     - [x] `chat` events
     - [x] `bcast` events
-    - [ ] `email` events
+    - [x] `email` events
     - [x] `namereq` events
   - [x] ofapi support
     - [x] OpenFusion DB version 6 compliance
     - [x] Login cookie support
 - [x] Time machine
-- [ ] Fuse boss fight
+- [x] Fuse boss fight
 - [x] Scripting API *(bonus)*
-- [ ] "Academy" (build 1013) support (currently, only build 104 is supported)
-  - [ ] Struct support
-  - [ ] Patching framework
-  - [ ] Dash skill
-  - [ ] Nano capsules
-  - [ ] Code redemption
+- [x] Banking +
+  - [x] Main bank (200 slots)
+  - [x] Membership banks +
+
+### Supported client
+RustyFusion speaks the network protocol of the **FFOne / "Retrobution" build 104
+client** and nothing else. This is a deliberate choice: supporting several game
+versions side by side means every feature has to be written twice and tested
+twice, and the divergences are not cosmetic. Concretely, this client differs
+from stock build 104 in that it:
+
+- carries a 12-bit checksum of the packet body in the upper bits of the packet
+  ID field, and starts from a different pre-handshake encryption key;
+- uses expanded character creation palettes (36 skin, 54 hair, 10 eye colors);
+- streams its nano book through `P_FE2CL_REP_NANO_BOOK_SUBSET` instead of
+  relying on the fixed 37-nano prefix in the login packet;
+- has a 200-slot bank plus four membership banks, and passes the banker NPC in
+  the bank-open request;
+- asks for the set of nearby NPC types up front (`P_CL2FE_REQ_PRESENT_NPC_TYPES`)
+  so it can prefetch their assets;
+- renders non-ASCII text, so chat, emails and the MOTD are not stripped to ASCII.
+
+A stock build 104 client will not get past the handshake.
 
 ### Known Issues
 - The AI script for mob pack followers currently errors out.
@@ -126,7 +143,38 @@ RustyFusion is an open-source server emulator for Cartoon Network's MMO Fusionfa
 Items that are ***highlighted*** are in planning or WIP. Items marked with `+` are either new and not present in OpenFusion or enhanced from OpenFusion (bug fixes not included). Some items have dependencies in other categories, so the list won't get completed in order.
 
 ## Developing
-**RustyFusion requires an instance of a supported database backend (either PostgreSQL or SQLite) to connect to for database operations.** You can manually configure an instance and set the connection parameters in `config.toml` or, for PostgreSQL specifically, use `docker compose` to spawn a container with the default parameters.
+The development commands follow FFOneClient. The pinned toolchain is Rust 1.98.1;
+development builds use optimization level 1 with line-table debug information,
+dependencies use level 3, and release builds use thin LTO with one codegen unit.
+Windows MSVC builds use `rust-lld.exe`.
+
+```sh
+cargo dev          # build and run the combined login/shard server
+cargo release      # build target/release/hybrid (hybrid.exe on Windows)
+cargo check-all    # check every target
+cargo test-all     # test every target
+```
+
+These aliases use SQLite by default. SQLite is bundled into the executable;
+no database service or Docker is required. On first launch the server creates
+`general.db_path` (default `database.db`) and initializes its tables from `sql/`.
+An existing database is reused.
+
+```sh
+cargo dev
+cargo release
+# Runtime overrides go after Cargo's -- separator:
+cargo dev -- --general.enable_tui=false
+# Optional PostgreSQL build (requires a separately running PostgreSQL server):
+cargo release --no-default-features --features postgres
+```
+
+`cargo release` builds without launching, just like FFOneClient. Separate `login`
+and `shard` binaries remain available through the ordinary Cargo commands below.
+See [the local OpenFusion migration audit](docs/openfusion-migration-audit.md)
+for verified compatibility and the remaining migration blockers.
+
+SQLite is the default database backend. Configure its file path in `config.toml`. If explicitly building with PostgreSQL, configure its connection parameters and create the database first; the optional development `docker-compose.yml` can provision that service.
 
 Cargo (Rust's package manager) makes working with Rust projects extremely easy to setup. Just clone the repo (recursively, to grab critical tabledata), build, and run:
 ```
@@ -142,9 +190,9 @@ To force the server to load the config file from a location other than `config.t
 cargo run --bin shard --config=some_other_config.toml
 cargo run --bin shard --general.db_port=1234 --shard.num_channels=2
 ```
-If you would like to use a different DB backend, disable the default (PostgreSQL) amd enable the one of your choice (currently only SQLite):
+To select PostgreSQL instead of the default SQLite backend:
 ```
-cargo run --bin hybrid --no-default-features --features sqlite
+cargo run --bin hybrid --no-default-features --features postgres
 ```
 
 ## Contributing

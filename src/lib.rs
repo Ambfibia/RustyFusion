@@ -40,6 +40,7 @@ macro_rules! log_if_none {
     };
 }
 
+pub mod barber;
 pub mod defines;
 pub mod enums;
 pub mod error;
@@ -58,11 +59,13 @@ pub mod tabledata;
 
 pub mod ai;
 pub mod chunk;
+pub mod email;
 pub mod entity;
 pub mod item;
 pub mod mission;
 pub mod nano;
 pub mod path;
+pub mod racing;
 pub mod scripting;
 pub mod skills;
 pub mod trade;
@@ -74,6 +77,10 @@ pub struct Position {
     pub z: i32,
 }
 impl Position {
+    pub fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
     pub fn from_client_coords(x: f32, y: f32, z: f32) -> Self {
         const CLIENT_TO_SERVER_SCALE: f32 = 100.0;
         Position {

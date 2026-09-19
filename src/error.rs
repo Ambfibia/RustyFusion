@@ -2,7 +2,7 @@ use std::{
     cmp::min,
     fmt::{Debug, Display},
     fs::File,
-    io::{BufWriter, ErrorKind, Write},
+    io::{BufWriter, ErrorKind, IsTerminal as _, Write},
     sync::OnceLock,
     time::SystemTime,
 };
@@ -332,6 +332,36 @@ impl Drop for Logger {
         self.drain();
         self.flush();
     }
+}
+
+/// Reports a failure that happened while the server was still starting up,
+/// somewhere the operator can actually read it.
+///
+/// Servers are usually launched by double-clicking, which gives the process
+/// its own console window that closes the instant it exits. Without this, a
+/// bad working directory or an occupied port looks like "it just closes":
+/// the message scrolls past in a window that is already gone, and the log
+/// file doesn't have it either, because a fatal returned out of `main` never
+/// goes through the logger.
+///
+/// So: push it into the log file, print it to stderr, and hold the window
+/// open if we own one.
+pub fn report_startup_failure(logger: &mut Logger, err: FFError) -> FFError {
+    log_error(err.clone());
+    logger.drain();
+    logger.flush();
+
+    eprintln!("\n{}", err.get_formatted(true, true));
+
+    // Skipped when stdin isn't a console (services, CI, pipes), so this can
+    // never wedge an unattended server.
+    if std::io::stdin().is_terminal() {
+        eprintln!("\nPress Enter to exit...");
+        let mut discard = String::new();
+        let _ = std::io::stdin().read_line(&mut discard);
+    }
+
+    err
 }
 
 pub fn panic_log(msg: &str) -> ! {

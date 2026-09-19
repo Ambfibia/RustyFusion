@@ -303,6 +303,16 @@ pub fn send_buddy_freechat_message(
         ));
     }
 
+    if is_blocked_either_way(pc_id, buddy_uid, state) {
+        return Err(FFError::build(
+            Severity::Info,
+            format!(
+                "{} tried to send freechat to blocked UID {}",
+                pc_id, buddy_uid
+            ),
+        ));
+    }
+
     let msg = helpers::process_freechat_message(util::parse_utf16(&pkt.szFreeChat)?);
     let reencoded_msg = util::encode_utf16(&msg).unwrap();
 
@@ -384,6 +394,16 @@ pub fn send_buddy_menuchat_message(
             format!(
                 "{} tried to send menuchat to non-buddy UID {}",
                 player, buddy_uid
+            ),
+        ));
+    }
+
+    if is_blocked_either_way(pc_id, buddy_uid, state) {
+        return Err(FFError::build(
+            Severity::Info,
+            format!(
+                "{} tried to send menuchat to blocked UID {}",
+                pc_id, buddy_uid
             ),
         ));
     }
@@ -478,6 +498,20 @@ pub fn pc_avatar_emotes_chat(
     Ok(())
 }
 
+/// True if either party has blocked the other. Blocks are one-sided on the
+/// client, but a conversation needs both ends, so we check both.
+fn is_blocked_either_way(pc_id: i32, other_uid: i64, state: &ShardServerState) -> bool {
+    let Ok(player) = state.get_player(pc_id) else {
+        return false;
+    };
+    if player.has_blocked(other_uid) {
+        return true;
+    }
+    state
+        .get_player_by_uid(other_uid)
+        .is_some_and(|other| other.has_blocked(player.get_uid()))
+}
+
 mod helpers {
     pub fn validate_menuchat_message(_msg: &str) -> bool {
         // TODO validate
@@ -485,8 +519,7 @@ mod helpers {
     }
 
     pub fn process_freechat_message(msg: String) -> String {
-        // TODO process
-        msg
+        crate::helpers::sanitize_text(&msg, false)
     }
 }
 

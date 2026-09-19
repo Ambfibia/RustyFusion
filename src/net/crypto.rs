@@ -5,7 +5,8 @@ use rand::{rngs::OsRng, thread_rng, Rng};
 
 use crate::error::{FFError, FFResult, Severity};
 
-pub const DEFAULT_KEY: u64 = u64::from_le_bytes(*b"m@rQn~W#");
+/// The pre-handshake XOR key the client starts out with.
+pub const DEFAULT_KEY: u64 = u64::from_le_bytes(*b"b>$rT~!Q");
 pub const AES128_NONCE_SIZE: usize = 12;
 pub const AUTH_CHALLENGE_BASE_SIZE: usize = 16;
 pub const AUTH_CHALLENGE_MAX_SIZE: usize = 32;

@@ -2,8 +2,9 @@ use rand::{rngs::ThreadRng, Rng};
 use uuid::Uuid;
 
 use crate::{
+    chunk::EntityMap,
     defines::RANGE_GROUP_PARTICIPATE,
-    entity::{Combatant, Entity, EntityID, Player},
+    entity::{Combatant, Entity, EntityID, Player, NPC},
     enums::*,
     error::*,
     net::{
@@ -14,6 +15,46 @@ use crate::{
     tabledata::tdata_get,
     util,
 };
+
+/// Strips characters the client can't render out of player-supplied text.
+///
+/// Unlike OpenFusion's original filter, which threw away everything outside
+/// printable ASCII, this keeps non-ASCII characters so non-Latin scripts work
+/// in chat, emails and the MOTD. Only C0 control characters are removed
+/// (newlines optionally kept), since those are what actually break the client's
+/// text rendering and the monitor line protocol.
+pub fn sanitize_text(text: &str, allow_newlines: bool) -> String {
+    text.chars()
+        .filter(|c| {
+            if *c == '\n' {
+                return allow_newlines;
+            }
+            // drop C0 controls and DEL; keep everything else, including
+            // multi-byte characters
+            !c.is_control()
+        })
+        .collect()
+}
+
+/// Truncates a string so that its UTF-16 encoding fits in `max_units` code
+/// units *including* the NUL terminator, without splitting a surrogate pair.
+pub fn truncate_utf16(text: &str, max_units: usize) -> String {
+    if max_units <= 1 {
+        return String::new();
+    }
+    let budget = max_units - 1;
+    let mut units = 0;
+    let mut end = 0;
+    for (idx, c) in text.char_indices() {
+        let len = c.len_utf16();
+        if units + len > budget {
+            break;
+        }
+        units += len;
+        end = idx + c.len_utf8();
+    }
+    text[..end].to_string()
+}
 
 pub fn broadcast_state(pc_id: i32, player_sbf: i8, state: &mut ShardServerState) {
     let bcast = sP_FE2CL_PC_STATE_CHANGE {
@@ -151,6 +192,18 @@ pub fn remove_group_member(
     // save group state
     state.groups.insert(group_id, group);
     Ok(())
+}
+
+/// Puts a dynamically created NPC into the world. Temp NPCs get cleaned up
+/// when they despawn rather than respawning on a timer, which is what both the
+/// GM summon commands and scripted boss stages want.
+pub fn spawn_temp_npc(entity_map: &mut EntityMap, mut npc: NPC) {
+    npc.summoned = true;
+    let (ai, tick_mode) = crate::ai::make_for_npc(&npc, true);
+    npc.ai = ai;
+    let chunk_coords = npc.get_chunk_coords();
+    let eid = entity_map.track(Box::new(npc), tick_mode);
+    entity_map.update(eid, Some(chunk_coords), true);
 }
 
 pub fn send_system_message(client: &FFClient, msg: &str) -> FFResult<()> {

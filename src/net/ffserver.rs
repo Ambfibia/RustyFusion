@@ -9,7 +9,6 @@ use tokio::{
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::{
-    config::config_get,
     error::{log, FFError, FFResult, Severity},
     net::{ClientMetadata, FFConnection, ServerMessage},
 };
@@ -36,13 +35,21 @@ impl<S: Send + 'static> FFServer<S> {
         live_check: Option<(Duration, LiveCheckCallback)>,
         state: Arc<Mutex<S>>,
     ) -> FFResult<Self> {
-        let sock = TcpListener::bind(addr).await?;
+        // Spell out which address failed and why: the bare io::Error keeps the
+        // OS detail at debug level, which turns "port already taken" into an
+        // unhelpful "I/O error" for whoever is starting the server.
+        let sock = TcpListener::bind(addr).await.map_err(|e| {
+            let hint = if e.kind() == std::io::ErrorKind::AddrInUse {
+                " (is another instance already running?)"
+            } else {
+                ""
+            };
+            FFError::build(
+                Severity::Fatal,
+                format!("Couldn't listen on {}{}: {}", addr, hint, e),
+            )
+        })?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-        log(
-            Severity::Info,
-            &format!("Protocol: {:?}", config_get().general.protocol.get()),
-        );
 
         Ok(Self {
             sock,

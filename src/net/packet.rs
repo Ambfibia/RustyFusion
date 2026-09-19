@@ -39,6 +39,7 @@ impl<A, B: TryFromProto<A>> TryIntoProto<B> for A {
 }
 
 use crate::{
+    defines::SIZEOF_BANK_SLOT,
     error::{log, FFError, FFResult, Severity},
     net::{
         self,
@@ -384,6 +385,10 @@ pub enum PacketID {
     P_CL2FE_REQ_PC_DISASSEMBLE_ITEM = 0x130000a2,      // 318767266
     P_CL2FE_GM_REQ_REWARD_RATE = 0x130000a3,           // 318767267
     P_CL2FE_REQ_PC_ITEM_ENCHANT = 0x130000a4,          // 318767268
+    // Retrobution (FFOne) extension
+    P_CL2FE_REQ_PC_BARBER_OPEN = 0x130000a5,
+    P_CL2FE_REQ_PC_BARBER_CONFIRM = 0x130000a6,
+    P_CL2FE_REQ_PRESENT_NPC_TYPES = 0x130000a7, // 318767271
 
     P_FE2CL_ERROR = 0x31000000,                                // 822083584
     P_FE2CL_REP_PC_ENTER_FAIL = 0x31000001,                    // 822083585
@@ -486,7 +491,7 @@ pub enum PacketID {
     P_FE2CL_REP_PC_GIVE_ITEM_FAIL = 0x31000062,                // 822083682
     P_FE2CL_REP_PC_BUDDYLIST_INFO_SUCC = 0x31000063,           // 822083683
     P_FE2CL_REP_PC_BUDDYLIST_INFO_FAIL = 0x31000064,           // 822083684
-    P_FE2CL_REP_REQUEST_MAKE_BUDDY_SUCC = 0x7fffffff,          // 2147483647
+    P_FE2CL_REP_REQUEST_MAKE_BUDDY_SUCC = 0x83000065,          // FFOne acknowledgement
     P_FE2CL_REP_REQUEST_MAKE_BUDDY_FAIL = 0x31000066,          // 822083686
     P_FE2CL_REP_ACCEPT_MAKE_BUDDY_SUCC = 0x31000067,           // 822083687
     P_FE2CL_REP_ACCEPT_MAKE_BUDDY_FAIL = 0x31000068,           // 822083688
@@ -688,6 +693,15 @@ pub enum PacketID {
     P_FE2CL_GM_REP_REWARD_RATE_SUCC = 0x3100012c,              // 822083884
     P_FE2CL_REP_PC_ITEM_ENCHANT_SUCC = 0x3100012d,             // 822083885
     P_FE2CL_REP_PC_ITEM_ENCHANT_FAIL = 0x3100012e,             // 822083886
+    // Retrobution (FFOne) extensions
+    P_FE2CL_REP_NANO_BOOK_SUBSET = 0x31000134,  // 822083892
+    P_FE2CL_NPC_CUSTOM_ATTACK_PCs = 0x31000135, // 822083893
+    P_FE2CL_NPC_SELF_EFFECT = 0x31000136,       // 822083894
+    P_FE2CL_REP_PC_BARBER_OPEN_SUCC = 0x31000138,
+    P_FE2CL_REP_PC_BARBER_CONFIRM = 0x31000139,
+    P_FE2CL_PC_CHANGE_STYLE = 0x3100013a,
+    P_FE2CL_NPC_MAP_SNAPSHOT = 0x3100013b,
+    P_FE2CL_REP_PRESENT_NPC_TYPES = 0x31000137, // 822083895
 
     P_LS2CL_REP_LOGIN_SUCC = 0x21000001,            // 553648129
     P_LS2CL_REP_LOGIN_FAIL = 0x21000002,            // 553648130
@@ -1204,3 +1218,148 @@ pub struct sP_LS2FE_REP_BUDDY_WARP_FAIL {
     pub iErrorCode: i32,
 }
 impl FFPacket for sP_LS2FE_REP_BUDDY_WARP_FAIL {}
+
+//
+// Packets the client speaks that aren't in the shared ffproto struct set.
+// They're laid out exactly like the client expects (4-byte packing, like
+// every other build 104 struct).
+//
+
+/// Client asks for the set of NPC types currently streamed around it so it can
+/// prefetch their assets. `uiLastSyncTime` is the client's last sync timestamp.
+#[repr(packed(4))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct sP_CL2FE_REQ_PRESENT_NPC_TYPES {
+    pub uiLastSyncTime: u64,
+}
+impl FFPacket for sP_CL2FE_REQ_PRESENT_NPC_TYPES {}
+
+/// Header for the reply; followed by `iCnt` trailing `i32` NPC types.
+/// `bClear` tells the client to drop whatever it had before.
+#[repr(packed(4))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct sP_FE2CL_REP_PRESENT_NPC_TYPES {
+    pub bClear: i32,
+    pub iCnt: i32,
+}
+impl FFPacket for sP_FE2CL_REP_PRESENT_NPC_TYPES {}
+
+/// Header for a custom (scripted) NPC attack; followed by `iPCCnt` `sAttackResult`s.
+#[repr(packed(4))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct sP_FE2CL_NPC_CUSTOM_ATTACK_PCs {
+    pub iNPC_ID: i32,
+    pub iMode: i32,
+    pub iProjectileType: i32,
+    pub iPCCnt: i32,
+}
+impl FFPacket for sP_FE2CL_NPC_CUSTOM_ATTACK_PCs {}
+
+/// Plays a self-effect (sound + animation) on an NPC.
+#[repr(packed(4))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sP_FE2CL_NPC_SELF_EFFECT {
+    pub iNPC_ID: i32,
+    pub iEffect: i32,
+    pub szSFX: [u8; 128],
+    pub szAnimation: [u8; 128],
+}
+impl FFPacket for sP_FE2CL_NPC_SELF_EFFECT {}
+impl Default for sP_FE2CL_NPC_SELF_EFFECT {
+    fn default() -> Self {
+        Self {
+            iNPC_ID: 0,
+            iEffect: 0,
+            szSFX: [0; 128],
+            szAnimation: [0; 128],
+        }
+    }
+}
+
+/// Streams the nano book to the client in chunks of 10. The client sizes its
+/// nano array from `bookSize`, which lets us exceed the 37 nanos the
+/// `sPCLoadData2CL` prefix can carry.
+#[repr(packed(4))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct sP_FE2CL_REP_NANO_BOOK_SUBSET {
+    pub PCUID: i64,
+    pub bookSize: i32,
+    pub elementOffset: i32,
+    pub element: [sNano; NANO_BOOK_SUBSET_SIZE],
+}
+impl FFPacket for sP_FE2CL_REP_NANO_BOOK_SUBSET {}
+
+/// Number of nanos carried by a single [`sP_FE2CL_REP_NANO_BOOK_SUBSET`].
+pub const NANO_BOOK_SUBSET_SIZE: usize = 10;
+
+/// The bank-open request carries the banker NPC, which selects between the
+/// main bank and the four membership banks.
+///
+/// This deliberately shadows the same-named struct from `ffproto`, whose
+/// build-104 layout predates the banker field.
+#[repr(packed(4))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct sP_CL2FE_REQ_PC_BANK_OPEN {
+    pub iPC_ID: i32,
+    pub iNPC_ID: i32,
+}
+impl FFPacket for sP_CL2FE_REQ_PC_BANK_OPEN {}
+
+/// The bank contents. Also shadows `ffproto`, which still describes the
+/// smaller pre-expansion bank.
+#[repr(packed(4))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sP_FE2CL_REP_PC_BANK_OPEN_SUCC {
+    pub aBank: [sItemBase; SIZEOF_BANK_SLOT as usize],
+    pub iExtraBank: i32,
+}
+impl FFPacket for sP_FE2CL_REP_PC_BANK_OPEN_SUCC {}
+impl Default for sP_FE2CL_REP_PC_BANK_OPEN_SUCC {
+    fn default() -> Self {
+        Self {
+            aBank: [sItemBase::default(); SIZEOF_BANK_SLOT as usize],
+            iExtraBank: 0,
+        }
+    }
+}
+
+/// FFOne map placements: flags 1=start, 2=end; records are id/type/protocol xyz.
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct NpcMapSnapshotHeader { pub flags: i32, pub count: i32 }
+impl FFPacket for NpcMapSnapshotHeader {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct NpcMapSnapshotEntry { pub id: i32, pub npc_type: i32, pub x: i32, pub y: i32, pub z: i32 }
+impl FFPacket for NpcMapSnapshotEntry {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct BarberOpenRequest { pub npc_id: i32 }
+impl FFPacket for BarberOpenRequest {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct BarberPrices {
+    pub change_gender: i32, pub gender_cost: i32, pub body_cost: i32, pub skin_color_cost: i32,
+    pub hair_style_cost: i32, pub hair_color_cost: i32, pub face_style_cost: i32, pub eye_color_cost: i32,
+    pub special_hair: [i32;16], pub special_face: [i32;16], pub special_hair_cost: [i32;16], pub special_face_cost: [i32;16],
+}
+impl FFPacket for BarberPrices {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct BarberConfirmRequest { pub style: sPCStyle }
+impl FFPacket for BarberConfirmRequest {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct BarberReply { pub error: i32, pub taros: i32, pub slots: [i32;3], pub items: [sItemBase;3] }
+impl FFPacket for BarberReply {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct BarberStyleBroadcast { pub pc_id: i32, pub style: sPCStyle }
+impl FFPacket for BarberStyleBroadcast {}

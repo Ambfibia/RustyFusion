@@ -559,12 +559,10 @@ pub async fn char_select(
         ))?;
         let slot_num = player.get_slot_num();
 
-        if !player.flags.tutorial_flag {
-            return Err(FFError::build(
-                Severity::Warning,
-                format!("Player {} hasn't completed the tutorial", pc_uid),
-            ));
-        }
+        // FFOne runs the tutorial in the shared shard world, so an unfinished
+        // character must be selectable too (as in the local OpenFusion server).
+        // Keep tutorial_flag unchanged: SAVE_CHAR_TUTOR owns completion and its
+        // rewards. Account ownership is still enforced by get_players_mut above.
 
         log_if_failed(state.set_selected_player_id(account_id, pc_uid));
         let db = db_get();

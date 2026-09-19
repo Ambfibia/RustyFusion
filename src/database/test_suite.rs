@@ -17,6 +17,8 @@ macro_rules! for_each_db_test {
         $macro!(test_player_appearance);
         $macro!(test_player_selected);
         $macro!(test_player_delete);
+        $macro!(test_email_round_trip);
+        $macro!(test_race_results);
     };
 }
 
@@ -247,4 +249,166 @@ pub async fn test_player_delete<D: DbImpl>(db: &Database<D>) {
 
     let after = db.load_player(acc.id, uid).await.unwrap();
     assert!(after.is_none(), "player should be gone after delete");
+}
+
+pub async fn test_email_round_trip<D: DbImpl>(db: &Database<D>) {
+    use crate::email::Email;
+    use crate::enums::ItemType;
+    use crate::item::Item;
+
+    let acc = db.create_account("mailman", "h").await.unwrap();
+    let sender_uid: i64 = 7007;
+    let recipient_uid: i64 = 7008;
+    let sender = make_player(sender_uid, 0);
+    let recipient = make_player(recipient_uid, 1);
+    db.init_player(acc.id, &sender).await.unwrap();
+    db.init_player(acc.id, &recipient).await.unwrap();
+
+    // nothing in the inbox yet
+    assert_eq!(
+        db.get_unread_email_count(recipient_uid).await.unwrap(),
+        0,
+        "a fresh inbox should be empty"
+    );
+
+    let mut email = Email::new(&sender, recipient_uid);
+    email.subject = "Hey".to_string();
+    email.body = "Line one\nLine two".to_string();
+    email.taros = 500;
+    let mut attachment = Item::new(ItemType::General, 119);
+    attachment.quantity = 3;
+    email.attachments[0] = Some(attachment);
+
+    let msg_index = db.send_email(&email).await.expect("send_email");
+    assert_eq!(msg_index, 1, "the first email should get index 1");
+    assert_eq!(
+        db.get_unread_email_count(recipient_uid).await.unwrap(),
+        1,
+        "the new email should be unread"
+    );
+
+    // the sender's own inbox is untouched
+    assert_eq!(db.get_unread_email_count(sender_uid).await.unwrap(), 0);
+
+    let loaded = db
+        .load_email(recipient_uid, msg_index)
+        .await
+        .unwrap()
+        .expect("email exists");
+    assert_eq!(loaded.subject, "Hey");
+    assert_eq!(loaded.body, "Line one\nLine two");
+    assert_eq!(loaded.taros, 500);
+    assert_eq!(loaded.sender_uid, sender_uid);
+    assert!(!loaded.read);
+    let stored_attachment = loaded.attachments[0].expect("attachment should round-trip");
+    assert_eq!(stored_attachment.id, 119);
+    assert_eq!(stored_attachment.quantity, 3);
+
+    // the page listing should show it too
+    let page = db.load_emails(recipient_uid, 1).await.unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].msg_index, msg_index);
+    assert!(page[0].has_attachments());
+
+    // claim the goodies and mark it read
+    let mut claimed = loaded;
+    claimed.read = true;
+    claimed.taros = 0;
+    claimed.attachments[0] = None;
+    db.update_email(&claimed).await.expect("update_email");
+
+    let after = db
+        .load_email(recipient_uid, msg_index)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after.read, "read flag should persist");
+    assert_eq!(after.taros, 0);
+    assert!(
+        after.attachments.iter().all(|item| item.is_none()),
+        "claimed attachments should be gone"
+    );
+    assert!(
+        !after.has_attachments(),
+        "the paperclip should clear once everything is claimed"
+    );
+    assert_eq!(db.get_unread_email_count(recipient_uid).await.unwrap(), 0);
+
+    // indices keep counting up
+    let second_index = db.send_email(&email).await.unwrap();
+    assert_eq!(second_index, 2);
+
+    db.delete_emails(recipient_uid, &[msg_index as i64, 0, 0, 0, 0])
+        .await
+        .expect("delete_emails");
+    assert!(db
+        .load_email(recipient_uid, msg_index)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        db.load_email(recipient_uid, second_index)
+            .await
+            .unwrap()
+            .is_some(),
+        "deleting one email shouldn't touch the others"
+    );
+}
+
+pub async fn test_race_results<D: DbImpl>(db: &Database<D>) {
+    use crate::racing::RaceResult;
+
+    let acc = db.create_account("racer", "h").await.unwrap();
+    let uid: i64 = 8008;
+    let p = make_player(uid, 0);
+    db.init_player(acc.id, &p).await.unwrap();
+
+    const EP_ID: i32 = 1;
+    assert!(
+        db.load_best_race_result(EP_ID, uid)
+            .await
+            .unwrap()
+            .is_none(),
+        "no runs yet"
+    );
+
+    let slower = RaceResult {
+        ep_id: EP_ID,
+        pc_uid: uid,
+        score: 100,
+        num_pods: 5,
+        time_s: 90,
+        timestamp: 1000,
+    };
+    let faster = RaceResult {
+        score: 400,
+        num_pods: 12,
+        time_s: 60,
+        timestamp: 2000,
+        ..slower
+    };
+    db.save_race_result(&slower)
+        .await
+        .expect("save_race_result");
+    db.save_race_result(&faster)
+        .await
+        .expect("save_race_result");
+
+    let best = db
+        .load_best_race_result(EP_ID, uid)
+        .await
+        .unwrap()
+        .expect("a best run exists");
+    assert_eq!(best.score, 400, "the best run should win on score");
+    assert_eq!(best.num_pods, 12);
+    assert_eq!(best.time_s, 60);
+
+    // results are scoped per zone
+    assert!(
+        db.load_best_race_result(EP_ID + 1, uid)
+            .await
+            .unwrap()
+            .is_none(),
+        "another zone shouldn't see this run"
+    );
 }

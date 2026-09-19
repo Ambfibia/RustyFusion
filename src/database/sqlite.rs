@@ -14,12 +14,14 @@ use regex::Regex;
 use crate::{
     database::*,
     defines::*,
+    email::{Email, EMAIL_ITEM_SLOTS, EMAIL_PAGE_SIZE},
     entity::{BuddyListEntry, Combatant, Entity, PlayerFlags, PlayerStyle},
-    enums::PlayerGuide,
+    enums::{ItemLocation, PlayerGuide},
     item::Item,
     mission::Task,
     nano::Nano,
     net::packet::*,
+    racing::RaceResult,
     state::Cookie,
     tabledata::tdata_get,
     util::{self, Bitfield},
@@ -206,6 +208,84 @@ impl SqliteDatabase {
         let n = Self::exec_in(&tx, name, params)?;
         tx.commit()?;
         Ok(n)
+    }
+
+    fn row_to_email(row: &OwnedRow) -> FFResult<Email> {
+        Ok(Email {
+            pc_uid: 0, // filled in by the caller, which knows the recipient
+            msg_index: row.get("MsgIndex"),
+            read: row.get::<Int>("ReadFlag") != 0,
+            sender_uid: row.get("SenderID"),
+            sender_first_name: row.get("SenderFirstName"),
+            sender_last_name: row.get("SenderLastName"),
+            subject: row.get("SubjectLine"),
+            body: row.get("MsgBody"),
+            taros: row.get::<Int>("Taros") as u32,
+            send_time: util::get_systime_from_sec(row.get::<Int>("SendTime") as u64),
+            delete_time: match row.get::<Int>("DeleteTime") {
+                0 => None,
+                secs => Some(util::get_systime_from_sec(secs as u64)),
+            },
+            attachments: [None; EMAIL_ITEM_SLOTS],
+        })
+    }
+
+    fn load_email_attachments_sync(
+        conn: &Connection,
+        pc_uid: BigInt,
+        msg_index: Int,
+    ) -> FFResult<[Option<Item>; EMAIL_ITEM_SLOTS]> {
+        let mut attachments = [None; EMAIL_ITEM_SLOTS];
+        let rows = Self::query(conn, "load_email_items", &[&pc_uid, &msg_index])?;
+        for row in &rows {
+            // email item slots are 1-indexed on the wire and in the DB
+            let slot_num = row.get::<Int>("Slot");
+            if slot_num < 1 || slot_num > EMAIL_ITEM_SLOTS as Int {
+                log(
+                    Severity::Warning,
+                    &format!("Email attachment has bad slot number {}", slot_num),
+                );
+                continue;
+            }
+            let item_raw = sItemBase {
+                iType: row.get::<Int>("Type") as i16,
+                iID: row.get::<Int>("ID") as i16,
+                iOpt: row.get("Opt"),
+                iTimeLimit: row.get("TimeLimit"),
+            };
+            attachments[slot_num as usize - 1] = item_raw.try_into_proto()?;
+        }
+        Ok(attachments)
+    }
+
+    fn save_email_items_sync(
+        tx: &rusqlite::Transaction,
+        pc_uid: BigInt,
+        msg_index: Int,
+        attachments: &[Option<Item>; EMAIL_ITEM_SLOTS],
+    ) -> FFResult<()> {
+        let sql = Self::read_sql("save_email_item")?;
+        let mut stmt = tx.prepare_cached(sql)?;
+        for (idx, item) in attachments.iter().enumerate() {
+            let Some(item) = item else {
+                continue;
+            };
+            let item_raw: sItemBase = Some(*item).into_proto();
+            stmt.execute(params_from_iter(
+                [
+                    &pc_uid as &dyn ToSql,
+                    &msg_index,
+                    &(idx as Int + 1),
+                    &(item_raw.iID as Int),
+                    &(item_raw.iType as Int),
+                    &item_raw.iOpt,
+                    &item_raw.iTimeLimit,
+                ]
+                .iter()
+                .copied(),
+            ))?;
+        }
+        Ok(())
     }
 
     fn save_player_sync(tx: &rusqlite::Transaction, player: &Player) -> FFResult<()> {
@@ -474,8 +554,13 @@ impl SqliteDatabase {
                 continue;
             }
 
-            let (loc, slot_num) = util::slot_num_to_loc_and_slot_num(slot_num)?;
-            player.set_item(loc, slot_num, item)?;
+            let (loc, bank_num, slot_num) = util::slot_num_to_location(slot_num)?;
+            match loc {
+                ItemLocation::Bank => player.set_bank_slot(bank_num, slot_num, item)?,
+                other => {
+                    player.set_item(other, slot_num, item)?;
+                }
+            }
         }
 
         let quest_items = Self::query(conn, "load_quest_items", &[&pc_uid])?;
@@ -565,7 +650,29 @@ impl SqliteDatabase {
         let rows = Self::query(conn, "load_blocked_ids", &[&player.get_uid()])?;
         for row in &rows {
             let blocked_uid: BigInt = row.get("BlockedPlayerId");
-            log_if_failed(player.block_player(blocked_uid));
+            // a blocked player may or may not also be a buddy. if they are,
+            // we just flip the flag; if not, they still need a list entry,
+            // because that's how the client models blocks.
+            if player.block_player(blocked_uid).is_ok() {
+                continue;
+            }
+            match Self::load_buddy_entry_sync(conn, blocked_uid) {
+                Ok(Some(entry)) => {
+                    log_if_failed(player.add_blocked_player(entry));
+                }
+                Ok(None) => log(
+                    Severity::Warning,
+                    &format!("Blocked player with UID {} not found", blocked_uid),
+                ),
+                Err(e) => log(
+                    Severity::Warning,
+                    &format!(
+                        "Failed to load blocked player with UID {}: {}",
+                        blocked_uid,
+                        e.get_msg()
+                    ),
+                ),
+            }
         }
         Ok(())
     }
@@ -893,6 +1000,175 @@ impl DbImpl for SqliteDatabase {
             .await??;
         assert_eq!(updated, 1);
         Ok(())
+    }
+
+    async fn get_unread_email_count(&self, pc_uid: BigInt) -> FFResult<Int> {
+        let conn = self.pool.get().await?;
+        conn.interact(move |conn| -> FFResult<Int> {
+            let rows = Self::query(conn, "get_unread_email_count", &[&pc_uid])?;
+            Ok(rows
+                .first()
+                .map_or(0, |row| row.get::<i64>("UnreadCount") as Int))
+        })
+        .await?
+    }
+
+    async fn load_emails(&self, pc_uid: BigInt, page_num: Int) -> FFResult<Vec<Email>> {
+        let conn = self.pool.get().await?;
+        conn.interact(move |conn| -> FFResult<Vec<Email>> {
+            // pages are 1-indexed
+            let offset = (page_num.max(1) - 1) * EMAIL_PAGE_SIZE as Int;
+            let rows = Self::query(conn, "load_emails", &[&pc_uid, &(offset as i64)])?;
+            let mut emails = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let mut email = Self::row_to_email(row)?;
+                email.pc_uid = pc_uid;
+                email.attachments =
+                    Self::load_email_attachments_sync(conn, pc_uid, email.msg_index)?;
+                emails.push(email);
+            }
+            Ok(emails)
+        })
+        .await?
+    }
+
+    async fn load_email(&self, pc_uid: BigInt, msg_index: Int) -> FFResult<Option<Email>> {
+        let conn = self.pool.get().await?;
+        conn.interact(move |conn| -> FFResult<Option<Email>> {
+            let rows = Self::query(conn, "load_email", &[&pc_uid, &msg_index])?;
+            let Some(row) = rows.first() else {
+                return Ok(None);
+            };
+            let mut email = Self::row_to_email(row)?;
+            email.pc_uid = pc_uid;
+            email.attachments = Self::load_email_attachments_sync(conn, pc_uid, msg_index)?;
+            Ok(Some(email))
+        })
+        .await?
+    }
+
+    async fn update_email(&self, email: &Email) -> FFResult<()> {
+        let conn = self.pool.get().await?;
+        let email = email.clone();
+        conn.interact(move |conn| -> FFResult<()> {
+            let tx = conn.transaction()?;
+            Self::exec_in(
+                &tx,
+                "update_email",
+                &[
+                    &email.pc_uid,
+                    &email.msg_index,
+                    &(email.read as Int),
+                    &(email.has_attachments() as Int),
+                    &(email.taros as Int),
+                ],
+            )?;
+            // rewrite the attachment set so claimed items disappear
+            Self::exec_in(&tx, "clear_email_items", &[&email.pc_uid, &email.msg_index])?;
+            Self::save_email_items_sync(&tx, email.pc_uid, email.msg_index, &email.attachments)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn delete_emails(&self, pc_uid: BigInt, msg_indices: &[i64]) -> FFResult<()> {
+        let conn = self.pool.get().await?;
+        let msg_indices = msg_indices.to_vec();
+        conn.interact(move |conn| -> FFResult<()> {
+            let tx = conn.transaction()?;
+            for msg_index in msg_indices {
+                if msg_index == 0 {
+                    continue;
+                }
+                let msg_index = msg_index as Int;
+                Self::exec_in(&tx, "clear_email_items", &[&pc_uid, &msg_index])?;
+                Self::exec_in(&tx, "delete_email", &[&pc_uid, &msg_index])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn send_email(&self, email: &Email) -> FFResult<Int> {
+        let conn = self.pool.get().await?;
+        let email = email.clone();
+        conn.interact(move |conn| -> FFResult<Int> {
+            let tx = conn.transaction()?;
+            let rows = Self::query(&tx, "get_next_email_index", &[&email.pc_uid])?;
+            let msg_index: Int = rows.first().map_or(1, |row| row.get("NextIndex"));
+            Self::exec_in(
+                &tx,
+                "save_email",
+                &[
+                    &email.pc_uid,
+                    &msg_index,
+                    &(email.read as Int),
+                    &(email.has_attachments() as Int),
+                    &email.sender_uid,
+                    &email.sender_first_name,
+                    &email.sender_last_name,
+                    &email.subject,
+                    &email.body,
+                    &(email.taros as Int),
+                    &(util::get_timestamp_sec(email.send_time) as Int),
+                    &(email.delete_time.map_or(0, util::get_timestamp_sec) as Int),
+                ],
+            )?;
+            Self::save_email_items_sync(&tx, email.pc_uid, msg_index, &email.attachments)?;
+            tx.commit()?;
+            Ok(msg_index)
+        })
+        .await?
+    }
+
+    async fn save_race_result(&self, result: &RaceResult) -> FFResult<()> {
+        let conn = self.pool.get().await?;
+        let result = *result;
+        conn.interact(move |conn| -> FFResult<()> {
+            Self::exec(
+                conn,
+                "save_race_result",
+                &[
+                    &(result.ep_id as BigInt),
+                    &result.pc_uid,
+                    &result.score,
+                    &result.num_pods,
+                    &result.time_s,
+                    &(result.timestamp as Int),
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn load_best_race_result(
+        &self,
+        ep_id: Int,
+        pc_uid: BigInt,
+    ) -> FFResult<Option<RaceResult>> {
+        let conn = self.pool.get().await?;
+        conn.interact(move |conn| -> FFResult<Option<RaceResult>> {
+            let rows = Self::query(
+                conn,
+                "load_best_race_result",
+                &[&(ep_id as BigInt), &pc_uid],
+            )?;
+            let Some(row) = rows.first() else {
+                return Ok(None);
+            };
+            Ok(Some(RaceResult {
+                ep_id: row.get::<BigInt>("EPID") as Int,
+                pc_uid: row.get("PlayerID"),
+                score: row.get("Score"),
+                num_pods: row.get("RingCount"),
+                time_s: row.get("Time"),
+                timestamp: row.get::<Int>("Timestamp") as u32,
+            }))
+        })
+        .await?
     }
 }
 

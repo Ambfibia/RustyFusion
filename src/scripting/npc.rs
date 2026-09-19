@@ -167,7 +167,13 @@ impl LuaUserData for NpcScriptContext {
                     None => return Err(LuaError::runtime("No target to attack")),
                 };
 
-                skills::do_basic_attack(EntityID::NPC(this.npc_id), &[target_id], false, state)?;
+                skills::do_basic_attack(
+                    EntityID::NPC(this.npc_id),
+                    &[target_id],
+                    false,
+                    skills::AttackContext::default(),
+                    state,
+                )?;
                 Ok(())
             }));
 
@@ -235,6 +241,35 @@ impl LuaUserData for NpcScriptContext {
                 state.entity_map.update(EntityID::NPC(this.npc_id), Some(chunk_pos), true);
                 Ok(())
             }));
+
+            luau_method!(methods, "summon_npc" -> "number",
+                |_, this, (ty, offset_x, offset_y, offset_z): (i32, i32, i32, i32)| this.with_state(|state| {
+                    tdata_get()
+                        .get_npc_stats(ty)
+                        .map_err(|e| LuaError::runtime(e.to_string()))?;
+
+                    let (pos, angle, instance_id) = {
+                        let summoner = state.get_npc(this.npc_id)?;
+                        (
+                            summoner.get_position(),
+                            summoner.get_rotation(),
+                            summoner.instance_id,
+                        )
+                    };
+                    let spawn_pos = Position {
+                        x: pos.x + offset_x,
+                        y: pos.y + offset_y,
+                        z: pos.z + offset_z,
+                    };
+
+                    let entity_map = &mut state.entity_map;
+                    let npc_id = entity_map.gen_next_npc_id();
+                    let npc = NPC::new(npc_id, ty, spawn_pos, angle, instance_id)
+                        .map_err(|e| LuaError::runtime(e.to_string()))?;
+                    helpers::spawn_temp_npc(entity_map, npc);
+                    Ok(npc_id)
+                })
+            );
 
             luau_method!(methods, "set_spawn_position" -> "()",
                 |_, this, (x, y, z): (i32, i32, i32)| this.with_npc(|npc| {

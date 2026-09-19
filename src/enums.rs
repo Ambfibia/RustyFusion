@@ -282,6 +282,19 @@ ffenum!(TimeBuffUpdate, i32, {
     // eTBU__End
 });
 
+// eWeaponTargetMode.cs
+// Determines how the client fires an equipped weapon, and therefore which
+// combat packets it will send for it.
+ffenum!(WeaponTargetMode, i32, {
+    Hand = 0,
+    Melee = 1,
+    Pistol = 2,
+    Shotgun = 3,
+    Sniper = 4,
+    Rocket = 5,
+    Grenade = 6,
+});
+
 // eTransportationType.cs
 ffenum!(TransportationType, i32, {
     // eTT_None
@@ -298,6 +311,12 @@ ffenum!(TeleportType, i32, {
     MyLocation = 2,      // eCN_GM_TeleportMapType__MyLocation
     SomeoneLocation = 3, // eCN_GM_TeleportMapType__SomeoneLocation
     Unstick = 4,         // eCN_GM_TeleportMapType__Unstick
+});
+
+// Infected Zone race mode (CN_EP_RACE_MODE_*)
+ffenum!(RacingMode, i32, {
+    Practice = CN_EP_RACE_MODE_PRACTICE as i32,
+    Record = CN_EP_RACE_MODE_RECORD as i32,
 });
 
 // eRideType.cs

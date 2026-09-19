@@ -302,6 +302,31 @@ impl EntityMap {
         Ok(())
     }
 
+    /// Narrows a list of entity IDs down to the ones within `range` of a point
+    /// in a given instance. Used to validate a projectile's blast radius.
+    pub fn filter_ids_in_proximity(
+        &self,
+        point: Position,
+        instance_id: InstanceID,
+        ids: &[EntityID],
+        range: u32,
+    ) -> Vec<EntityID> {
+        let mut within_range = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(entry) = self.registry.get(id) else {
+                continue;
+            };
+            if entry.entity.get_chunk_coords().i != instance_id {
+                continue;
+            }
+            if entry.entity.get_position().distance_to(&point) > range {
+                continue;
+            }
+            within_range.push(*id);
+        }
+        within_range
+    }
+
     pub fn gen_next_pc_id(&mut self) -> i32 {
         let id = self.next_pc_id;
         if id == u32::MAX {

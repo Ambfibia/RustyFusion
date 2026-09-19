@@ -36,12 +36,20 @@ futures = "0.3.32"
 mlua = { version = "0.11.6", features = ["luau", "send"] }
 
 [features]
-default = ["postgres"]
+default = ["sqlite"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 sqlite = ["dep:deadpool-sqlite"]
 
-[profile.dev.package.backtrace]
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
 opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 [build-dependencies]
 regex = "1.12.3"

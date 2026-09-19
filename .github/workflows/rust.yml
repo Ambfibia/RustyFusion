@@ -56,8 +56,8 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "stable, ${{ needs.read_msrv.outputs.msrv }}"
-      - run: cargo build --verbose
-      - run: cargo test -- --include-ignored
+      - run: cargo build --no-default-features --features postgres --verbose
+      - run: cargo test --no-default-features --features postgres -- --include-ignored
       - run: mv target/debug/* ./
       - uses: actions/upload-artifact@v6
         if: ${{ github.event_name != 'pull_request' && github.ref_name == 'main' }}
@@ -88,8 +88,8 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "stable, ${{ needs.read_msrv.outputs.msrv }}"
-      - run: cargo build --no-default-features --features sqlite --verbose
-      - run: cargo test --no-default-features --features sqlite
+      - run: cargo build --verbose
+      - run: cargo test
       - run: mv target/debug/* ./
       - uses: actions/upload-artifact@v6
         if: ${{ github.event_name != 'pull_request' && github.ref_name == 'main' }}

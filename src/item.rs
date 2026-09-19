@@ -1,9 +1,12 @@
-use std::{cmp::min, time::SystemTime};
+use std::{
+    cmp::min,
+    time::{Duration, SystemTime},
+};
 
 use crate::{
     defines::*,
     entity::RewardData,
-    enums::{ItemType, RewardCategory, RewardType},
+    enums::{ItemType, RewardCategory, RewardType, WeaponTargetMode},
     error::{FFError, FFResult},
     net::packet::*,
     tabledata::tdata_get,
@@ -43,6 +46,16 @@ impl Item {
 
     pub fn set_expiry_time(&mut self, time: SystemTime) {
         self.expiry_time = Some(time);
+    }
+
+    /// Croc Pot changes the appearance owner's stats, retaining its existing look
+    /// and expiry. Equipment iOpt contains only the appearance ID (no stack count).
+    pub fn combine_stats(&self, stats: &Item) -> Item {
+        let mut result=*self;
+        result.appearance_id=Some(self.appearance_id.unwrap_or(self.id));
+        result.id=stats.id;
+        result.quantity=0;
+        result
     }
 
     pub fn set_appearance(&mut self, looks_item: &Item) {
@@ -150,6 +163,11 @@ pub struct ItemStats {
     pub gender: Option<i8>,
     pub single_power: Option<i32>,
     pub multi_power: Option<i32>,
+    /// How the client fires this weapon. Rockets and grenades are the two
+    /// modes that produce projectiles.
+    pub target_mode: Option<WeaponTargetMode>,
+    /// How long a projectile from this weapon stays in the air.
+    pub projectile_time: Option<Duration>,
     pub defense: Option<i32>,
     pub speed: Option<i32>,
 }
@@ -249,5 +267,20 @@ impl Reward {
             self.fusion_matter = (self.fusion_matter as f32 * factor) as u32;
         }
         self
+    }
+}
+
+#[cfg(test)] mod crocpot_tests {
+    use super::*;
+    #[test] fn combining_retains_original_look_and_expiry_and_matches_openfusion_wire_item(){
+        let mut looks=Item::new(ItemType::Hand,10);let mut stats=Item::new(ItemType::Hand,20);
+        looks.expiry_time=Some(SystemTime::UNIX_EPOCH + Duration::from_secs(100));
+        stats.quantity=1;
+        let combined=looks.combine_stats(&stats);
+        let wire:sItemBase=Some(combined).into_proto();
+        let opt=wire.iOpt;let id=wire.iID;let expiry=wire.iTimeLimit;
+        assert_eq!(id,20);assert_eq!(opt,10<<16);assert_eq!(expiry,100);
+        let again=combined.combine_stats(&Item::new(ItemType::Hand,30));
+        let wire:sItemBase=Some(again).into_proto();let opt=wire.iOpt;assert_eq!(opt,10<<16);
     }
 }

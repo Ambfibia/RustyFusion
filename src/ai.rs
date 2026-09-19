@@ -5,10 +5,19 @@ use crate::{
     tabledata::tdata_get,
 };
 
+/// Lord Fuse fights in three bodies. The first two summon the next stage (and
+/// one of his arms) when they go down; the last one is just a mob.
+pub const NPC_TYPE_FUSE_STAGE_1: i32 = 2466;
+pub const NPC_TYPE_FUSE_STAGE_2: i32 = 2467;
+
 fn get_script_name(npc: &NPC) -> Option<&'static str> {
     let is_combatant = npc.as_combatant().is_some();
     if !is_combatant {
         return None;
+    }
+
+    if matches!(npc.ty, NPC_TYPE_FUSE_STAGE_1 | NPC_TYPE_FUSE_STAGE_2) {
+        return Some("lord_fuse");
     }
 
     let stats = tdata_get().get_npc_stats(npc.ty).unwrap();

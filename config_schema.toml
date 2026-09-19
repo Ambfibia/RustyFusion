@@ -59,9 +59,6 @@ db_path = "database.db" # path to database file (SQLite only)
 #: String
 table_data_path = "tabledata/" # path to OpenFusion table data repository
 
-#: FFProtocol
-protocol = "v0104" # the protocol version to use (v0104 or v1013)
-
 [login]
 
 #: String
@@ -150,3 +147,26 @@ num_sliders = 20 # how many sliders (evenly spaced out) there should be on the s
 #: u64
 vehicle_duration = 10_080  # how long (minutes) after a vehicle is bought before it expires
                            # defaults to one week
+
+#: bool
+iz_race_score_capped = true # whether Infected Zone race scores are clamped to the
+                            # per-zone score cap from tabledata. OpenFusion makes this
+                            # optional, since uncapped scores are useful for testing
+
+# Native server defaults, not recovered legacy prices. All prices are Taros.
+#: bool
+barber_allow_gender = true
+#: u32
+barber_gender_cost = 500
+#: u32
+barber_body_cost = 100
+#: u32
+barber_skin_cost = 100
+#: u32
+barber_hair_cost = 100
+#: u32
+barber_hair_color_cost = 50
+#: u32
+barber_face_cost = 100
+#: u32
+barber_eye_cost = 50

@@ -436,22 +436,39 @@ pub fn get_uid() -> i64 {
     rand::thread_rng().gen_range(1..i64::MAX)
 }
 
-pub fn slot_num_to_loc_and_slot_num(mut slot_num: usize) -> FFResult<(ItemLocation, usize)> {
+/// Total number of flat item save slots: equipment, main inventory, and every
+/// bank laid out end to end.
+pub fn total_item_slots() -> usize {
+    (SIZEOF_EQUIP_SLOT + SIZEOF_INVEN_SLOT) as usize
+        + SIZEOF_BANK_SLOT as usize * (NUM_EXTRA_BANKS + 1)
+}
+
+/// Resolves a flat save slot number into a location, a bank number (0 for
+/// everything that isn't a bank) and the index within that location.
+///
+/// The banks sit end to end after the main inventory, with bank 0 first, so
+/// the numbering of pre-existing saves is unchanged.
+pub fn slot_num_to_location(mut slot_num: usize) -> FFResult<(ItemLocation, usize, usize)> {
     if slot_num < SIZEOF_EQUIP_SLOT as usize {
-        return Ok((ItemLocation::Equip, slot_num));
+        return Ok((ItemLocation::Equip, 0, slot_num));
     }
     slot_num -= SIZEOF_EQUIP_SLOT as usize;
 
     if slot_num < SIZEOF_INVEN_SLOT as usize {
-        return Ok((ItemLocation::Inven, slot_num));
+        return Ok((ItemLocation::Inven, 0, slot_num));
     }
     slot_num -= SIZEOF_INVEN_SLOT as usize;
 
     // NOTE: quest items are not stored in inventory slots,
     // so do NOT factor in SIZEOF_QINVEN_SLOT
 
-    if slot_num < SIZEOF_BANK_SLOT as usize {
-        return Ok((ItemLocation::Bank, slot_num));
+    let bank_num = slot_num / SIZEOF_BANK_SLOT as usize;
+    if bank_num <= NUM_EXTRA_BANKS {
+        return Ok((
+            ItemLocation::Bank,
+            bank_num,
+            slot_num % SIZEOF_BANK_SLOT as usize,
+        ));
     }
 
     Err(FFError::build(

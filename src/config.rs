@@ -3,7 +3,6 @@ use std::{collections::HashMap, fmt::Write as _, net::SocketAddr, sync::OnceLock
 use serde::Deserialize;
 
 use crate::error::*;
-use crate::net::FFProtocol;
 
 include!(concat!(env!("OUT_DIR"), "/config_generated.rs"));
 
@@ -147,12 +146,6 @@ impl SettingDefault<String> for &str {
 impl SettingDefault<SocketAddr> for &str {
     fn setting_default(self) -> SocketAddr {
         self.parse().expect("Invalid default SocketAddr")
-    }
-}
-impl SettingDefault<FFProtocol> for &str {
-    fn setting_default(self) -> FFProtocol {
-        let deserializer = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(self);
-        FFProtocol::deserialize(deserializer).expect("Invalid default FFProtocol")
     }
 }
 

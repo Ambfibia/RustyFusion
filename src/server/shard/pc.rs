@@ -191,6 +191,10 @@ pub async fn pc_enter(
         ),
     );
 
+    // The client sizes its nano array from the book size we send it, and it
+    // has to know that size before it processes the login packet.
+    send_nano_book(clients.get_sender(), &player, true);
+
     let player_uid = player.get_uid();
     state.entity_map.track(Box::new(player), TickMode::Always);
     state.player_uid_to_id.insert(player_uid, pc_id);
@@ -199,7 +203,42 @@ pub async fn pc_enter(
         .get_sender()
         .send_packet(P_FE2CL_REP_PC_ENTER_SUCC, &resp);
 
+    // ...and the contents afterwards, while the client is loading
+    let player = state.get_player(pc_id)?;
+    send_nano_book(clients.get_sender(), player, false);
+
     Ok(())
+}
+
+/// Streams the nano book to the client in chunks.
+///
+/// The login packet only carries a fixed 37-nano prefix, which isn't enough
+/// for XDTs that define more. This packet lets the client resize its nano
+/// array and then receive the contents.
+fn send_nano_book(client: &FFClient, player: &Player, resize_only: bool) {
+    let book_size = tdata_get().get_nano_book_size();
+    let mut pkt = sP_FE2CL_REP_NANO_BOOK_SUBSET {
+        // Despite the field name, FFOne associates this page with the live
+        // shard player ID, not the persistent database character UID.
+        PCUID: i64::from(player.get_player_id()),
+        bookSize: book_size as i32,
+        elementOffset: 0,
+        element: Default::default(),
+    };
+
+    if resize_only {
+        // an empty subset just triggers the array resize
+        client.send_packet(P_FE2CL_REP_NANO_BOOK_SUBSET, &pkt);
+        return;
+    }
+
+    let book = player.nano_data.as_full_book(book_size);
+    for (chunk_idx, chunk) in book.chunks(NANO_BOOK_SUBSET_SIZE).enumerate() {
+        pkt.elementOffset = (chunk_idx * NANO_BOOK_SUBSET_SIZE) as i32;
+        pkt.element = Default::default();
+        pkt.element[..chunk.len()].copy_from_slice(chunk);
+        client.send_packet(P_FE2CL_REP_NANO_BOOK_SUBSET, &pkt);
+    }
 }
 
 pub async fn pc_exit(clients: &ClientMap<'_>, state: Arc<Mutex<ShardServerState>>) -> FFResult<()> {
@@ -904,4 +943,283 @@ pub fn pc_warp_channel(
             .get_sender()
             .send_packet(P_FE2CL_REP_PC_WARP_CHANNEL_FAIL, &resp);
     })
+}
+
+//
+// Infected Zone movement elements.
+//
+// These are all the same shape: the client tells us where its physics put the
+// player, we trust it (same as regular movement), keep the authoritative
+// position in sync so chunking and proximity checks stay correct, and relay
+// the motion to everyone nearby so they see the same animation.
+//
+
+pub fn pc_jumppad(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+    time: SystemTime,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+    let pkt: &sP_CL2FE_REQ_PC_JUMPPAD = pkt.get()?;
+    let pos = Position {
+        x: pkt.iX,
+        y: pkt.iY,
+        z: pkt.iZ,
+    };
+
+    let resp = sP_FE2CL_PC_JUMPPAD {
+        iCliTime: pkt.iCliTime,
+        iX: pkt.iX,
+        iY: pkt.iY,
+        iZ: pkt.iZ,
+        iVX: pkt.iVX,
+        iVY: pkt.iVY,
+        iVZ: pkt.iVZ,
+        iAngle: pkt.iAngle,
+        cKeyValue: pkt.cKeyValue,
+        iPC_ID: pc_id,
+        iSvrTime: util::get_timestamp_ms(time),
+    };
+    let angle = pkt.iAngle;
+
+    state
+        .entity_map
+        .for_each_around(EntityID::Player(pc_id), |client| {
+            client.send_packet(P_FE2CL_PC_JUMPPAD, &resp);
+        });
+
+    update_player_pos(pc_id, pos, Some(angle), state)
+}
+
+pub fn pc_launcher(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+    time: SystemTime,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+    let pkt: &sP_CL2FE_REQ_PC_LAUNCHER = pkt.get()?;
+    let pos = Position {
+        x: pkt.iX,
+        y: pkt.iY,
+        z: pkt.iZ,
+    };
+
+    let resp = sP_FE2CL_PC_LAUNCHER {
+        iCliTime: pkt.iCliTime,
+        iX: pkt.iX,
+        iY: pkt.iY,
+        iZ: pkt.iZ,
+        iVX: pkt.iVX,
+        iVY: pkt.iVY,
+        iVZ: pkt.iVZ,
+        iAngle: pkt.iAngle,
+        iSpeed: pkt.iSpeed,
+        iPC_ID: pc_id,
+        iSvrTime: util::get_timestamp_ms(time),
+    };
+    let angle = pkt.iAngle;
+
+    state
+        .entity_map
+        .for_each_around(EntityID::Player(pc_id), |client| {
+            client.send_packet(P_FE2CL_PC_LAUNCHER, &resp);
+        });
+
+    update_player_pos(pc_id, pos, Some(angle), state)
+}
+
+pub fn pc_zipline(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+    time: SystemTime,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+    let pkt: &sP_CL2FE_REQ_PC_ZIPLINE = pkt.get()?;
+    let pos = Position {
+        x: pkt.iX,
+        y: pkt.iY,
+        z: pkt.iZ,
+    };
+
+    let resp = sP_FE2CL_PC_ZIPLINE {
+        iCliTime: pkt.iCliTime,
+        iStX: pkt.iStX,
+        iStY: pkt.iStY,
+        iStZ: pkt.iStZ,
+        fMovDistance: pkt.fMovDistance,
+        fMaxDistance: pkt.fMaxDistance,
+        fDummy: pkt.fDummy,
+        iX: pkt.iX,
+        iY: pkt.iY,
+        iZ: pkt.iZ,
+        fVX: pkt.fVX,
+        fVY: pkt.fVY,
+        fVZ: pkt.fVZ,
+        bDown: pkt.bDown,
+        iRollMax: pkt.iRollMax,
+        iRoll: pkt.iRoll,
+        iAngle: pkt.iAngle,
+        iSpeed: pkt.iSpeed,
+        iPC_ID: pc_id,
+        iSvrTime: util::get_timestamp_ms(time),
+    };
+    let angle = pkt.iAngle;
+
+    state
+        .entity_map
+        .for_each_around(EntityID::Player(pc_id), |client| {
+            client.send_packet(P_FE2CL_PC_ZIPLINE, &resp);
+        });
+
+    update_player_pos(pc_id, pos, Some(angle), state)
+}
+
+pub fn pc_moveplatform(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+    time: SystemTime,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+    let pkt: &sP_CL2FE_REQ_PC_MOVEPLATFORM = pkt.get()?;
+    let pos = Position {
+        x: pkt.iX,
+        y: pkt.iY,
+        z: pkt.iZ,
+    };
+
+    let resp = sP_FE2CL_PC_MOVEPLATFORM {
+        iCliTime: pkt.iCliTime,
+        iLcX: pkt.iLcX,
+        iLcY: pkt.iLcY,
+        iLcZ: pkt.iLcZ,
+        iX: pkt.iX,
+        iY: pkt.iY,
+        iZ: pkt.iZ,
+        fVX: pkt.fVX,
+        fVY: pkt.fVY,
+        fVZ: pkt.fVZ,
+        bDown: pkt.bDown,
+        iPlatformID: pkt.iPlatformID,
+        iAngle: pkt.iAngle,
+        cKeyValue: pkt.cKeyValue,
+        iSpeed: pkt.iSpeed,
+        iPC_ID: pc_id,
+        iSvrTime: util::get_timestamp_ms(time),
+    };
+    let angle = pkt.iAngle;
+
+    state
+        .entity_map
+        .for_each_around(EntityID::Player(pc_id), |client| {
+            client.send_packet(P_FE2CL_PC_MOVEPLATFORM, &resp);
+        });
+
+    update_player_pos(pc_id, pos, Some(angle), state)
+}
+
+pub fn pc_slope(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+    time: SystemTime,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+    let pkt: &sP_CL2FE_REQ_PC_SLOPE = pkt.get()?;
+    let pos = Position {
+        x: pkt.iX,
+        y: pkt.iY,
+        z: pkt.iZ,
+    };
+
+    let resp = sP_FE2CL_PC_SLOPE {
+        iCliTime: pkt.iCliTime,
+        iX: pkt.iX,
+        iY: pkt.iY,
+        iZ: pkt.iZ,
+        iAngle: pkt.iAngle,
+        iSpeed: pkt.iSpeed,
+        cKeyValue: pkt.cKeyValue,
+        iPC_ID: pc_id,
+        iSvrTime: util::get_timestamp_ms(time),
+        fVX: pkt.fVX,
+        fVY: pkt.fVY,
+        fVZ: pkt.fVZ,
+        iSlopeID: pkt.iSlopeID,
+    };
+    let angle = pkt.iAngle;
+
+    state
+        .entity_map
+        .for_each_around(EntityID::Player(pc_id), |client| {
+            client.send_packet(P_FE2CL_PC_SLOPE, &resp);
+        });
+
+    update_player_pos(pc_id, pos, Some(angle), state)
+}
+
+/// Relays an Infected Zone switch (the "IM" puzzle switches) to everyone in
+/// the same instance. The switch state itself lives in the client's copy of
+/// the map, so all the server has to do is keep the instance in sync.
+pub fn pc_change_switch_status(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+    let pkt: &sP_CL2FE_REQ_IM_CHANGE_SWITCH_STATUS = pkt.get()?;
+
+    let player = state.get_player(pc_id)?;
+    let instance_id = player.instance_id;
+
+    let resp = sP_FE2CL_REP_IM_CHANGE_SWITCH_STATUS {
+        iMapNum: instance_id.map_num as i32,
+        iSwitchLID: pkt.iSwitchLID,
+        iSwitchGID: unused!(),
+        iSwitchStatus: 1,
+    };
+
+    let pc_ids: Vec<i32> = state
+        .entity_map
+        .find_players(|p| p.instance_id == instance_id)
+        .into_iter()
+        .collect();
+    for other_id in pc_ids {
+        let Ok(other) = state.get_player(other_id) else {
+            continue;
+        };
+        if let Some(other_client) = other.get_client() {
+            other_client.send_packet(P_FE2CL_REP_IM_CHANGE_SWITCH_STATUS, &resp);
+        }
+    }
+
+    Ok(())
+}
+
+/// Keeps the authoritative position (and hence chunking) in step with a
+/// client-driven movement packet.
+fn update_player_pos(
+    pc_id: i32,
+    pos: Position,
+    angle: Option<i32>,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let player = state.get_player_mut(pc_id)?;
+    let entity_id = player.get_id();
+    player.set_position(pos);
+    if let Some(angle) = angle {
+        player.set_rotation(angle);
+    }
+    let chunk = player.get_chunk_coords();
+    state.entity_map.update(entity_id, Some(chunk), true);
+    Ok(())
 }

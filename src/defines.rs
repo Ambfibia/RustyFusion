@@ -127,7 +127,21 @@ pub const WPN_EQUIP_TYPE_DH_THROW: u32 = 10;
 pub const WPN_EQUIP_TYPE_DH_ROCKET: u32 = 11;
 pub const SIZEOF_INVEN_SLOT: u32 = 50;
 pub const SIZEOF_QINVEN_SLOT: u32 = 50;
-pub const SIZEOF_BANK_SLOT: u32 = 119;
+pub const SIZEOF_BANK_SLOT: u32 = 200;
+/// Number of membership ("extra") banks on top of the main one.
+pub const NUM_EXTRA_BANKS: usize = 4;
+
+/// General items that unlock each membership bank.
+pub const ID_GOLD_MEMBERSHIP_CARD: i16 = 5;
+pub const ID_EMERALD_MEMBERSHIP_CARD: i16 = 29;
+pub const ID_RUBY_MEMBERSHIP_CARD: i16 = 30;
+pub const ID_SAPPHIRE_MEMBERSHIP_CARD: i16 = 32;
+
+/// NPC types that open each membership bank.
+pub const TYPE_EMERALD_BANKER: i32 = 2507;
+pub const TYPE_GOLD_BANKER: i32 = 2586;
+pub const TYPE_RUBY_BANKER: i32 = 3124;
+pub const TYPE_SAPPHIRE_BANKER: i32 = 3129;
 pub const SIZEOF_RESTORE_SLOT: u32 = 5;
 pub const SIZEOF_NANO_BANK_SLOT: u32 = 37;
 pub const SIZEOF_QUEST_SLOT: u32 = 1024;

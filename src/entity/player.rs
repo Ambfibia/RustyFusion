@@ -2,7 +2,8 @@ use std::{
     any::Any,
     collections::HashMap,
     fmt::Display,
-    time::{Duration, SystemTime},
+    ops::RangeInclusive,
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
@@ -57,11 +58,71 @@ pub struct PlayerStyle {
     pub height: i8,
     pub body: i8,
 }
+/// The palettes the client can build a character from.
+///
+/// These are the client's own editable palettes; anything outside them would
+/// render wrong, so character creation and appearance changes are both
+/// validated against them.
+struct StylePalette;
+impl StylePalette {
+    const BODY: RangeInclusive<i8> = 0..=2;
+    const EYE_COLOR: RangeInclusive<i8> = 1..=10;
+    const GENDER: RangeInclusive<i8> = 1..=2;
+    const HAIR_COLOR: RangeInclusive<i8> = 1..=54;
+    const HEIGHT: RangeInclusive<i8> = 0..=4;
+    const SKIN_COLOR: RangeInclusive<i8> = 1..=36;
+    // face and hair styles come from separate, gender-specific sets
+    const MALE_FACE_STYLE: RangeInclusive<i8> = 1..=5;
+    const MALE_HAIR_STYLE: RangeInclusive<i8> = 1..=23;
+    const FEMALE_FACE_STYLE: RangeInclusive<i8> = 6..=10;
+    const FEMALE_HAIR_STYLE: RangeInclusive<i8> = 25..=45;
+}
+
 impl TryFrom<sPCStyle> for PlayerStyle {
     type Error = FFError;
 
     fn try_from(style: sPCStyle) -> FFResult<Self> {
-        // TODO style validation
+        let bad = |field: &str, value: i8| {
+            FFError::build(
+                Severity::Warning,
+                format!("Invalid character style: {} = {}", field, value),
+            )
+        };
+
+        if !StylePalette::BODY.contains(&style.iBody) {
+            return Err(bad("body", style.iBody));
+        }
+        if !StylePalette::EYE_COLOR.contains(&style.iEyeColor) {
+            return Err(bad("eye color", style.iEyeColor));
+        }
+        if !StylePalette::GENDER.contains(&style.iGender) {
+            return Err(bad("gender", style.iGender));
+        }
+        if !StylePalette::HAIR_COLOR.contains(&style.iHairColor) {
+            return Err(bad("hair color", style.iHairColor));
+        }
+        if !StylePalette::HEIGHT.contains(&style.iHeight) {
+            return Err(bad("height", style.iHeight));
+        }
+        if !StylePalette::SKIN_COLOR.contains(&style.iSkinColor) {
+            return Err(bad("skin color", style.iSkinColor));
+        }
+
+        let (face_styles, hair_styles) = if style.iGender == GENDER_MALE as i8 {
+            (StylePalette::MALE_FACE_STYLE, StylePalette::MALE_HAIR_STYLE)
+        } else {
+            (
+                StylePalette::FEMALE_FACE_STYLE,
+                StylePalette::FEMALE_HAIR_STYLE,
+            )
+        };
+        if !face_styles.contains(&style.iFaceStyle) {
+            return Err(bad("face style", style.iFaceStyle));
+        }
+        if !hair_styles.contains(&style.iHairStyle) {
+            return Err(bad("hair style", style.iHairStyle));
+        }
+
         Ok(Self {
             gender: style.iGender,
             face_style: style.iFaceStyle,
@@ -151,6 +212,20 @@ impl Nanocom {
         bank
     }
 
+    /// The full nano book, sized to the nano table rather than the fixed
+    /// prefix that fits in the login packet. The client resizes its nano
+    /// array from the book size we send it.
+    pub fn as_full_book(&self, book_size: usize) -> Vec<sNano> {
+        let mut book = vec![None.into_proto(); book_size];
+        for (id, nano) in &self.nano_inventory {
+            let idx = *id as usize;
+            if idx < book_size {
+                book[idx] = Some(nano).into_proto();
+            }
+        }
+        book
+    }
+
     pub fn as_slots(&self) -> [i16; SIZEOF_NANO_CARRY_SLOT as usize] {
         let mut slots = [0; SIZEOF_NANO_CARRY_SLOT as usize];
         for (idx, nano_id) in self.equipped_ids.iter().enumerate() {
@@ -186,7 +261,11 @@ struct PlayerInventory {
     main: [Option<Item>; SIZEOF_INVEN_SLOT as usize],
     equipped: [Option<Item>; SIZEOF_EQUIP_SLOT as usize],
     quest: [Option<(i16, usize)>; SIZEOF_QINVEN_SLOT as usize],
-    bank: [Option<Item>; SIZEOF_BANK_SLOT as usize],
+    /// Bank 0 is the ordinary bank; 1..=4 are the membership banks the
+    /// Retrobution client exposes through its own banker NPCs.
+    banks: [[Option<Item>; SIZEOF_BANK_SLOT as usize]; NUM_EXTRA_BANKS + 1],
+    /// Which bank `ItemLocation::Bank` currently refers to.
+    active_bank: usize,
 }
 impl Default for PlayerInventory {
     fn default() -> Self {
@@ -194,7 +273,8 @@ impl Default for PlayerInventory {
             main: [None; SIZEOF_INVEN_SLOT as usize],
             equipped: [None; SIZEOF_EQUIP_SLOT as usize],
             quest: [None; SIZEOF_QINVEN_SLOT as usize],
-            bank: [None; SIZEOF_BANK_SLOT as usize],
+            banks: [[None; SIZEOF_BANK_SLOT as usize]; NUM_EXTRA_BANKS + 1],
+            active_bank: 0,
         }
     }
 }
@@ -289,10 +369,55 @@ impl RewardData {
     }
 }
 
+/// What kind of projectile is in the air. Rockets carry the weapon item ID so
+/// the client can render the right model; grenades are all the same.
+#[derive(Debug, Clone, Copy)]
+pub enum ProjectileKind {
+    Grenade,
+    Rocket(i16),
+}
+
+/// A rocket or grenade a player has fired but which hasn't detonated yet.
+/// The damage numbers are locked in at fire time so that swapping weapons
+/// mid-flight can't change the payload.
+#[derive(Debug, Clone, Copy)]
+pub struct Projectile {
+    pub kind: ProjectileKind,
+    pub single_power: i32,
+    pub multi_power: i32,
+    pub charged: bool,
+    pub start_pos: Position,
+    pub end_pos: Position,
+    pub expires: SystemTime,
+}
+impl From<Projectile> for sPCBullet {
+    fn from(value: Projectile) -> Self {
+        Self {
+            eAT: unused!(),
+            iID: match value.kind {
+                ProjectileKind::Grenade => 1,
+                ProjectileKind::Rocket(item_id) => item_id as i32,
+            },
+            bCharged: value.charged as i32,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PreWarpData {
     pub instance_id: InstanceID,
     pub position: Position,
+}
+
+/// The Stim Pak condition flag that corresponds to a nano carry slot.
+/// There is one per slot, so the client can show which nano is boosted.
+fn stim_pak_buff_for_slot(slot: usize) -> Option<BuffID> {
+    match slot {
+        0 => Some(BuffID::StimPakSlot1),
+        1 => Some(BuffID::StimPakSlot2),
+        2 => Some(BuffID::StimPakSlot3),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +520,28 @@ impl BuddyList {
         Ok(idx)
     }
 
+    /// Adds an entry straight to the list in the blocked state. Used for
+    /// blocking someone who was never a buddy, and when loading blocks from
+    /// the DB (blocked players occupy buddy list slots on the client).
+    fn insert_blocked(&mut self, mut entry: BuddyListEntry) -> FFResult<usize> {
+        if let Some(idx) = self.get_buddy_slot_number(entry.pc_uid) {
+            self.slots[idx].as_mut().unwrap().blocked = true;
+            return Ok(idx);
+        }
+        entry.blocked = true;
+        self.insert_buddy(entry)
+    }
+
+    fn get_entry(&self, slot_num: usize) -> Option<&BuddyListEntry> {
+        self.slots.get(slot_num)?.as_deref()
+    }
+
+    fn is_blocked(&self, pc_uid: i64) -> bool {
+        self.get_buddy_slot_number(pc_uid)
+            .and_then(|idx| self.slots[idx].as_ref())
+            .is_some_and(|entry| entry.blocked)
+    }
+
     fn get_num_buddies(&self) -> usize {
         self.slots.iter().filter(|entry| entry.is_some()).count()
     }
@@ -441,12 +588,18 @@ pub struct Player {
     fusion_matter: u32,
     nano_potions: u32,
     weapon_boosts: u32,
+    owned_projectiles: HashMap<i8, Projectile>,
+    next_projectile_id: i8,
     pub buddy_list_synced: bool,
     buddy_list: BuddyList,
     pub buddy_offered_to: Option<i64>,
     pub buddy_warp_available_at: Option<u32>,
     last_heal_time: Option<SystemTime>,
     pub last_warp_away_time: Option<SystemTime>,
+    /// Last time this player asked for the set of NPC types around them.
+    /// Used to rate-limit a request the Retrobution client can spam.
+    pub last_npc_type_sync: Option<Instant>,
+    pub barber_session: Option<crate::barber::BarberSession>,
     pub skyway_ride: Option<SkywayRideState>,
     pub trade_id: Option<Uuid>,
     pub trade_offered_to: Option<i32>,
@@ -547,6 +700,11 @@ impl Player {
         self.nano_data.nano_inventory.insert(nano.get_id(), nano);
     }
 
+    /// The nano ID equipped in a carry slot, if any.
+    pub fn get_equipped_nano_id(&self, slot: usize) -> Option<i16> {
+        *self.nano_data.equipped_ids.get(slot)?
+    }
+
     pub fn get_active_nano_slot(&self) -> Option<usize> {
         self.nano_data.active_slot
     }
@@ -577,6 +735,36 @@ impl Player {
         self.nano_data.active_slot = None;
     }
 
+    /// Whether the active nano is currently boosted by a gumball.
+    ///
+    /// The boost lives in the Stim Pak condition flag for the nano's own slot,
+    /// which is how the client tracks it too.
+    /// Overrides how long an already-applied buff lasts. Used by E.G.G.s,
+    /// whose duration comes from the egg table rather than the skill table.
+    pub fn override_buff_duration(&mut self, buff_id: BuffID, duration: Duration) -> bool {
+        self.buffs.set_buff_duration(buff_id, duration)
+    }
+
+    pub fn get_nano_boost(&self) -> bool {
+        let Some(slot) = self.nano_data.active_slot else {
+            return false;
+        };
+        let Some(buff_id) = stim_pak_buff_for_slot(slot) else {
+            return false;
+        };
+        self.has_buff(buff_id, None)
+    }
+
+    /// Index into a skill's per-level value arrays for this player's nano.
+    /// A boosted nano uses the top tier.
+    pub fn get_nano_skill_level(&self) -> usize {
+        if self.get_nano_boost() {
+            SKILL_LEVEL_MAX
+        } else {
+            0
+        }
+    }
+
     pub fn activate_nano(&mut self, slot: usize) -> FFResult<bool> {
         self.deactivate_nano();
         self.set_active_nano_slot(Some(slot))?;
@@ -584,7 +772,7 @@ impl Player {
         if let Some(skill) = self.get_active_nano().and_then(|n| n.get_skill()) {
             if skill.passive {
                 if let Some(buff_id) = skill.get_buff_id() {
-                    let level = placeholder!(0);
+                    let level = self.get_nano_skill_level();
                     let buff = skill.make_buff_instance(BuffType::Nano, level).unwrap();
                     let id = self.get_id();
                     self.apply_buff(buff_id, buff, Some(id));
@@ -851,7 +1039,7 @@ impl Player {
             ItemLocation::QInven => unimplemented!("Quest items not accessible by slot number"),
             ItemLocation::Bank => {
                 if slot_num < SIZEOF_BANK_SLOT as usize {
-                    Ok(&self.inventory.bank[slot_num])
+                    Ok(&self.inventory.banks[self.inventory.active_bank][slot_num])
                 } else {
                     err
                 }
@@ -894,7 +1082,8 @@ impl Player {
             ItemLocation::QInven => unimplemented!("Quest items not accessible by slot number"),
             ItemLocation::Bank => {
                 if slot_num < SIZEOF_BANK_SLOT as usize {
-                    Ok(&mut self.inventory.bank[slot_num])
+                    let active_bank = self.inventory.active_bank;
+                    Ok(&mut self.inventory.banks[active_bank][slot_num])
                 } else {
                     err_oob
                 }
@@ -976,9 +1165,7 @@ impl Player {
                 .iter()
                 .filter(|slot| slot.is_none())
                 .count(),
-            ItemLocation::Bank => self
-                .inventory
-                .bank
+            ItemLocation::Bank => self.inventory.banks[self.inventory.active_bank]
                 .iter()
                 .filter(|slot| slot.is_none())
                 .count(),
@@ -990,7 +1177,7 @@ impl Player {
             ItemLocation::Equip => self.inventory.equipped.as_slice(),
             ItemLocation::Inven => self.inventory.main.as_slice(),
             ItemLocation::QInven => unimplemented!("Quest item inventory not searchable"),
-            ItemLocation::Bank => self.inventory.bank.as_slice(),
+            ItemLocation::Bank => self.inventory.banks[self.inventory.active_bank].as_slice(),
         };
 
         for (slot_num, slot) in inven.iter().enumerate() {
@@ -1033,7 +1220,7 @@ impl Player {
             ItemLocation::Equip => self.inventory.equipped.as_slice(),
             ItemLocation::Inven => self.inventory.main.as_slice(),
             ItemLocation::QInven => unimplemented!("Quest item inventory not searchable"),
-            ItemLocation::Bank => self.inventory.bank.as_slice(),
+            ItemLocation::Bank => self.inventory.banks[self.inventory.active_bank].as_slice(),
         };
 
         inven
@@ -1053,13 +1240,81 @@ impl Player {
             .collect()
     }
 
+    /// Every stored item paired with its flat save slot number. Covers the
+    /// equipment, the main inventory and all of the banks.
     pub fn get_item_iter(&self) -> impl Iterator<Item = (usize, &Item)> {
-        let inv_slot_max = (SIZEOF_EQUIP_SLOT + SIZEOF_INVEN_SLOT + SIZEOF_BANK_SLOT) as usize;
-        (0..inv_slot_max).filter_map(move |slot_num| {
-            let (loc, slot_num_loc) = util::slot_num_to_loc_and_slot_num(slot_num).unwrap();
-            let item = self.get_item(loc, slot_num_loc).unwrap();
+        let flat_max = util::total_item_slots();
+        (0..flat_max).filter_map(move |slot_num| {
+            let (loc, bank_num, slot_num_loc) = util::slot_num_to_location(slot_num).unwrap();
+            let item = match loc {
+                ItemLocation::Bank => &self.inventory.banks[bank_num][slot_num_loc],
+                other => self.get_item(other, slot_num_loc).unwrap(),
+            };
             item.as_ref().map(|item| (slot_num, item))
         })
+    }
+
+    /// Which bank the player currently has open.
+    pub fn get_active_bank(&self) -> usize {
+        self.inventory.active_bank
+    }
+
+    pub fn set_active_bank(&mut self, bank_num: usize) -> FFResult<()> {
+        if bank_num > NUM_EXTRA_BANKS {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Bad bank number {}", bank_num),
+            ));
+        }
+        self.inventory.active_bank = bank_num;
+        Ok(())
+    }
+
+    pub fn get_bank_slot(&self, bank_num: usize, slot_num: usize) -> FFResult<&Option<Item>> {
+        self.inventory
+            .banks
+            .get(bank_num)
+            .and_then(|bank| bank.get(slot_num))
+            .ok_or_else(|| {
+                FFError::build(
+                    Severity::Warning,
+                    format!("Bad bank slot {}/{}", bank_num, slot_num),
+                )
+            })
+    }
+
+    pub fn set_bank_slot(
+        &mut self,
+        bank_num: usize,
+        slot_num: usize,
+        item: Option<Item>,
+    ) -> FFResult<()> {
+        let slot = self
+            .inventory
+            .banks
+            .get_mut(bank_num)
+            .and_then(|bank| bank.get_mut(slot_num))
+            .ok_or_else(|| {
+                FFError::build(
+                    Severity::Warning,
+                    format!("Bad bank slot {}/{}", bank_num, slot_num),
+                )
+            })?;
+        *slot = item;
+        Ok(())
+    }
+
+    /// Whether the player is carrying a given item anywhere, including in any
+    /// bank. Used to check membership cards.
+    pub fn has_item_anywhere(&self, ty: ItemType, id: i16) -> bool {
+        let matches = |slot: &Option<Item>| slot.is_some_and(|item| item.ty == ty && item.id == id);
+        self.inventory.equipped.iter().any(matches)
+            || self.inventory.main.iter().any(matches)
+            || self
+                .inventory
+                .banks
+                .iter()
+                .any(|bank| bank.iter().any(matches))
     }
 
     pub fn get_quest_item_iter(&self) -> impl Iterator<Item = (i16, usize)> + '_ {
@@ -1245,6 +1500,50 @@ impl Player {
         self.nano_potions
     }
 
+    /// Spends weapon boosts on an attack. Returns whether there were enough
+    /// to make the shot a charged one.
+    pub fn consume_weapon_boosts(&mut self, amount: u32) -> bool {
+        let weapon_boosts = self.get_weapon_boosts();
+        if weapon_boosts >= amount {
+            self.set_weapon_boosts(weapon_boosts - amount);
+            true
+        } else {
+            self.set_weapon_boosts(0);
+            false
+        }
+    }
+
+    /// Registers a projectile in flight and hands back the bullet slot the
+    /// client should use to refer to it. Fails if every slot is occupied.
+    pub fn add_projectile(&mut self, projectile: Projectile) -> Option<i8> {
+        if self.owned_projectiles.len() >= SIZEOF_PC_BULLET_SLOT as usize {
+            return None;
+        }
+        // find the next free slot, wrapping around
+        for _ in 0..SIZEOF_PC_BULLET_SLOT {
+            let bullet_id = self.next_projectile_id;
+            self.next_projectile_id = (bullet_id + 1) % SIZEOF_PC_BULLET_SLOT as i8;
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.owned_projectiles.entry(bullet_id)
+            {
+                slot.insert(projectile);
+                return Some(bullet_id);
+            }
+        }
+        None
+    }
+
+    pub fn remove_projectile(&mut self, bullet_id: i8) -> Option<Projectile> {
+        self.owned_projectiles.remove(&bullet_id)
+    }
+
+    /// Drops projectiles that should have detonated by now, so a client that
+    /// never reports a hit can't hold its bullet slots forever.
+    pub fn expire_projectiles(&mut self, now: SystemTime) {
+        self.owned_projectiles
+            .retain(|_, projectile| projectile.expires > now);
+    }
+
     pub fn set_weapon_boosts(&mut self, weapon_boosts: u32) -> u32 {
         self.weapon_boosts = clamp(weapon_boosts, 0, PC_BATTERY_MAX);
         self.weapon_boosts
@@ -1309,6 +1608,22 @@ impl Player {
         self.buddy_list.block_buddy(pc_uid)
     }
 
+    pub fn add_blocked_player(&mut self, entry: BuddyListEntry) -> FFResult<usize> {
+        self.buddy_list.insert_blocked(entry)
+    }
+
+    pub fn has_blocked(&self, pc_uid: i64) -> bool {
+        self.buddy_list.is_blocked(pc_uid)
+    }
+
+    pub fn get_buddy_slot_num(&self, pc_uid: i64) -> Option<usize> {
+        self.buddy_list.get_buddy_slot_number(pc_uid)
+    }
+
+    pub fn get_buddy_at_slot(&self, slot_num: usize) -> Option<&BuddyListEntry> {
+        self.buddy_list.get_entry(slot_num)
+    }
+
     pub fn get_num_buddies(&self) -> usize {
         self.buddy_list.get_num_buddies()
     }
@@ -1354,6 +1669,8 @@ impl Player {
         let player_snapshot = player.clone();
 
         state.player_uid_to_id.remove(&uid);
+        // an unfinished IZ race dies with the player leaving the shard
+        state.ongoing_races.remove(&pc_id);
 
         let id = EntityID::Player(pc_id);
         let entity_map = &mut state.entity_map;
@@ -1827,7 +2144,7 @@ impl Combatant for Player {
     }
 
     fn take_damage(&mut self, damage: i32, source: Option<EntityID>) -> i32 {
-        if self.invulnerable {
+        if self.invulnerable || self.buffs.has_buff(BuffID::Invulnerable, None) {
             return 0;
         }
 

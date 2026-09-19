@@ -10,7 +10,9 @@ use rusty_fusion::{
     config::{config_get, config_init},
     database::db_init,
     defines::*,
-    error::{log, log_error, log_if_failed, log_init, FFResult, Logger, Severity},
+    error::{
+        log, log_error, log_if_failed, log_init, report_startup_failure, FFResult, Logger, Severity,
+    },
     net::{ClientMap, FFServer},
     scripting::scripting_init,
     server::shard,
@@ -29,17 +31,11 @@ async fn main() -> FFResult<()> {
     let config = config_init()?;
     let mut logger = Logger::new(log_rx, &config.shard.log_path.get());
 
-    let mut tui = if config.general.enable_tui.get() {
-        let terminal = ratatui::init();
-        let tui = ShardTui::default();
-        let ke = ce::EventStream::new();
-        Some((terminal, tui, ke))
-    } else {
-        None
-    };
-
-    tdata_init()?;
-    scripting_init()?;
+    // Everything that can fail runs before the TUI takes over the terminal:
+    // once the alt-screen is up, a startup error is painted into a buffer that
+    // vanishes with the window.
+    tdata_init().map_err(|e| report_startup_failure(&mut logger, e))?;
+    scripting_init().map_err(|e| report_startup_failure(&mut logger, e))?;
 
     let mut tui_timer = util::make_timer(Duration::from_millis(250), true);
     let mut logger_timer = util::make_timer(
@@ -79,12 +75,23 @@ async fn main() -> FFResult<()> {
         Some((live_check_time, shard::send_live_check)),
         state.clone(),
     )
-    .await?;
+    .await
+    .map_err(|e| report_startup_failure(&mut logger, e))?;
 
     log(
         Severity::Info,
         &format!("Shard server listening on {}", server.get_endpoint()),
     );
+
+    // Nothing below here fails at startup, so it's safe to take the terminal.
+    let mut tui = if config.general.enable_tui.get() {
+        let terminal = ratatui::init();
+        let tui = ShardTui::default();
+        let ke = ce::EventStream::new();
+        Some((terminal, tui, ke))
+    } else {
+        None
+    };
 
     let mut fatal_error = None;
     let mut save_handle = None;

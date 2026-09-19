@@ -1,13 +1,17 @@
+use std::time::{Duration, SystemTime};
+
 use crate::{
-    entity::{Combatant, Entity, EntityID},
-    enums::{SkillTargetType, TargetType},
+    defines::*,
+    entity::{Combatant, Entity, EntityID, Projectile, ProjectileKind},
+    enums::{SkillTargetType, TargetType, WeaponTargetMode},
     error::*,
     net::{
         packet::{PacketID::*, *},
         ClientMap,
     },
-    skills::{self, SkillResult},
+    skills::{self, AttackContext, Skill, SkillResult},
     state::ShardServerState,
+    Position,
 };
 
 #[allow(non_camel_case_types)]
@@ -86,7 +90,13 @@ pub fn pc_attack_npcs(
     };
 
     // attack handler
-    skills::do_basic_attack(player.get_id(), &target_ids, charged, state)?;
+    skills::do_basic_attack(
+        player.get_id(),
+        &target_ids,
+        charged,
+        AttackContext::default(),
+        state,
+    )?;
 
     Ok(())
 }
@@ -155,7 +165,13 @@ pub fn pc_attack_pcs(
     };
 
     // attack handler
-    skills::do_basic_attack(player.get_id(), &target_ids, charged, state)?;
+    skills::do_basic_attack(
+        player.get_id(),
+        &target_ids,
+        charged,
+        AttackContext::default(),
+        state,
+    )?;
 
     Ok(())
 }
@@ -178,7 +194,8 @@ pub fn nano_skill_use(
         ));
     };
 
-    let skill_level = placeholder!(1); // TODO calculate from gumballs
+    // 0 normally, top tier when the nano is boosted by a gumball
+    let skill_level = player.get_nano_skill_level();
 
     let Some(skill) = nano.get_skill() else {
         return Err(FFError::build(
@@ -187,7 +204,7 @@ pub fn nano_skill_use(
         ));
     };
 
-    let skill_cost = skill.costs[skill_level as usize - 1] as i16;
+    let skill_cost = skill.costs[skill_level];
     let nano_stamina = nano.get_stamina();
     if nano_stamina < skill_cost {
         return Err(FFError::build(
@@ -199,9 +216,28 @@ pub fn nano_skill_use(
         ));
     }
 
+    let group_id = player.get_group_id();
+
     let mut reader = PacketReader::new(&pkt);
     let pkt: &sP_CL2FE_REQ_NANO_SKILL_USE = reader.get_struct()?;
+    let pkt_copy = *pkt;
     let target_count = pkt.iTargetCnt as usize;
+
+    // Group skills (group heal, group recall, group phoenix) come in with no
+    // targets at all: the client expects the server to resolve the group.
+    if skill.target_type == TargetType::CasterPC {
+        let mut target_ids = vec![EntityID::Player(pc_id)];
+        if let Some(group) = group_id.and_then(|group_id| state.groups.get(&group_id)) {
+            target_ids = group
+                .get_member_ids()
+                .iter()
+                .copied()
+                .filter(|id| matches!(id, EntityID::Player(_)))
+                .collect();
+        }
+        return finish_nano_skill(&pkt_copy, &target_ids, skill, skill_level, clients, state);
+    }
+
     if target_count == 0 {
         return Ok(());
     }
@@ -259,14 +295,41 @@ pub fn nano_skill_use(
         target_ids.push(target_id);
     }
 
-    let results = skills::do_skill(player.get_id(), &target_ids, skill, skill_level, state)?;
+    finish_nano_skill(&pkt_copy, &target_ids, skill, skill_level, clients, state)
+}
+
+/// Runs a nano skill against already-resolved targets and sends the
+/// confirmation to the caster plus the broadcast to everyone nearby.
+fn finish_nano_skill(
+    pkt: &sP_CL2FE_REQ_NANO_SKILL_USE,
+    target_ids: &[EntityID],
+    skill: &'static Skill,
+    skill_level: usize,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+    let skill_cost = skill.costs[skill_level];
+
+    let results = skills::do_skill(
+        EntityID::Player(pc_id),
+        target_ids,
+        skill,
+        skill_level,
+        state,
+    )?;
 
     let nano = state
         .get_player_mut(pc_id)
         .unwrap()
         .get_active_nano_mut()
-        .unwrap();
+        .ok_or(FFError::build(
+            Severity::Warning,
+            format!("Player {} lost their nano mid-skill", pc_id),
+        ))?;
 
+    let nano_stamina = nano.get_stamina();
     nano.set_stamina(nano_stamina - skill_cost);
 
     let target_cnt = results.len() as i32;
@@ -370,4 +433,299 @@ pub fn nano_skill_use(
     }
 
     Ok(())
+}
+
+//
+// Rockets and grenades.
+//
+// The client fires a projectile, we hand back a bullet slot, and the client
+// reports back what the blast hit. The damage numbers are locked in at fire
+// time so the payload can't change while the projectile is in the air, and the
+// reported targets are re-checked against the blast radius before they take
+// damage.
+//
+
+/// How far from the reported impact point a target can be and still be hit.
+/// The client doesn't tell us the weapon's blast radius, so this is a
+/// server-side sanity bound rather than an exact simulation.
+const EXPLOSION_RADIUS: u32 = 500;
+/// Upper bound on how many entities one blast may be reported to have hit.
+const MAX_PROJECTILE_TARGETS: usize = 32;
+
+/// A projectile hit's trailing entry. The client sends 8 bytes per target,
+/// with the entity ID in the low half.
+#[allow(non_camel_case_types)]
+#[allow(non_snake_case)]
+#[repr(packed(4))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct sProjectileTarget {
+    pub iID: i32,
+    pub _unused: i32,
+}
+impl FFPacket for sProjectileTarget {}
+
+pub fn pc_rocket_style_ready(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_PC_ROCKET_STYLE_READY = pkt.get()?;
+    let pc_id = clients.get_sender().get_player_id()?;
+    let bcast = sP_FE2CL_PC_ROCKET_STYLE_READY {
+        iPC_ID: pc_id,
+        iSkillID: pkt.iSkillID,
+    };
+    state
+        .entity_map
+        .for_each_around(EntityID::Player(pc_id), |c| {
+            c.send_packet(P_FE2CL_PC_ROCKET_STYLE_READY, &bcast);
+        });
+    Ok(())
+}
+
+pub fn pc_grenade_style_ready(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_PC_GRENADE_STYLE_READY = pkt.get()?;
+    let pc_id = clients.get_sender().get_player_id()?;
+    let bcast = sP_FE2CL_PC_GRENADE_STYLE_READY {
+        iPC_ID: pc_id,
+        iSkillID: pkt.iSkillID,
+    };
+    state
+        .entity_map
+        .for_each_around(EntityID::Player(pc_id), |c| {
+            c.send_packet(P_FE2CL_PC_GRENADE_STYLE_READY, &bcast);
+        });
+    Ok(())
+}
+
+pub fn pc_rocket_style_fire(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_PC_ROCKET_STYLE_FIRE = pkt.get()?;
+    let from = Position::new(pkt.iX, pkt.iY, pkt.iZ);
+    let to = Position::new(pkt.iToX, pkt.iToY, pkt.iToZ);
+    fire_projectile(WeaponTargetMode::Rocket, Some(from), to, clients, state)
+}
+
+pub fn pc_grenade_style_fire(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let pkt: &sP_CL2FE_REQ_PC_GRENADE_STYLE_FIRE = pkt.get()?;
+    let to = Position::new(pkt.iToX, pkt.iToY, pkt.iToZ);
+    fire_projectile(WeaponTargetMode::Grenade, None, to, clients, state)
+}
+
+fn fire_projectile(
+    mode: WeaponTargetMode,
+    from: Option<Position>,
+    to: Position,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+
+    let player = state.get_player(pc_id)?;
+    let weapon = player.get_equipped()[EQUIP_SLOT_HAND as usize].ok_or_else(|| {
+        FFError::build(
+            Severity::Warning,
+            format!("{} tried to fire a projectile bare-handed", player),
+        )
+    })?;
+    let weapon_stats = weapon.get_stats()?;
+    if weapon_stats.target_mode != Some(mode) {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!(
+                "{} tried to fire a {:?} with a {:?} weapon",
+                player, mode, weapon_stats.target_mode
+            ),
+        ));
+    }
+
+    let flight_time = weapon_stats.projectile_time.unwrap_or(Duration::ZERO);
+    let weapon_boosts_needed = BATTERY_BASE_COST + weapon_stats.required_level.max(0) as u32;
+
+    let player = state.get_player_mut(pc_id)?;
+    let charged = player.consume_weapon_boosts(weapon_boosts_needed);
+    let start_pos = from.unwrap_or_else(|| player.get_position());
+
+    let projectile = Projectile {
+        kind: match mode {
+            WeaponTargetMode::Grenade => ProjectileKind::Grenade,
+            _ => ProjectileKind::Rocket(weapon.id),
+        },
+        single_power: player.get_single_power(),
+        multi_power: player.get_multi_power(),
+        charged,
+        start_pos,
+        end_pos: to,
+        // give the client a generous grace period on top of the flight time
+        // before we reclaim the bullet slot
+        expires: SystemTime::now() + flight_time + Duration::from_secs(10),
+    };
+
+    // stale projectiles would otherwise hold their slots forever
+    player.expire_projectiles(SystemTime::now());
+    let bullet_id = player.add_projectile(projectile).ok_or_else(|| {
+        FFError::build(
+            Severity::Warning,
+            format!("Player {} has too many projectiles in flight", pc_id),
+        )
+    })?;
+    let bullet: sPCBullet = projectile.into();
+    let weapon_boosts = player.get_weapon_boosts() as i32;
+
+    match mode {
+        WeaponTargetMode::Grenade => {
+            let resp = sP_FE2CL_REP_PC_GRENADE_STYLE_FIRE_SUCC {
+                iSkillID: unused!(),
+                iToX: to.x,
+                iToY: to.y,
+                iToZ: to.z,
+                iBulletID: bullet_id,
+                Bullet: bullet,
+                iBatteryW: weapon_boosts,
+                bNanoDeactive: unused!(),
+                iNanoID: unused!(),
+                iNanoStamina: unused!(),
+            };
+            client.send_packet(P_FE2CL_REP_PC_GRENADE_STYLE_FIRE_SUCC, &resp);
+
+            let bcast = sP_FE2CL_PC_GRENADE_STYLE_FIRE {
+                iPC_ID: pc_id,
+                iToX: to.x,
+                iToY: to.y,
+                iToZ: to.z,
+                iBulletID: bullet_id,
+                Bullet: bullet,
+                bNanoDeactive: unused!(),
+            };
+            state
+                .entity_map
+                .for_each_around(EntityID::Player(pc_id), |c| {
+                    c.send_packet(P_FE2CL_PC_GRENADE_STYLE_FIRE, &bcast);
+                });
+        }
+        _ => {
+            let resp = sP_FE2CL_REP_PC_ROCKET_STYLE_FIRE_SUCC {
+                iSkillID: unused!(),
+                iX: start_pos.x,
+                iY: start_pos.y,
+                iZ: start_pos.z,
+                iToX: to.x,
+                iToY: to.y,
+                iToZ: to.z,
+                iBulletID: bullet_id,
+                Bullet: bullet,
+                iBatteryW: weapon_boosts,
+                bNanoDeactive: unused!(),
+                iNanoID: unused!(),
+                iNanoStamina: unused!(),
+            };
+            client.send_packet(P_FE2CL_REP_PC_ROCKET_STYLE_FIRE_SUCC, &resp);
+
+            let bcast = sP_FE2CL_PC_ROCKET_STYLE_FIRE {
+                iPC_ID: pc_id,
+                iX: start_pos.x,
+                iY: start_pos.y,
+                iZ: start_pos.z,
+                iToX: to.x,
+                iToY: to.y,
+                iToZ: to.z,
+                iBulletID: bullet_id,
+                Bullet: bullet,
+                bNanoDeactive: unused!(),
+            };
+            state
+                .entity_map
+                .for_each_around(EntityID::Player(pc_id), |c| {
+                    c.send_packet(P_FE2CL_PC_ROCKET_STYLE_FIRE, &bcast);
+                });
+        }
+    }
+
+    Ok(())
+}
+
+/// Handles a projectile detonating. Rockets and grenades use the same request
+/// body, so one handler covers both.
+pub fn pc_projectile_hit(
+    pkt: Packet,
+    clients: &ClientMap,
+    state: &mut ShardServerState,
+) -> FFResult<()> {
+    let client = clients.get_sender();
+    let pc_id = client.get_player_id()?;
+
+    let mut reader = PacketReader::new(&pkt);
+    let pkt: &sP_CL2FE_REQ_PC_ROCKET_STYLE_HIT = reader.get_struct()?;
+    let bullet_id = pkt.iBulletID;
+    let target_count = pkt.iTargetCnt as usize;
+    let hit_pos = Position::new(pkt.iX, pkt.iY, pkt.iZ);
+
+    let player = state.get_player_mut(pc_id)?;
+    let projectile = player.remove_projectile(bullet_id).ok_or_else(|| {
+        FFError::build(
+            Severity::Warning,
+            format!("Player {} has no projectile {} in flight", pc_id, bullet_id),
+        )
+    })?;
+
+    if target_count == 0 {
+        // nothing was hit; the bullet slot is already freed
+        return Ok(());
+    }
+    if target_count > MAX_PROJECTILE_TARGETS {
+        return Err(FFError::build(
+            Severity::Warning,
+            format!(
+                "Player {} reported {} projectile targets (max {})",
+                pc_id, target_count, MAX_PROJECTILE_TARGETS
+            ),
+        ));
+    }
+
+    let instance_id = state.get_player(pc_id)?.instance_id;
+    let mut claimed_ids = Vec::with_capacity(target_count);
+    for _ in 0..target_count {
+        let npc_id = reader.get_struct::<sProjectileTarget>()?.iID;
+        // only mobs can be caught in a blast
+        if state.get_npc(npc_id).is_err() {
+            continue;
+        }
+        claimed_ids.push(EntityID::NPC(npc_id));
+    }
+
+    // the client decides what the blast touched, so re-check it against the
+    // impact point before anything takes damage
+    let target_ids = state.entity_map.filter_ids_in_proximity(
+        hit_pos,
+        instance_id,
+        &claimed_ids,
+        EXPLOSION_RADIUS,
+    );
+    if target_ids.is_empty() {
+        return Ok(());
+    }
+
+    skills::do_basic_attack(
+        EntityID::Player(pc_id),
+        &target_ids,
+        projectile.charged,
+        AttackContext {
+            power: Some((projectile.single_power, projectile.multi_power)),
+            projectile: Some((bullet_id, projectile.into())),
+        },
+        state,
+    )
 }

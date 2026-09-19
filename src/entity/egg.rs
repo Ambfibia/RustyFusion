@@ -47,6 +47,20 @@ impl Egg {
     pub fn is_summoned(&self) -> bool {
         self.summoned
     }
+
+    pub fn get_type(&self) -> i32 {
+        self.ty
+    }
+
+    pub fn get_instance_id(&self) -> InstanceID {
+        self.instance_id
+    }
+
+    /// Takes the E.G.G. out of the world until `respawn_time`. Summoned eggs
+    /// never come back, so they get marked for cleanup by the caller instead.
+    pub fn pick_up(&mut self, respawn_time: SystemTime) {
+        self.respawn_time = Some(respawn_time);
+    }
 }
 impl Display for Egg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
