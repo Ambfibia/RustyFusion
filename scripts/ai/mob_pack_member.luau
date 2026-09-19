@@ -35,7 +35,7 @@ return function(npc: Npc)
             end
             was_leader_retreating = leader_retreating
 
-            if not b.check_retreat(npc) then
+            if not b.handle_crowd_control(npc) and not b.check_retreat(npc) then
                 -- Bi-directional target sync
                 if not leader_retreating then
                     local leader_target = leader:target()

@@ -208,6 +208,8 @@ impl LuaUserData for NpcScriptContext {
             }));
 
             luau_method!(methods, "begin_death" -> "()", |_, this, ()| this.with_state(|state| {
+                // a corpse keeps no conditions (OpenFusion MobAI::onDeath)
+                state.get_npc_mut(this.npc_id)?.clear_buffs();
                 let last_attacked_by = state.get_npc(this.npc_id)?.last_attacked_by;
                 if let Some(defeater_id) = last_attacked_by {
                     let mut rng = thread_rng();

@@ -23,14 +23,15 @@ function behaviors.handle_death(npc: Npc)
     return true
 end
 
--- Sleep
--- Returns true if the NPC is sleeping
-function behaviors.handle_sleep(npc: Npc)
-    if not npc:has_buff(BUFF_SLEEP) then
+-- Crowd control (sleep or stun)
+-- Returns true if the NPC is disabled; it keeps its target but neither moves
+-- nor attacks until the server times the buff out (or a hit wakes it from sleep).
+function behaviors.handle_crowd_control(npc: Npc)
+    if not npc:has_buff(BUFF_SLEEP) and not npc:has_buff(BUFF_STUN) then
         return false
     end
 
-    -- Don't move while asleep
+    -- Drop any walk or chase already in flight
     npc:stop()
     return true
 end

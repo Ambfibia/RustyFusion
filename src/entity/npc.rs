@@ -90,6 +90,10 @@ impl NPC {
         })
     }
 
+    pub fn clear_buffs(&mut self) {
+        self.buffs.clear();
+    }
+
     pub fn move_towards(&mut self, position: Position, speed: Option<i32>) -> bool {
         let stats = tdata_get().get_npc_stats(self.ty).unwrap();
 
@@ -455,6 +459,10 @@ impl Combatant for NPC {
             }
         }
 
+        // any hit wakes a sleeping NPC (OpenFusion Mob::takeDamage); a stun
+        // runs its full course
+        self.buffs.remove_buff(BuffID::Sleep, None);
+
         let init_hp = self.hp;
         self.hp = clamp_min(self.hp - damage, 0);
         init_hp - self.hp
@@ -484,5 +492,7 @@ impl Combatant for NPC {
         self.target_id = None;
         self.retreating = false;
         self.hp = self.get_max_hp();
+        // retreat and respawn drop every debuff (OpenFusion clearDebuff)
+        self.buffs.clear();
     }
 }

@@ -149,6 +149,7 @@ impl ScriptingEngine {
         luau_const!(vm, "DB_VERSION", "number", DB_VERSION);
 
         luau_const!(vm, "BUFF_SLEEP", "number", BuffID::Sleep as i32);
+        luau_const!(vm, "BUFF_STUN", "number", BuffID::Stun as i32);
 
         luau_function!("yield", "(): ()");
         luau_function!("wait", "(seconds: number, predicate: (() -> boolean)?): ()");

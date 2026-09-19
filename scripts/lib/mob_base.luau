@@ -5,7 +5,7 @@ local mob_base = {}
 function mob_base.run(npc: Npc)
     while true do
         if not b.handle_death(npc) then
-            if not b.handle_sleep(npc) then
+            if not b.handle_crowd_control(npc) then
                 if not b.check_retreat(npc) then
                     b.scan_for_target_aggro(npc)
 

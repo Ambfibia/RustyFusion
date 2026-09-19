@@ -57,7 +57,7 @@ return function(npc: Npc)
             return
         end
 
-        if not b.handle_sleep(npc) then
+        if not b.handle_crowd_control(npc) then
             b.scan_for_target_aggro(npc)
 
             local target = npc:target()

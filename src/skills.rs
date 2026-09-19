@@ -56,6 +56,7 @@ impl Skill {
             SkillType::ProtectBattery => BuffID::ProtectBattery,
             SkillType::ProtectInfection => BuffID::ProtectInfection,
             SkillType::Snare => BuffID::DnMoveSpeed,
+            SkillType::Stun => BuffID::Stun,
             SkillType::Sleep => BuffID::Sleep,
             SkillType::MiniMapEnemy => BuffID::MiniMapEnemy,
             SkillType::MiniMapTreasure => BuffID::MiniMapTreasure,
@@ -496,10 +497,21 @@ impl BuffContainer {
             .map(|stack| stack.get_max_value())
     }
 
+    /// Drops every buff. Like [`BuffContainer::remove_buff`], the stacks go
+    /// away (and are reported) on the next tick.
+    pub fn clear(&mut self) {
+        for buff_stack in self.buff_stacks.values_mut() {
+            buff_stack.remove_stacks(None);
+        }
+    }
+
     pub fn get_bit_flags(&self) -> i32 {
+        // Stacks count from the moment they are added or emptied, not the
+        // next tick, so skill results carry the new condition like
+        // OpenFusion's getCompositeCondition().
         let mut flags = 0;
         for (buff_id, buff_stack) in &self.buff_stacks {
-            if buff_stack.applied {
+            if !buff_stack.buffs.is_empty() {
                 flags |= 1 << (*buff_id as i32 - 1);
             }
         }
@@ -1367,3 +1379,7 @@ fn do_rps(us: &Option<CombatStyle>, them: &Option<CombatStyle>) -> RpsResult {
 #[cfg(test)]
 #[path = "skills_damage_tests.rs"]
 mod damage_tests;
+
+#[cfg(test)]
+#[path = "skills_cc_tests.rs"]
+mod cc_tests;
