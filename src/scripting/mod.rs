@@ -4,6 +4,7 @@ use mlua::prelude::*;
 use parking_lot::Mutex;
 
 use crate::{
+    corruption::{CORRUPTION_COOLDOWN_SECONDS, CORRUPTION_WINDUP_SECONDS},
     defines::*,
     entity::NPC,
     enums::BuffID,
@@ -150,6 +151,9 @@ impl ScriptingEngine {
 
         luau_const!(vm, "BUFF_SLEEP", "number", BuffID::Sleep as i32);
         luau_const!(vm, "BUFF_STUN", "number", BuffID::Stun as i32);
+
+        luau_const!(vm, "CORRUPTION_WINDUP_SECONDS", "number", CORRUPTION_WINDUP_SECONDS);
+        luau_const!(vm, "CORRUPTION_COOLDOWN_SECONDS", "number", CORRUPTION_COOLDOWN_SECONDS);
 
         luau_function!("yield", "(): ()");
         luau_function!("wait", "(seconds: number, predicate: (() -> boolean)?): ()");
@@ -525,6 +529,7 @@ mod tests {
 
     #[test]
     fn test_load() {
-        scripting_init().expect("Failed to load scripting engine");
+        // AI tests may already have set the global engine; load a separate one
+        ScriptingEngine::new().expect("Failed to load scripting engine");
     }
 }

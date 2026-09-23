@@ -37,7 +37,8 @@ function behaviors.handle_crowd_control(npc: Npc)
 end
 
 -- Retreat to spawn if target is dead, gone, or too far from spawn.
--- After retreat, fully heals the NPC (matching native reset behavior).
+-- After retreat, fully heals the NPC and shows the heal to everyone watching
+-- (matching native reset behavior).
 -- Returns true if retreating (caller should skip other behaviors).
 function behaviors.check_retreat(npc: Npc)
     local target = npc:target()
@@ -82,7 +83,7 @@ function behaviors.check_retreat(npc: Npc)
     while npc:is_moving() do
         yield()
     end
-    npc:reset() -- full heal + clear state
+    npc:return_home() -- full heal + clear state, synced to watching clients
     return true
 end
 
@@ -144,9 +145,33 @@ function behaviors.try_attack(npc: Npc)
         return false
     end
 
+    if behaviors.try_corruption(npc) then
+        return true
+    end
+
     npc:attack()
     wait(npc:delay_time(), function()
         -- Interrupt delay if npc dies
+        return npc:is_dead()
+    end)
+    return true
+end
+
+-- Corruption (rock-paper-scissors) special attack, for mobs whose table entry
+-- has one. The server rolls for it; on a hit the mob stands still and winds up
+-- (players get the windup to swap to the nano that wins), then lands the hit
+-- or cancels it if it was interrupted, and pauses before acting again.
+-- Returns true if a corruption attack was attempted.
+function behaviors.try_corruption(npc: Npc)
+    if not npc:try_begin_corruption() then
+        return false
+    end
+
+    wait(CORRUPTION_WINDUP_SECONDS, function()
+        return npc:corruption_interrupted()
+    end)
+    npc:finish_corruption()
+    wait(CORRUPTION_COOLDOWN_SECONDS, function()
         return npc:is_dead()
     end)
     return true

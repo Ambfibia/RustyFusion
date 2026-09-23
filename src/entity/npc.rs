@@ -24,7 +24,7 @@ use crate::{
     skills::{BuffContainer, BuffInstance},
     state::ShardServerState,
     tabledata::tdata_get,
-    util::{self, clamp_min},
+    util::{self, clamp_max, clamp_min},
     Position,
 };
 
@@ -49,7 +49,17 @@ pub struct NPC {
     pub interacting_pcs: HashSet<i32>,
     pub summoned: bool,
     pub ai: Option<String>,
+    /// Corruption attack being wound up, if any (OpenFusion `skillStyle >= 0`).
+    pub corruption: Option<PendingCorruption>,
     buffs: BuffContainer,
+}
+
+/// A corruption attack between its READY broadcast and its HIT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCorruption {
+    pub skill_id: i16,
+    pub style: CombatStyle,
+    pub target_pc_id: i32,
 }
 impl NPC {
     /// The NPC table's `m_iPower`, with no flat bonus. OpenFusion's
@@ -86,6 +96,7 @@ impl NPC {
             interacting_pcs: HashSet::new(),
             summoned: false,
             ai: None,
+            corruption: None,
             buffs: BuffContainer::default(),
         })
     }
@@ -448,7 +459,9 @@ impl Combatant for NPC {
     }
 
     fn take_damage(&mut self, damage: i32, source: Option<EntityID>) -> i32 {
-        if self.invulnerable || self.retreating {
+        // a mob winding up a corruption attack can't be hurt
+        // (OpenFusion Mob::takeDamage)
+        if self.invulnerable || self.retreating || self.corruption.is_some() {
             return 0;
         }
 
@@ -470,7 +483,8 @@ impl Combatant for NPC {
 
     fn heal(&mut self, amount: i32) -> i32 {
         let init_hp = self.hp;
-        self.hp = clamp_min(self.hp + amount, self.get_max_hp());
+        // never past max HP (OpenFusion CombatNPC::heal)
+        self.hp = clamp_max(self.hp + amount, self.get_max_hp());
         self.hp - init_hp
     }
 
@@ -492,7 +506,9 @@ impl Combatant for NPC {
         self.target_id = None;
         self.retreating = false;
         self.hp = self.get_max_hp();
-        // retreat and respawn drop every debuff (OpenFusion clearDebuff)
+        // retreat and respawn drop every debuff and any windup
+        // (OpenFusion clearDebuff)
         self.buffs.clear();
+        self.corruption = None;
     }
 }

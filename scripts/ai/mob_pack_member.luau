@@ -31,7 +31,7 @@ return function(npc: Npc)
                 npc:set_retreating(true)
                 npc:clear_target()
             elseif was_leader_retreating then
-                npc:reset()
+                npc:return_home()
             end
             was_leader_retreating = leader_retreating
 
@@ -39,7 +39,7 @@ return function(npc: Npc)
                 -- Bi-directional target sync
                 if not leader_retreating then
                     local leader_target = leader:target()
-                    if not npc:has_target() then
+                    if not npc:target() then
                         if leader_target then
                             npc:set_target(leader_target)
                         end
@@ -53,9 +53,13 @@ return function(npc: Npc)
                     end
                 end
 
-                b.scan_for_target_aggro(npc)
+                -- A retreating pack heads home without picking fights on the
+                -- way (OpenFusion MobAI::groupRetreat)
+                if not leader_retreating then
+                    b.scan_for_target_aggro(npc)
+                end
 
-                if npc:has_target() then
+                if npc:target() then
                     if not b.try_attack(npc) then
                         b.chase_target(npc)
                     end

@@ -2,6 +2,7 @@ use mlua::prelude::*;
 use rand::thread_rng;
 
 use crate::{
+    corruption,
     entity::{Combatant, Entity, EntityID, NPC},
     error::log_if_failed,
     helpers, skills,
@@ -177,6 +178,18 @@ impl LuaUserData for NpcScriptContext {
                 Ok(())
             }));
 
+            luau_method!(methods, "try_begin_corruption" -> "boolean", |_, this, ()| this.with_state(|state| {
+                Ok(corruption::try_begin(this.npc_id, state)?)
+            }));
+
+            luau_method!(methods, "corruption_interrupted" -> "boolean", |_, this, ()| this.with_state(|state| {
+                Ok(corruption::is_interrupted(this.npc_id, state))
+            }));
+
+            luau_method!(methods, "finish_corruption" -> "boolean", |_, this, ()| this.with_state(|state| {
+                Ok(corruption::finish(this.npc_id, state)?)
+            }));
+
             luau_method!(methods, "move_to" -> "()",
                 |_, this, (x, y, z, speed): (i32, i32, i32, Option<i32>)| this.with_state(|state| {
                     let target_pos = Position { x, y, z };
@@ -207,9 +220,14 @@ impl LuaUserData for NpcScriptContext {
                 Ok(())
             }));
 
+            luau_method!(methods, "return_home" -> "()", |_, this, ()| this.with_state(|state| {
+                Ok(crate::ai::return_home(this.npc_id, state)?)
+            }));
+
             luau_method!(methods, "begin_death" -> "()", |_, this, ()| this.with_state(|state| {
-                // a corpse keeps no conditions (OpenFusion MobAI::onDeath)
+                // a corpse keeps no conditions or windup (OpenFusion MobAI::onDeath)
                 state.get_npc_mut(this.npc_id)?.clear_buffs();
+                corruption::cancel(this.npc_id, state)?;
                 let last_attacked_by = state.get_npc(this.npc_id)?.last_attacked_by;
                 if let Some(defeater_id) = last_attacked_by {
                     let mut rng = thread_rng();

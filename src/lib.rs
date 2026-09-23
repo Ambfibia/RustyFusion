@@ -59,6 +59,7 @@ pub mod tabledata;
 
 pub mod ai;
 pub mod chunk;
+pub mod corruption;
 pub mod email;
 pub mod entity;
 pub mod item;

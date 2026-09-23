@@ -229,6 +229,16 @@ pub struct NPCStats {
     pub delay_time: u64, // generic value for various delays
     pub ai_type: u8,     // TODO investigate further
     pub bark_type: Option<usize>,
+    /// Rock-paper-scissors special attack (`m_iCorruptionType`), if any.
+    pub corruption: Option<NpcCorruption>,
+}
+
+/// An NPC's corruption attack: the skill it casts and its
+/// `m_iCorruptionTypeProb` weight (out of 2,000,000, like OpenFusion).
+#[derive(Debug, Clone, Copy)]
+pub struct NpcCorruption {
+    pub skill_id: i16,
+    pub prob: i32,
 }
 
 #[derive(Debug)]
@@ -2040,6 +2050,10 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
         m_iDelayTime: u64,
         m_iAiType: u8,
         m_iBarkerType: usize,
+        #[serde(default)]
+        m_iCorruptionType: i16,
+        #[serde(default)]
+        m_iCorruptionTypeProb: i32,
     }
 
     #[derive(Deserialize)]
@@ -2083,6 +2097,12 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
                 0 => None,
                 x => Some(x),
             },
+            corruption: (entry.m_iCorruptionType > 0 && entry.m_iCorruptionTypeProb > 0).then_some(
+                NpcCorruption {
+                    skill_id: entry.m_iCorruptionType,
+                    prob: entry.m_iCorruptionTypeProb,
+                },
+            ),
         };
 
         let npc_strings = npc_strings.get(entry.m_iNpcName as usize).ok_or(format!(
