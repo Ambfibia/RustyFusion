@@ -40,6 +40,10 @@ pub struct Skill {
     pub target_type: TargetType,
     pub passive: bool,
     pub range: u32,
+    /// Cast distance is distinct from the effect-area radius (`range`).
+    pub cast_range: u32,
+    pub target_count: usize,
+    pub cooldown: Duration,
     pub values_a: [i32; SKILL_LEVEL_MAX + 1],
     pub values_b: [Option<i32>; SKILL_LEVEL_MAX + 1],
     pub values_c: [Option<i32>; SKILL_LEVEL_MAX + 1],

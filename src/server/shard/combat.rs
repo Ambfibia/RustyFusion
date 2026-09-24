@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 use crate::{
     defines::*,
     entity::{Combatant, Entity, EntityID, Projectile, ProjectileKind},
-    enums::{SkillTargetType, TargetType, WeaponTargetMode},
+    enums::{CombatantTeam, SkillTargetType, TargetType, WeaponTargetMode},
     error::*,
     net::{
         packet::{PacketID::*, *},
@@ -205,6 +205,12 @@ pub fn nano_skill_use(
     };
 
     let skill_cost = skill.costs[skill_level];
+    if player.is_dead() || skill.passive || !nano.skill_is_ready() {
+        return Err(FFError::build(
+            Severity::Warning,
+            "Nano skill is not available".to_owned(),
+        ));
+    }
     let nano_stamina = nano.get_stamina();
     if nano_stamina < skill_cost {
         return Err(FFError::build(
@@ -217,11 +223,21 @@ pub fn nano_skill_use(
     }
 
     let group_id = player.get_group_id();
+    let request_len = pkt.read_bytes().len();
 
     let mut reader = PacketReader::new(&pkt);
     let pkt: &sP_CL2FE_REQ_NANO_SKILL_USE = reader.get_struct()?;
     let pkt_copy = *pkt;
     let target_count = pkt.iTargetCnt as usize;
+    // Reject the complete frame before effects, including truncated/trailing tails.
+    if target_count > MAX_TARGETS
+        || request_len != 4 + size_of::<sP_CL2FE_REQ_NANO_SKILL_USE>() + target_count * 4
+    {
+        return Err(FFError::build(
+            Severity::Warning,
+            "Invalid Nano skill target count".to_owned(),
+        ));
+    }
 
     // Group skills (group heal, group recall, group phoenix) come in with no
     // targets at all: the client expects the server to resolve the group.
@@ -243,18 +259,7 @@ pub fn nano_skill_use(
     }
 
     let mut target_ids = Vec::with_capacity(MAX_TARGETS);
-    for i in 0..target_count {
-        if i >= MAX_TARGETS {
-            log(
-                Severity::Warning,
-                &format!(
-                    "{} tried to use a nano skill on {} targets (max {})",
-                    player, pkt.iTargetCnt, MAX_TARGETS
-                ),
-            );
-            break;
-        }
-
+    for _ in 0..target_count {
         let target_id = match skill.target_type {
             TargetType::HostileNPCs => {
                 let target_npc_id = reader.get_struct::<sTargetNpcId>()?.iNPC_ID;
@@ -267,35 +272,87 @@ pub fn nano_skill_use(
             TargetType::CasterPC => player.get_id(),
         };
 
-        // validate against targeting type
-        let valid = match skill.targeting_type {
-            SkillTargetType::None => {
-                return Err(FFError::build(
-                    Severity::Warning,
-                    format!(
-                        "{} tried to use a nano skill with no targeting type",
-                        player
-                    ),
-                ));
-            }
-            _ => placeholder!(true), // TODO validate for each targeting type
-        };
-
-        if !valid {
-            log(
+        if skill.targeting_type == SkillTargetType::None {
+            return Err(FFError::build(
                 Severity::Warning,
-                &format!(
-                    "{} tried to use a nano skill on an invalid target {:?} for targeting type {:?}",
-                    player, target_id, skill.targeting_type
-                ),
-            );
-            continue;
+                "Nano skill has no targeting type".to_owned(),
+            ));
         }
 
         target_ids.push(target_id);
     }
 
+    if skill.target_type == TargetType::HostileNPCs {
+        validate_nano_attack_targets(player, &pkt_copy, &target_ids, skill, state)?;
+    }
     finish_nano_skill(&pkt_copy, &target_ids, skill, skill_level, clients, state)
+}
+
+/// Validate the entire hostile target set before applying any damage/debuff.
+/// Target/TargetArea are the accepted single and splash Nano attack branches.
+fn validate_nano_attack_targets(
+    player: &crate::entity::Player,
+    pkt: &sP_CL2FE_REQ_NANO_SKILL_USE,
+    ids: &[EntityID],
+    skill: &Skill,
+    state: &ShardServerState,
+) -> FFResult<()> {
+    let invalid = || FFError::build(Severity::Warning, "Invalid Nano attack targets".to_owned());
+    if ids.is_empty() || ids.len() > skill.target_count {
+        return Err(invalid());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        let target = state.get_combatant(*id)?;
+        if !seen.insert(*id)
+            || target.is_dead()
+            || target.get_team() != CombatantTeam::Mob
+            || target.get_chunk_coords().i != player.instance_id
+        {
+            return Err(invalid());
+        }
+    }
+    if matches!(
+        skill.targeting_type,
+        SkillTargetType::Target | SkillTargetType::TargetArea
+    ) {
+        let focus = EntityID::NPC(pkt.iArg1);
+        if !ids.contains(&focus)
+            || (skill.targeting_type == SkillTargetType::Target && ids.len() != 1)
+        {
+            return Err(invalid());
+        }
+        let focus = state.get_combatant(focus)?;
+        if !nano_target_in_range(player.get_position(), focus, skill.cast_range)? {
+            return Err(invalid());
+        }
+        if skill.targeting_type == SkillTargetType::TargetArea {
+            for id in ids {
+                let target = state.get_combatant(*id)?;
+                if !nano_target_in_range(focus.get_position(), target, skill.range)? {
+                    return Err(invalid());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn nano_target_in_range(origin: Position, target: &dyn Combatant, range: u32) -> FFResult<bool> {
+    let npc = target
+        .as_any()
+        .downcast_ref::<crate::entity::NPC>()
+        .unwrap();
+    let stats = crate::tabledata::tdata_get().get_npc_stats(npc.ty)?;
+    // Native targeting includes the NPC body extent in protocol centiunits.
+    let extent = f64::from(stats.radius).max(f64::from(stats.height) * 0.5);
+    let pos = target.get_position();
+    let delta = [
+        f64::from(pos.x) - f64::from(origin.x),
+        f64::from(pos.y) - f64::from(origin.y),
+        f64::from(pos.z) - f64::from(origin.z),
+    ];
+    Ok(delta.into_iter().map(|v| v * v).sum::<f64>().sqrt() < f64::from(range) + extent)
 }
 
 /// Runs a nano skill against already-resolved targets and sends the
@@ -319,6 +376,11 @@ fn finish_nano_skill(
         skill_level,
         state,
     )?;
+    // 0104 has no Nano-use FAIL. An empty SUCC is invalid to the native client
+    // and must not commit a resource cost (OpenFusion also omits empty replies).
+    if results.is_empty() {
+        return Ok(());
+    }
 
     let nano = state
         .get_player_mut(pc_id)
@@ -331,6 +393,7 @@ fn finish_nano_skill(
 
     let nano_stamina = nano.get_stamina();
     nano.set_stamina(nano_stamina - skill_cost);
+    nano.start_skill_cooldown(skill.cooldown);
 
     let target_cnt = results.len() as i32;
     let skill_id = nano.selected_skill.unwrap();
@@ -430,6 +493,10 @@ fn finish_nano_skill(
             .for_each_around(EntityID::Player(pc_id), |c| {
                 c.send_payload(pkt.clone());
             });
+    }
+
+    if nano_deactive {
+        state.get_player_mut(pc_id)?.deactivate_nano();
     }
 
     Ok(())

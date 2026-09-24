@@ -17,6 +17,8 @@ pub struct Nano {
     stamina: i16,
     last_regen: Option<Instant>,
     last_wear: Option<Instant>,
+    /// Transient cast lock belongs to the Nano, so switching it cannot reset it.
+    skill_ready_at: Option<Instant>,
 }
 impl Nano {
     pub fn new(id: i16) -> Self {
@@ -26,11 +28,20 @@ impl Nano {
             stamina: NANO_STAMINA_MAX,
             last_regen: None,
             last_wear: None,
+            skill_ready_at: None,
         }
     }
 
     pub fn get_id(&self) -> i16 {
         self.id
+    }
+
+    pub fn skill_is_ready(&self) -> bool {
+        self.skill_ready_at.is_none_or(|ready| Instant::now() >= ready)
+    }
+
+    pub fn start_skill_cooldown(&mut self, duration: Duration) {
+        self.skill_ready_at = Instant::now().checked_add(duration);
     }
 
     pub fn get_stamina(&self) -> i16 {
@@ -121,6 +132,7 @@ impl FromProto<sNano> for Option<Nano> {
             stamina: value.iStamina,
             last_regen: None,
             last_wear: None,
+            skill_ready_at: None,
         };
         Some(nano)
     }

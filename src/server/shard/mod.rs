@@ -27,6 +27,8 @@ mod chat;
 #[cfg(all(test, feature = "sqlite"))]
 mod chat_command_tests;
 mod combat;
+#[cfg(test)]
+mod nano_attack_tests;
 mod egg;
 mod email;
 mod gm;
