@@ -80,6 +80,9 @@ impl LuaUserData for NpcScriptContext {
             luau_method!(methods, "is_moving" -> "boolean", |_, this, ()| this.with_npc(|npc| {
                 Ok(npc.path.is_some())
             }));
+            luau_method!(methods, "has_authored_path" -> "boolean", |_, this, ()| this.with_npc(|npc| {
+                Ok(npc.authored_path.is_some())
+            }));
 
             // Stats
 
@@ -157,8 +160,12 @@ impl LuaUserData for NpcScriptContext {
             }));
 
             luau_method!(methods, "set_target" -> "()", |_, this, target: EntityScriptContext| this.with_npc(|npc| {
-                npc.target_id = Some(target.id());
+                npc.acquire_target(target.id());
                 Ok(())
+            }));
+
+            luau_method!(methods, "combat_origin" -> "Position", |_, this, ()| this.with_npc(|npc| {
+                Ok(npc.combat_origin.unwrap_or(npc.spawn_position))
             }));
 
             luau_method!(methods, "attack" -> "()", |_, this, ()| this.with_state(|state| {
@@ -188,6 +195,15 @@ impl LuaUserData for NpcScriptContext {
 
             luau_method!(methods, "finish_corruption" -> "boolean", |_, this, ()| this.with_state(|state| {
                 Ok(corruption::finish(this.npc_id, state)?)
+            }));
+            luau_method!(methods, "try_begin_eruption" -> "boolean", |_, this, ()| this.with_state(|state| {
+                Ok(crate::eruption::try_begin(this.npc_id, state)?)
+            }));
+            luau_method!(methods, "eruption_interrupted" -> "boolean", |_, this, ()| this.with_state(|state| {
+                Ok(crate::eruption::is_interrupted(this.npc_id, state))
+            }));
+            luau_method!(methods, "finish_eruption" -> "boolean", |_, this, ()| this.with_state(|state| {
+                Ok(crate::eruption::finish(this.npc_id, state)?)
             }));
 
             luau_method!(methods, "move_to" -> "()",
@@ -228,6 +244,7 @@ impl LuaUserData for NpcScriptContext {
                 // a corpse keeps no conditions or windup (OpenFusion MobAI::onDeath)
                 state.get_npc_mut(this.npc_id)?.clear_buffs();
                 corruption::cancel(this.npc_id, state)?;
+                crate::eruption::cancel(this.npc_id, state)?;
                 let last_attacked_by = state.get_npc(this.npc_id)?.last_attacked_by;
                 if let Some(defeater_id) = last_attacked_by {
                     let mut rng = thread_rng();

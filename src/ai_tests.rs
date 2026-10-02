@@ -16,6 +16,7 @@ use crate::{
         packet::{Packet, PacketID, PacketReader},
         ClientMessage, ClientMetadata, ClientType, FFClient,
     },
+    path::{Path, PathPoint},
     scripting::{scripting_get, scripting_init},
     state::ShardServerState,
     tabledata::tdata_init,
@@ -107,6 +108,112 @@ fn tick(state: &mut ShardServerState, npc_id: i32) {
     NPC::tick(state, npc_id);
 }
 
+#[test]
+fn authored_npc_route_survives_idle_ai_and_reaches_both_watchers() {
+    tdata_init().unwrap();
+    let _ = scripting_init();
+    let npc_id = 2_000_000_902;
+    scripting_get().lock().remove_npc(npc_id);
+    let mut state = ShardServerState::default();
+    let mut first = add_player(
+        &mut state,
+        1,
+        Position {
+            x: BASE.x + 3000,
+            ..BASE
+        },
+        false,
+    );
+    let mut second = add_player(
+        &mut state,
+        2,
+        Position {
+            x: BASE.x - 3000,
+            ..BASE
+        },
+        false,
+    );
+    let mut path = Path::new(
+        vec![
+            PathPoint {
+                pos: BASE,
+                speed: 400,
+                stop_ticks: 0,
+            },
+            PathPoint {
+                pos: Position {
+                    x: BASE.x + 100,
+                    ..BASE
+                },
+                speed: 400,
+                stop_ticks: 1,
+            },
+        ],
+        true,
+    );
+    path.start();
+    let mut npc = NPC::new(npc_id, 3285, BASE, 0, InstanceID::default()).unwrap();
+    npc.authored_path = Some(path.clone());
+    npc.path = Some(path);
+    let (ai, tick_mode) = make_for_npc(&npc, false);
+    assert_eq!(ai.as_deref(), Some("mob"));
+    assert!(matches!(tick_mode, TickMode::Always));
+    npc.ai = ai;
+    let chunk = npc.get_chunk_coords();
+    state.entity_map.track(Box::new(npc), tick_mode);
+    state
+        .entity_map
+        .update(EntityID::NPC(npc_id), Some(chunk), false);
+
+    tick(&mut state, npc_id); // duplicated starting waypoint
+    tick(&mut state, npc_id);
+    assert_eq!(state.get_npc(npc_id).unwrap().get_position().x, BASE.x + 50);
+    assert!(!only(&drain(&mut first), P_FE2CL_NPC_MOVE).is_empty());
+    assert!(!only(&drain(&mut second), P_FE2CL_NPC_MOVE).is_empty());
+
+    tick(&mut state, npc_id); // arrive and pause
+    for _ in 0..8 {
+        tick(&mut state, npc_id);
+        assert_eq!(
+            state.get_npc(npc_id).unwrap().get_position().x,
+            BASE.x + 100
+        );
+    }
+    tick(&mut state, npc_id); // return leg of the cycle
+    assert_eq!(state.get_npc(npc_id).unwrap().get_position().x, BASE.x + 50);
+}
+
+#[test]
+fn every_placed_bundled_npc_route_advances_without_a_watcher() {
+    tdata_init().unwrap();
+    let _ = scripting_init();
+    let mut state = ShardServerState::default();
+    for ty in [454, 461, 3285, 3286, 3287, 3288] {
+        let npc_id = state
+            .entity_map
+            .get_all_ids()
+            .filter_map(|id| match id {
+                EntityID::NPC(npc_id) => Some(npc_id),
+                _ => None,
+            })
+            .find(|&id| state.get_npc(id).is_ok_and(|npc| npc.ty == ty))
+            .unwrap_or_else(|| panic!("missing route NPC type {ty}"));
+        assert!(state
+            .entity_map
+            .get_tickable_ids()
+            .any(|id| id == EntityID::NPC(npc_id)));
+        let before = state.get_npc(npc_id).unwrap().get_position();
+        for _ in 0..3 {
+            tick(&mut state, npc_id);
+        }
+        assert_ne!(
+            state.get_npc(npc_id).unwrap().get_position(),
+            before,
+            "type {ty}"
+        );
+    }
+}
+
 fn move_npc(state: &mut ShardServerState, npc_id: i32, pos: Position) {
     let npc = state.get_npc_mut(npc_id).unwrap();
     npc.set_position(pos);
@@ -186,7 +293,12 @@ fn idle_mob_roams_inside_its_idle_box() {
         );
         assert_eq!(pos.z, BASE.z, "roaming never changes height");
         left_spawn |= pos != BASE;
-        moves += only(&drain(&mut rx), P_FE2CL_NPC_MOVE).len();
+        for packet in only(&drain(&mut rx), P_FE2CL_NPC_MOVE) {
+            let movement = PacketReader::new(packet).get_struct::<sP_FE2CL_NPC_MOVE>().unwrap();
+            assert_eq!(movement.iMoveStyle, 0, "peaceful roaming must send Walk");
+            assert_eq!(movement.iSpeed, 300, "distance must not select combat running");
+            moves += 1;
+        }
     }
     assert!(left_spawn, "the mob never walked away from its spawn point");
     assert!(moves > 0, "the watching client never saw the mob walk");
@@ -330,6 +442,127 @@ fn mob_fights_again_after_returning_home() {
     assert!(attacks > 0, "the mob never attacked again");
 }
 
+#[test]
+fn patrol_mob_can_be_hit_again_far_from_its_original_spawn() {
+    let npc_id = 2_000_000_920;
+    let (mut state, mut rx) = fixture(npc_id, ROAMING_MOB, 4500);
+    retreat(&mut state, &mut rx, npc_id);
+    // An authored patrol or roaming pack has since moved beyond the original
+    // spawn's combat range. A new fight must be anchored at this position.
+    let encounter = Position {
+        x: BASE.x + 9000,
+        ..BASE
+    };
+    move_npc(&mut state, npc_id, encounter);
+    state.get_player_mut(PC_ID).unwrap().set_position(encounter);
+    let chunk = ChunkCoords::from_pos_inst(encounter, InstanceID::default());
+    state
+        .entity_map
+        .update(EntityID::Player(PC_ID), Some(chunk), false);
+    drain(&mut rx);
+    for _ in 0..3 {
+        assert_eq!(
+            state
+                .get_npc_mut(npc_id)
+                .unwrap()
+                .take_damage(1, Some(EntityID::Player(PC_ID))),
+            1
+        );
+        for _ in 0..crate::defines::SHARD_TICKS_PER_SECOND {
+            tick(&mut state, npc_id);
+            assert!(
+                !state.get_npc(npc_id).unwrap().retreating,
+                "new hit triggered another reset"
+            );
+        }
+    }
+    assert!(return_home_heals(&drain(&mut rx), npc_id).is_empty());
+    // Leaving this encounter's leash still resets it, then a later encounter
+    // captures a fresh anchor rather than retaining either previous origin.
+    let outside = Position {
+        x: encounter.x + 4500,
+        ..encounter
+    };
+    state.get_player_mut(PC_ID).unwrap().set_position(outside);
+    let chunk = ChunkCoords::from_pos_inst(outside, InstanceID::default());
+    state
+        .entity_map
+        .update(EntityID::Player(PC_ID), Some(chunk), false);
+    for _ in 0..(5 * crate::defines::SHARD_TICKS_PER_SECOND) {
+        tick(&mut state, npc_id);
+    }
+    let heals = return_home_heals(&drain(&mut rx), npc_id);
+    assert_eq!(heals.len(), 1);
+    let home = Position {
+        x: heals[0].0.iValue1,
+        y: heals[0].0.iValue2,
+        z: heals[0].0.iValue3,
+    };
+    assert!(home.distance_to(&encounter) < 1000);
+    let npc = state.get_npc(npc_id).unwrap();
+    assert!(npc.combat_origin.is_none());
+    assert!(!npc.retreating);
+}
+
+#[test]
+fn accepted_trio_and_boss_pack_spawn_all_members_for_a_watcher() {
+    tdata_init().unwrap();
+    for (group, ty, pos, follower_ty, count) in [
+        (
+            0,
+            174,
+            Position {
+                x: 536307,
+                y: 457315,
+                z: -4435,
+            },
+            174,
+            3,
+        ),
+        (
+            27,
+            521,
+            Position {
+                x: 497662,
+                y: 513961,
+                z: -5096,
+            },
+            133,
+            5,
+        ),
+    ] {
+        let mut state = ShardServerState::default();
+        let mut rx = add_player(&mut state, PC_ID, pos, false);
+        let npcs = tdata_get().make_group_npcs(&mut state.entity_map, 1, group);
+        assert_eq!(npcs.len(), count);
+        let leader = npcs.iter().find(|npc| npc.tight_follow.is_none()).unwrap();
+        let leader_id = leader.id;
+        assert_eq!(leader.ty, ty);
+        assert_eq!(leader.get_position(), pos);
+        for mut npc in npcs {
+            if let Some((id, offset)) = npc.tight_follow {
+                assert_eq!(id, EntityID::NPC(leader_id));
+                assert_eq!(npc.ty, follower_ty);
+                assert_eq!(npc.get_position(), pos + offset);
+            }
+            let (ai, tick_mode) = make_for_npc(&npc, false);
+            assert_eq!(
+                ai.as_deref(),
+                Some(if npc.id == leader_id {
+                    "mob"
+                } else {
+                    "mob_pack_member"
+                })
+            );
+            npc.ai = ai;
+            let chunk = npc.get_chunk_coords();
+            let id = state.entity_map.track(Box::new(npc), tick_mode);
+            state.entity_map.update(id, Some(chunk), true);
+        }
+        assert_eq!(only(&drain(&mut rx), P_FE2CL_NPC_ENTER).len(), count);
+    }
+}
+
 /// Adds a pack member behind `leader_id`, the way tabledata spawns groups.
 fn add_follower(state: &mut ShardServerState, leader_id: i32, follower_id: i32) -> Position {
     scripting_get().lock().remove_npc(follower_id);
@@ -366,11 +599,11 @@ fn pack_followers_walk_with_their_roaming_leader() {
         follower_moves += only(&drain(&mut rx), P_FE2CL_NPC_MOVE)
             .into_iter()
             .filter(|p| {
-                PacketReader::new(p)
-                    .get_struct::<sP_FE2CL_NPC_MOVE>()
-                    .unwrap()
-                    .iNPC_ID
-                    == follower_id
+                let movement = PacketReader::new(p).get_struct::<sP_FE2CL_NPC_MOVE>().unwrap();
+                if movement.iNPC_ID != follower_id { return false; }
+                assert_eq!(movement.iMoveStyle, 0, "peaceful pack followers must walk");
+                assert!(movement.iSpeed <= 300);
+                true
             })
             .count();
     }

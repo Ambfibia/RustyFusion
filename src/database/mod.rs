@@ -134,6 +134,9 @@ impl<D> Database<D> {
 /// Opens an isolated SQLite file for tests outside this module.
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) async fn open_test_sqlite(db_path: &str) -> Database<sqlite::SqliteDatabase> {
+    // Negative transaction tests need the same error severity initialization
+    // as a running server, without initializing its global/live database.
+    let _ = DB_ERROR_SEVERITY.set(Severity::Warning);
     let cfg = test_suite::build_config(db_path);
     Database::new(sqlite::SqliteDatabase::connect(&cfg.general).await.unwrap())
 }
@@ -209,6 +212,9 @@ define_db_api! {
     update_player_appearance(&self, player: &Player) -> ();
     update_selected_player(&self, acc_id: BigInt, slot_num: Int) -> ();
     save_player(&self, player: &Player) -> ();
+    // Claim and save rewards atomically; false means this character already claimed it.
+    redeem_code(&self, player: &Player, code: &str) -> bool;
+    is_code_redeemed(&self, pc_uid: BigInt, code: &str) -> bool;
     save_players(&self, players: &[&Player]) -> ();
     load_player(&self, acc_id: BigInt, pc_uid: BigInt) -> Option<Player>;
     load_players(&self, acc_id: BigInt) -> Vec<Player>;

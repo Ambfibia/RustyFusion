@@ -40,6 +40,7 @@ pub struct TaskDefinition {
     pub obj_enemies: HashMap<i32, usize>, // m_iCSUEnemyID -> m_iCSUNumToKill
     pub obj_enemy_id_ordering: Vec<i32>, // m_iCSUEnemyID (needed for loading counts correctly from DB)
     pub obj_escort_npc_type: Option<i32>, // m_iCSUDEFNPCID
+    pub escort_follows_player: bool, // delivery destination or m_iCSUDEPNPCFollow
     pub obj_time_limit: Option<Duration>, // m_iCSUCheckTimer
 
     // failure

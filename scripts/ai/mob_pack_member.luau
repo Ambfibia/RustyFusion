@@ -74,7 +74,8 @@ return function(npc: Npc)
                         local dist = npc:distance_to(tx, ty, tz)
                         local tolerance = npc:attack_range() / 2
                         if dist > tolerance then
-                            local max_speed = npc:run_speed() * 2
+                            local max_speed = if leader_retreating or leader:target()
+                                then npc:run_speed() * 2 else npc:walk_speed()
                             local speed = math.min(dist, max_speed)
                             npc:move_to(tx, ty, tz, speed)
                         end

@@ -340,3 +340,28 @@ fn whois_requires_access_and_unknown_slash_commands_stay_out_of_chat() {
         .iter()
         .any(|p| p.id() == P_FE2CL_REP_SEND_FREECHAT_MESSAGE_SUCC));
 }
+
+#[test]
+fn help_and_redeem_route_for_normal_muted_players_without_broadcast() {
+    let mut f = fixture(99, 5);
+    f.state.get_player_mut(1).unwrap().freechat_muted = true;
+    for command in ["/help", "!help"] {
+        f.chat(command);
+        let out = drain(&mut f.rx);
+        let lines = system_messages(&out);
+        assert_eq!(lines.len(), 20);
+        assert_eq!(lines[0], "Available commands");
+        assert!(lines.iter().any(|s| s == "/redeem: Redeem a code item"));
+        assert!(lines[1..].windows(2).all(|pair| pair[0] < pair[1]));
+        // This was the original /help failure: one oversized UTF-16 packet.
+        assert!(util::encode_utf16::<512>(&lines.join("\n")).is_err());
+        assert_eq!(out.len(), 20);
+    }
+    for (command, expected) in [("/redeem", "/redeem: No code specified"),
+        ("/redeem unknown", "/redeem: Unknown code"),
+        ("/redeem a b", "Usage: /redeem <code>")] {
+        f.chat(command);
+        assert_eq!(system_messages(&drain(&mut f.rx)), [expected]);
+    }
+    assert!(drain(&mut f.observer_rx).is_empty());
+}

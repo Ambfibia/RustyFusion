@@ -33,6 +33,8 @@ pub struct NPC {
     pub id: i32,
     pub ty: i32,
     pub spawn_position: Position,
+    /// Leash anchor for the current encounter (OpenFusion Mob::roamX/Y/Z).
+    pub combat_origin: Option<Position>,
     position: Position,
     rotation: i32,
     hp: i32,
@@ -44,13 +46,17 @@ pub struct NPC {
     pub instance_id: InstanceID,
     pub tight_follow: Option<(EntityID, Position)>,
     pub path: Option<Path>,
+    /// TableData route retained while combat temporarily owns `path`.
+    pub authored_path: Option<Path>,
     pub group_id: Option<Uuid>,
     pub loose_follow: Option<EntityID>,
+    pub mission_escort: Option<crate::escort::Escort>,
     pub interacting_pcs: HashSet<i32>,
     pub summoned: bool,
     pub ai: Option<String>,
     /// Corruption attack being wound up, if any (OpenFusion `skillStyle >= 0`).
     pub corruption: Option<PendingCorruption>,
+    pub eruption: Option<(i16, Position, i32)>,
     buffs: BuffContainer,
 }
 
@@ -80,6 +86,7 @@ impl NPC {
             id,
             ty,
             spawn_position: position,
+            combat_origin: None,
             position,
             rotation: angle % 360,
             hp: stats.max_hp as i32,
@@ -91,18 +98,28 @@ impl NPC {
             instance_id,
             tight_follow: None,
             path: None,
+            authored_path: None,
             group_id: None,
             loose_follow: None,
+            mission_escort: None,
             interacting_pcs: HashSet::new(),
             summoned: false,
             ai: None,
             corruption: None,
+            eruption: None,
             buffs: BuffContainer::default(),
         })
     }
 
     pub fn clear_buffs(&mut self) {
         self.buffs.clear();
+    }
+
+    pub fn acquire_target(&mut self, target: EntityID) {
+        if self.target_id.is_none() {
+            self.combat_origin = Some(self.position);
+        }
+        self.target_id = Some(target);
     }
 
     pub fn move_towards(&mut self, position: Position, speed: Option<i32>) -> bool {
@@ -171,11 +188,14 @@ impl NPC {
     }
 
     pub fn tick_movement_along_path(npc_id: i32, path: &mut Path, state: &mut ShardServerState) {
-        let speed = path.get_speed();
+        let mut speed = path.get_speed();
+        if state.get_npc(npc_id).unwrap().has_buff(BuffID::DnMoveSpeed, None) {
+            speed /= 2;
+        }
         let npc_eid = EntityID::NPC(npc_id);
         let old_pos = state.get_npc(npc_id).unwrap().position;
         let mut new_pos = old_pos;
-        if path.tick(&mut new_pos) {
+        if path.tick_at_speed(&mut new_pos, speed) {
             // update angle, position, and chunks
             let npc = state.get_npc_mut(npc_id).unwrap();
             npc.set_position(new_pos);
@@ -262,6 +282,10 @@ impl NPC {
             });
         }
 
+        if crate::escort::tick(state, npc_id) {
+            return;
+        }
+
         // tick AI; we don't tick AI while PCs are interacting with the NPC
         let npc = state.get_npc(npc_id).unwrap(); // re-borrow
         if npc.ai.is_some() && npc.interacting_pcs.is_empty() {
@@ -315,7 +339,8 @@ impl Entity for NPC {
         };
 
         let buffed_speed = self.buffs.get_buff_value(BuffID::UpMoveSpeed).unwrap_or(0);
-        base_speed + buffed_speed
+        let speed = (base_speed + buffed_speed).max(0);
+        if self.has_buff(BuffID::DnMoveSpeed, None) { speed / 2 } else { speed }
     }
 
     fn get_chunk_coords(&self) -> ChunkCoords {
@@ -468,7 +493,7 @@ impl Combatant for NPC {
         if let Some(source) = source {
             self.last_attacked_by = Some(source);
             if self.target_id.is_none() {
-                self.target_id = Some(source);
+                self.acquire_target(source);
             }
         }
 
@@ -504,11 +529,16 @@ impl Combatant for NPC {
     fn reset(&mut self) {
         self.last_attacked_by = None;
         self.target_id = None;
+        self.combat_origin = None;
         self.retreating = false;
         self.hp = self.get_max_hp();
         // retreat and respawn drop every debuff and any windup
         // (OpenFusion clearDebuff)
         self.buffs.clear();
         self.corruption = None;
+        self.eruption = None;
+        if let Some(path) = &self.authored_path {
+            self.path = Some(path.clone());
+        }
     }
 }

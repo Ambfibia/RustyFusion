@@ -108,6 +108,7 @@ impl PostgresDatabase {
             .await?;
         }
 
+        Self::exec(&mut db_client, "create_redeemed_codes", &[]).await?;
         Ok(Self {
             pool,
             config: db_config,
@@ -223,6 +224,28 @@ impl PostgresDatabase {
                     .completed_mission_flags
                     .to_bytes()
                     .as_slice(),
+            ],
+        )
+        .await?;
+
+        // Keep appearance, currency and inventory in the same save transaction.
+        let style = player.style.unwrap_or_default();
+        let appearance_flag: Int = i32::from(player.style.is_some());
+        Self::exec(
+            client,
+            "update_appearance",
+            &[
+                &pc_uid,
+                &(style.body as Int),
+                &(style.eye_color as Int),
+                &(style.face_style as Int),
+                &(style.gender as Int),
+                &(style.hair_color as Int),
+                &(style.hair_style as Int),
+                &(style.height as Int),
+                &(style.skin_color as Int),
+                &pc_uid,
+                &appearance_flag,
             ],
         )
         .await?;
@@ -879,6 +902,23 @@ impl DbImpl for PostgresDatabase {
     async fn save_player(&self, player: &Player) -> FFResult<()> {
         let mut client = self.get_client().await?;
         Self::save_player_internal(&mut client, player).await
+    }
+
+    async fn is_code_redeemed(&self, pc_uid: BigInt, code: &str) -> FFResult<bool> {
+        let client = self.get_client().await?;
+        Ok(!Self::query(&client, "is_code_redeemed", &[&pc_uid, &code]).await?.is_empty())
+    }
+
+    async fn redeem_code(&self, player: &Player, code: &str) -> FFResult<bool> {
+        let mut client = self.get_client().await?;
+        let mut tx = client.transaction().await?;
+        let uid = player.get_uid();
+        if tx.execute(Self::read_sql("claim_code")?, &[&uid, &code]).await? == 0 {
+            return Ok(false);
+        }
+        Self::save_player_internal(&mut tx, player).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn save_players(&self, players: &[&Player]) -> FFResult<()> {

@@ -42,6 +42,8 @@ mod item_move_tests;
 mod xdt_identity_tests;
 mod login;
 mod mission;
+#[cfg(test)]
+mod escort_tests;
 mod nano;
 #[cfg(test)]
 mod nano_tune_tests;

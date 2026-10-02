@@ -111,10 +111,15 @@ impl Path {
     }
 
     pub fn tick(&mut self, pos: &mut Position) -> bool {
+        self.tick_at_speed(pos, self.get_speed())
+    }
+
+    /// Project temporary movement conditions without changing the authored route.
+    pub fn tick_at_speed(&mut self, pos: &mut Position, speed: i32) -> bool {
         match self.state {
             PathState::Pending => {}
             PathState::Moving => {
-                let dist = self.points[self.idx].speed as f32 / SHARD_TICKS_PER_SECOND as f32;
+                let dist = speed.max(0) as f32 / SHARD_TICKS_PER_SECOND as f32;
                 let target_point = self.points[self.idx];
                 let target_pos = target_point.pos;
                 let source_pos = *pos;

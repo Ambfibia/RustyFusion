@@ -17,6 +17,9 @@ use crate::{
 const CUSTOM_COMMAND_PREFIX: char = '/';
 const CUSTOM_COMMAND_PREFIXES: [char; 2] = [CUSTOM_COMMAND_PREFIX, '!'];
 
+#[path = "chat_redeem.rs"]
+mod redeem;
+
 pub async fn send_freechat_message(
     pkt: Packet,
     clients: &ClientMap<'_>,
@@ -543,7 +546,7 @@ mod commands {
 
     fn init_commands() -> HashMap<&'static str, Command> {
         #[rustfmt::skip]
-        let commands: [(&'static str, &'static str, CommandHandler); 18] = [
+        let commands: [(&'static str, &'static str, CommandHandler); 19] = [
             ("about", "Show information about the server", cmd_about),
             ("level", "Change your character's level", cmd_level),
             ("levelx", "Change your character's level", cmd_level), // for Academy
@@ -562,6 +565,7 @@ mod commands {
             ("registerall", "Register all transportation locations", cmd_registerall),
             ("unregisterall", "Unregister all transportation locations", cmd_unregisterall),
             ("help", "Show this help message", cmd_help),
+            ("redeem", "Redeem a code item", redeem::cmd_redeem),
         ];
 
         commands
@@ -1413,16 +1417,17 @@ mod commands {
         _state: &'a mut ShardServerState,
     ) -> Pin<Box<dyn Future<Output = FFResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            let mut help_msg = "Available commands\n".to_string();
-            for (cmd_name, cmd) in AVAILABLE_COMMANDS.get().unwrap() {
-                help_msg.push_str(&format!(
-                    "{}{}: {}\n",
-                    CUSTOM_COMMAND_PREFIX, cmd_name, cmd.description
-                ));
+            // MOTD holds 512 UTF-16 units. One entry per packet avoids overflow
+            // and fits the chat history's individual visible rows.
+            send_system_message(clients.get_sender(), "Available commands")?;
+            let mut entries: Vec<_> = AVAILABLE_COMMANDS.get().unwrap().iter().collect();
+            entries.sort_unstable_by_key(|(name, _)| **name);
+            for (cmd_name, cmd) in entries {
+                send_system_message(clients.get_sender(), &format!(
+                    "{}{}: {}", CUSTOM_COMMAND_PREFIX, cmd_name, cmd.description
+                ))?;
             }
-
-            help_msg.pop(); // remove trailing newline
-            send_system_message(clients.get_sender(), &help_msg)
+            Ok(())
         })
     }
 }

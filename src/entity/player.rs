@@ -1796,6 +1796,13 @@ impl Player {
 
         if let Some(escort_npc_id) = task.escort_npc_id {
             if let Ok(escort_npc) = state.get_npc(escort_npc_id) {
+                if task_def.escort_follows_player
+                    && !escort_npc.mission_escort.as_ref().is_some_and(|escort|
+                        escort.player_id == player.get_player_id()
+                            && escort.task_id == task.get_task_id())
+                {
+                    return Some(codes::TaskEndErr::EscortFailed);
+                }
                 if escort_npc.is_dead() {
                     return Some(codes::TaskEndErr::EscortFailed);
                 }
@@ -2265,20 +2272,22 @@ impl Entity for Player {
 
         // cleanup ongoing trade
         if let Some(trade_id) = self.trade_id {
-            let trade = state.ongoing_trades.remove(&trade_id).unwrap();
+            if let Some(trade) = state.ongoing_trades.remove(&trade_id) {
             let pc_id_other = trade.get_other_id(pc_id);
-            let player_other = state.get_player_mut(pc_id_other).unwrap();
-            player_other.trade_id = None;
-            let client_other = player_other.get_client().unwrap();
-            let pkt_cancel = sP_FE2CL_REP_PC_TRADE_CONFIRM_CANCEL {
-                iID_Request: pc_id,
-                iID_From: trade.get_id_from(),
-                iID_To: trade.get_id_to(),
-            };
-
-            client_other.send_packet(P_FE2CL_REP_PC_TRADE_CONFIRM_CANCEL, &pkt_cancel);
+            if let Ok(player_other) = state.get_player_mut(pc_id_other) {
+                if player_other.trade_id == Some(trade_id) { player_other.trade_id = None; }
+                if let Some(client_other) = player_other.get_client() {
+                    let pkt_cancel = sP_FE2CL_REP_PC_TRADE_CONFIRM_CANCEL {
+                        iID_Request: pc_id,
+                        iID_From: trade.get_id_from(),
+                        iID_To: trade.get_id_to(),
+                    };
+                    client_other.send_packet(P_FE2CL_REP_PC_TRADE_CONFIRM_CANCEL, &pkt_cancel);
+                }
+            }
         }
 
+        }
         // cleanup group
         if let Some(group_id) = self.group_id {
             helpers::remove_group_member(EntityID::Player(pc_id), group_id, state).unwrap();

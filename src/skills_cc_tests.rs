@@ -20,6 +20,79 @@ const MOB_TYPE: i32 = 59;
 const STUN_SKILL: i16 = 1;
 const SLEEP_SKILL: i16 = 28;
 
+#[test]
+fn snare_slows_an_existing_mob_path_and_removal_restores_it() {
+    let npc_id = 2_000_000_190;
+    let (mut state, _rx) = fixture(npc_id);
+    let pos = state.get_npc(npc_id).unwrap().get_position();
+    let mut dest = pos;
+    dest.x += 10000;
+    state.get_npc_mut(npc_id).unwrap().move_towards(dest, Some(500));
+    let skill = tdata_get().get_skill(171).unwrap();
+    assert_eq!(skill.skill_type, SkillType::Snare);
+    do_skill(EntityID::Player(PC_ID), &[EntityID::NPC(npc_id)], skill, 0, &mut state).unwrap();
+    assert_eq!(state.get_npc(npc_id).unwrap().get_speed(true), 250);
+    let mut path = state.get_npc_mut(npc_id).unwrap().path.take().unwrap();
+    NPC::tick_movement_along_path(npc_id, &mut path, &mut state);
+    let slow_distance = state.get_npc(npc_id).unwrap().get_position().x - pos.x;
+    assert_eq!(path.get_speed(), 500, "the authored path is preserved");
+    state.get_npc_mut(npc_id).unwrap().clear_buffs();
+    NPC::tick(&mut state, npc_id);
+    let before = state.get_npc(npc_id).unwrap().get_position();
+    NPC::tick_movement_along_path(npc_id, &mut path, &mut state);
+    assert_eq!(state.get_npc(npc_id).unwrap().get_position().x - before.x, slow_distance * 2);
+    assert_eq!(state.get_npc(npc_id).unwrap().get_speed(true), 500);
+}
+
+#[test]
+fn numbuh_two_eruption_hits_the_pinned_ground_and_can_be_avoided_or_cancelled() {
+    let npc_id = 2_000_000_191;
+    let (mut state, mut rx) = fixture(npc_id);
+    state.get_npc_mut(npc_id).unwrap().ty = 7;
+    state.get_npc_mut(npc_id).unwrap().target_id = Some(EntityID::Player(PC_ID));
+    let attack = tdata_get().get_npc_stats(7).unwrap().eruption.unwrap();
+    assert_eq!((attack.skill_id, attack.prob), (178, 100_000));
+    crate::corruption::FORCED_ROLL.with(|r| r.set(Some(0)));
+    assert!(crate::eruption::try_begin(npc_id, &mut state).unwrap());
+    let hp = state.get_player(PC_ID).unwrap().get_hp();
+    assert!(crate::eruption::finish(npc_id, &mut state).unwrap());
+    assert!(state.get_player(PC_ID).unwrap().get_hp() < hp);
+    assert_eq!(count(&drain(&mut rx), P_FE2CL_NPC_SKILL_READY), 1);
+
+    assert!(crate::eruption::try_begin(npc_id, &mut state).unwrap());
+    let mut escaped = state.get_player(PC_ID).unwrap().get_position();
+    escaped.x += 400;
+    state.get_player_mut(PC_ID).unwrap().set_position(escaped);
+    let hp = state.get_player(PC_ID).unwrap().get_hp();
+    assert!(crate::eruption::finish(npc_id, &mut state).unwrap());
+    assert_eq!(state.get_player(PC_ID).unwrap().get_hp(), hp);
+    assert_eq!(count(&drain(&mut rx), P_FE2CL_NPC_SKILL_HIT), 1);
+
+    assert!(crate::eruption::try_begin(npc_id, &mut state).unwrap());
+    state.get_npc_mut(npc_id).unwrap().apply_buff(BuffID::Stun, short_buff(3000), None);
+    assert!(!crate::eruption::finish(npc_id, &mut state).unwrap());
+    assert_eq!(count(&drain(&mut rx), P_FE2CL_NPC_SKILL_CANCEL), 1);
+    assert!(state.get_npc(npc_id).unwrap().eruption.is_none());
+    crate::corruption::FORCED_ROLL.with(|r| r.set(None));
+}
+
+#[test]
+fn numbuh_two_ai_emits_eruption_ready_then_hit_after_windup() {
+    let npc_id = 2_000_000_192;
+    let (mut state, mut rx) = fixture(npc_id);
+    state.get_npc_mut(npc_id).unwrap().ty = 7;
+    with_ai(&mut state, npc_id);
+    crate::corruption::FORCED_ROLL.with(|r| r.set(Some(0)));
+    tick(&mut state, npc_id, 1);
+    assert_eq!(count(&drain(&mut rx), P_FE2CL_NPC_SKILL_READY), 1);
+    tick(&mut state, npc_id, 14);
+    assert_eq!(count(&drain(&mut rx), P_FE2CL_NPC_SKILL_HIT), 0);
+    tick(&mut state, npc_id, 1);
+    assert_eq!(count(&drain(&mut rx), P_FE2CL_NPC_SKILL_HIT), 1);
+    crate::corruption::FORCED_ROLL.with(|r| r.set(None));
+    scripting_get().lock().remove_npc(npc_id);
+}
+
 fn fixture(npc_id: i32) -> (ShardServerState, Rx) {
     tdata_init().unwrap();
     let mut state = ShardServerState::default();

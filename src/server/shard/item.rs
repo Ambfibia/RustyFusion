@@ -489,6 +489,18 @@ pub fn vendor_item_buy(
         let stats = item.get_stats()?;
         let price = stats.buy_price * item.quantity as u32;
         let player = state.get_player_mut(client.get_player_id()?)?;
+        if !guide_shop_purchase_allowed(
+            pkt.iVendorID,
+            stats.mentor,
+            stats.required_level,
+            player.get_guide(),
+            player.get_level(),
+        ) {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Guide item ({}, {:?}) is unavailable to this player", item.id, item.ty),
+            ));
+        }
         if player.get_taros() < price {
             Err(FFError::build(
                 Severity::Warning,
@@ -741,6 +753,33 @@ pub fn streetstall_cancel(client: &FFClient) -> FFResult<()> {
     Ok(())
 }
 
+fn guide_shop_purchase_allowed(
+    vendor_id: i32,
+    item_mentor: Option<i16>,
+    required_level: i16,
+    player_guide: PlayerGuide,
+    player_level: i16,
+) -> bool {
+    !(643..=650).contains(&vendor_id)
+        || (item_mentor == Some(player_guide as i16) && player_level >= required_level)
+}
+
+#[cfg(test)]
+mod guide_shop_tests {
+    use super::*;
+
+    #[test]
+    fn paired_guide_shops_accept_only_their_guide_and_required_level() {
+        for vendor in [643, 644] {
+            assert!(guide_shop_purchase_allowed(vendor, Some(1), 6, PlayerGuide::Edd, 6));
+            assert!(!guide_shop_purchase_allowed(vendor, Some(1), 6, PlayerGuide::Ben, 20));
+            assert!(!guide_shop_purchase_allowed(vendor, Some(1), 6, PlayerGuide::Edd, 5));
+            assert!(!guide_shop_purchase_allowed(vendor, None, 1, PlayerGuide::Edd, 20));
+        }
+        assert!(guide_shop_purchase_allowed(651, None, 1, PlayerGuide::Edd, 1));
+    }
+}
+
 fn validate_vendor(
     client: &FFClient,
     state: &mut ShardServerState,
@@ -748,48 +787,25 @@ fn validate_vendor(
     vendor_id: i32,
 ) -> FFResult<()> {
     let pc_id = client.get_player_id()?;
-    if npc_id == vendor_id {
-        /*
-         * due to a client bug where the iNPC_ID field in vendor packets is incorrectly
-         * set to the same value as iVendorID, we need to lookup the NPC by its type
-         * instead (which is equal to iVendorID for whatever reason).
-         * On top of that, there may exist multiple NPCs with the same type... so if
-         * one of them is close enough, we'll accept it.
-         */
-        let npc_ids = state.entity_map.find_npcs(|n| n.ty == vendor_id);
-        for npc_id in npc_ids {
-            if validate_vendor(client, state, npc_id, vendor_id).is_ok() {
-                return Ok(());
-            }
-        }
-        Err(FFError::build(
+    let npc = state.get_npc(npc_id)?;
+    if npc.ty != vendor_id {
+        return Err(FFError::build(
             Severity::Warning,
-            "No matching NPCs close enough".to_string(),
-        ))
-    } else {
-        let npc = state.get_npc(npc_id)?;
-        if npc.ty != vendor_id {
-            return Err(FFError::build(
-                Severity::Warning,
-                format!(
-                    "Vendor {} has type {} instead of {}",
-                    npc_id, npc.ty, vendor_id
-                ),
-            ));
-        }
-        state
-            .entity_map
-            .validate_proximity(
-                &[EntityID::Player(pc_id), EntityID::NPC(npc_id)],
-                RANGE_INTERACT,
-            )
-            .map_err(|e| {
-                e.with_parent(FFError::build(
-                    Severity::Warning,
-                    format!("Vendor {} not close enough", npc_id),
-                ))
-            })
+            format!("Vendor {} has type {} instead of {}", npc_id, npc.ty, vendor_id),
+        ));
     }
+    state
+        .entity_map
+        .validate_proximity(
+            &[EntityID::Player(pc_id), EntityID::NPC(npc_id)],
+            RANGE_INTERACT,
+        )
+        .map_err(|e| {
+            e.with_parent(FFError::build(
+                Severity::Warning,
+                format!("Vendor {} not close enough", npc_id),
+            ))
+        })
 }
 
 //

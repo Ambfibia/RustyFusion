@@ -216,3 +216,6 @@ mod tests {
         assert_eq!(size_of::<NpcMapSnapshotEntry>(), 20);
     }
 }
+
+#[cfg(test)]
+mod integration_tests;

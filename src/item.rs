@@ -162,6 +162,7 @@ pub struct ItemStats {
     pub tradeable: bool,
     pub max_stack_size: u16,
     pub required_level: i16,
+    pub mentor: Option<i16>,
     pub rarity: Option<i8>,
     pub gender: Option<i8>,
     pub single_power: Option<i32>,
@@ -175,6 +176,7 @@ pub struct ItemStats {
     pub speed: Option<i32>,
 }
 
+#[derive(Clone)]
 pub struct VendorItem {
     pub sort_number: i32,
     pub ty: ItemType,
@@ -197,9 +199,18 @@ impl VendorData {
         self.items.push(item);
     }
 
+    pub fn with_vendor_id(&self, vendor_id: i32) -> Self {
+        Self {
+            vendor_id,
+            items: self.items.clone(),
+        }
+    }
+
     pub fn as_arr(&self) -> FFResult<[sItemVendor; SIZEOF_VENDOR_TABLE_SLOT as usize]> {
         let mut vendor_item_structs = Vec::new();
-        for item in &self.items {
+        // The 0104 reply has 20 slots. OpenFusion sends the first 20 listings
+        // even when the source guide catalog contains more rows.
+        for item in self.items.iter().take(SIZEOF_VENDOR_TABLE_SLOT as usize) {
             vendor_item_structs.push(sItemVendor {
                 iVendorID: self.vendor_id,
                 fBuyCost: tdata_get().get_item_stats(item.id, item.ty)?.buy_price as f32,

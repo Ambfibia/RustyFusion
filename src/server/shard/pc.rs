@@ -263,7 +263,13 @@ pub async fn pc_exit(clients: &ClientMap<'_>, state: Arc<Mutex<ShardServerState>
 
     // save to db
     let db = db_get();
-    log_if_failed(db.save_player(&player).await);
+    if let Err(error) = db.save_player(&player).await {
+        // Never confirm exit when the authoritative player snapshot was not
+        // persisted. The client treats EOF without an ack as a failed exit.
+        client.clear_player_id()?;
+        client.disconnect();
+        return Err(error);
+    }
 
     client.send_packet(P_FE2CL_REP_PC_EXIT_SUCC, &resp);
     client.clear_player_id().unwrap();

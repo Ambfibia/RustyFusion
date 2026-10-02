@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS RedeemedCodes (
+    PlayerID BIGINT NOT NULL REFERENCES Players(PlayerID) ON DELETE CASCADE,
+    Code TEXT NOT NULL,
+    PRIMARY KEY (PlayerID, Code)
+);

@@ -292,8 +292,8 @@ impl EntityMap {
                     return Err(FFError::build(
                         Severity::Warning,
                         format!(
-                            "Entity with ID {:?} is too far from entity with ID {:?} ({} > {})",
-                            ids[i], ids[j], distance, range
+                            "Entity with ID {:?} is too far from entity with ID {:?} ({} > {}; XYZ {:?} vs {:?}; instance {:?})",
+                            ids[i], ids[j], distance, range, pos1, pos2, inst1
                         ),
                     ));
                 }
@@ -1117,5 +1117,30 @@ mod tests {
         place_entity(&mut map, far_npc);
         // The far NPC is in an unloaded chunk, shouldn't be counted
         assert_eq!(map.get_num_loaded_entities(), 2);
+    }
+
+    #[test]
+    fn interaction_proximity_uses_exact_id_instance_and_inclusive_boundary() {
+        let mut map = EntityMap::default();
+        let inst = default_instance();
+        let origin = pos_for_chunk(64, 64);
+        let player_id = EntityID::Player(1);
+        let npc_id = EntityID::NPC(2248);
+        place_entity(&mut map, MockEntity::new_player(1, origin, inst));
+        let at_limit = Position { x: origin.x + 800, ..origin };
+        place_entity(&mut map, MockEntity::new_npc(2248, at_limit, inst));
+        place_entity(&mut map, MockEntity::new_npc(2249, origin, inst));
+        assert!(map.validate_proximity(&[player_id, npc_id], 800).is_ok());
+
+        let beyond_limit = Position { x: origin.x + 801, ..origin };
+        map.get_entity_mut::<MockEntity>(npc_id).unwrap().set_position(beyond_limit);
+        assert!(map.validate_proximity(&[player_id, npc_id], 800).is_err());
+        assert!(map.validate_proximity(&[player_id, EntityID::NPC(9999)], 800).is_err());
+
+        map.get_entity_mut::<MockEntity>(npc_id).unwrap().set_position(origin);
+        assert!(map.validate_proximity(&[player_id, npc_id], 800).is_ok());
+        map.get_entity_mut::<MockEntity>(npc_id).unwrap().instance_id =
+            InstanceID { map_num: 41, ..inst };
+        assert!(map.validate_proximity(&[player_id, npc_id], 800).is_err());
     }
 }

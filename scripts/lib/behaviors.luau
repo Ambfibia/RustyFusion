@@ -36,7 +36,7 @@ function behaviors.handle_crowd_control(npc: Npc)
     return true
 end
 
--- Retreat to spawn if target is dead, gone, or too far from spawn.
+-- Retreat to the encounter origin if target is dead, gone, or beyond its leash.
 -- After retreat, fully heals the NPC and shows the heal to everyone watching
 -- (matching native reset behavior).
 -- Returns true if retreating (caller should skip other behaviors).
@@ -46,7 +46,9 @@ function behaviors.check_retreat(npc: Npc)
         return false
     end
 
-    local spawn = npc:spawn_position()
+    -- Roaming/patrolling mobs start each encounter where they were engaged,
+    -- not at the permanent table spawn (OpenFusion onCombatStart).
+    local spawn = npc:combat_origin()
     local combat_range = npc:combat_range()
     local should_retreat = false
 
@@ -76,7 +78,7 @@ function behaviors.check_retreat(npc: Npc)
         return false
     end
 
-    -- Retreat to spawn
+    -- Retreat to the position where this encounter began.
     npc:clear_target()
     npc:set_retreating(true)
     npc:move_to(spawn.x, spawn.y, spawn.z, npc:run_speed() * 2)
@@ -149,6 +151,17 @@ function behaviors.try_attack(npc: Npc)
         return true
     end
 
+    if npc:try_begin_eruption() then
+        wait(CORRUPTION_WINDUP_SECONDS, function()
+            return npc:eruption_interrupted()
+        end)
+        npc:finish_eruption()
+        wait(CORRUPTION_COOLDOWN_SECONDS, function()
+            return npc:is_dead()
+        end)
+        return true
+    end
+
     npc:attack()
     wait(npc:delay_time(), function()
         -- Interrupt delay if npc dies
@@ -191,6 +204,12 @@ end
 -- Returns early if the NPC dies or acquires a target.
 -- Optional on_tick callback is called each tick (e.g. to scan for targets).
 function behaviors.idle_roam(npc: Npc, on_tick: (() -> ())?)
+    -- OpenFusion MobAI::roamingStep still scans aggro for staticPath mobs,
+    -- but does not replace their authored route with random roaming.
+    if npc:has_authored_path() then
+        yield()
+        return
+    end
     local idle_range = npc:idle_range()
     if idle_range <= 0 then
         yield()
@@ -199,7 +218,9 @@ function behaviors.idle_roam(npc: Npc, on_tick: (() -> ())?)
 
     local roam_radius = idle_range / 2
     local point = random_point_in_range(npc:spawn_position(), roam_radius)
-    npc:move_to(point.x, point.y, point.z)
+    -- Roaming is peaceful locomotion even when the random point is far away.
+    -- An omitted speed lets move_towards choose combat running by distance.
+    npc:move_to(point.x, point.y, point.z, npc:walk_speed())
     while npc:is_moving() do
         if on_tick then on_tick() end
         if npc:is_dead() or npc:target() then return end

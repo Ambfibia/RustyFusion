@@ -92,6 +92,7 @@ fn validate_nano_skills(nano_data: &NanoData, skill_data: &SkillData) -> Result<
 
 #[derive(Debug)]
 struct NPCSpawnData {
+    placement_id: Option<i32>,
     group_id: Option<i32>,
     npc_type: i32,
     pos: Position,
@@ -232,6 +233,7 @@ pub struct NPCStats {
     pub bark_type: Option<usize>,
     /// Rock-paper-scissors special attack (`m_iCorruptionType`), if any.
     pub corruption: Option<NpcCorruption>,
+    pub eruption: Option<NpcCorruption>,
 }
 
 /// An NPC's corruption attack: the skill it casts and its
@@ -334,6 +336,7 @@ struct EggData {
 }
 
 struct DropData {
+    code_items: HashMap<String, Vec<i32>>,
     race_data: HashMap<i32, RaceData>,
     crate_drop_chances: HashMap<i32, CrateDropChance>,
     crate_drop_types: HashMap<i32, CrateDropType>,
@@ -351,6 +354,7 @@ struct PathData {
     skyway_paths: HashMap<i32, Path>,
     slider_path: Path,
     npc_paths: HashMap<i32, Path>,
+    npc_placement_paths: HashMap<i32, Path>,
 }
 
 pub struct TableData {
@@ -362,6 +366,17 @@ pub struct TableData {
     egg_data: EggData,
 }
 impl TableData {
+    pub fn code_rewards(&self, code: &str) -> FFResult<Option<Vec<Item>>> {
+        let Some(refs) = self.drop_data.code_items.get(code) else { return Ok(None); };
+        let mut items = Vec::new();
+        for id in refs {
+            let reference = &self.drop_data.item_refs[id];
+            let item = Item::new((reference.Type as i16).try_into()?, reference.ItemID as i16);
+            item.get_stats()?;
+            items.push(item);
+        }
+        Ok(Some(items))
+    }
     fn new() -> FFResult<Self> {
         Self::load().map_err(|e| {
             FFError::build(Severity::Fatal, format!("Failed loading TableData: {}", e))
@@ -596,11 +611,17 @@ impl TableData {
     pub fn make_all_npcs(&self, entity_map: &mut EntityMap, channel_num: u8) -> Vec<NPC> {
         let mut npcs = Vec::new();
         for dat in &self.npcs {
-            npcs.extend(Self::make_npcs_from_spawn_data(
-                dat,
-                entity_map,
-                channel_num,
-            ));
+            let mut spawned = Self::make_npcs_from_spawn_data(dat, entity_map, channel_num);
+            if let Some(path) = dat.placement_id
+                .and_then(|id| self.path_data.npc_placement_paths.get(&id))
+            {
+                // Only the placed NPC owns an ID route; followers have their own types.
+                if let Some(npc) = spawned.last_mut() {
+                    npc.authored_path = Some(path.clone());
+                    npc.path = Some(path.clone());
+                }
+            }
+            npcs.extend(spawned);
         }
         npcs
     }
@@ -1132,6 +1153,7 @@ fn load_item_data(
                 tradeable: data.m_iTradeAble != 0,
                 max_stack_size: data.m_iStackNumber as u16,
                 required_level: data.m_iMinReqLev.unwrap_or(0) as i16,
+                mentor: data.m_iMentor.map(|mentor| mentor as i16),
                 rarity: data.m_iRarity.map(|v| v as i8),
                 gender: data.m_iReqSex.map(|v| v as i8),
                 single_power: data.m_iPointRat,
@@ -1197,6 +1219,17 @@ fn load_vendor_data(root: &Map<String, Value>) -> Result<HashMap<i32, VendorData
             .entry(key)
             .or_insert_with(|| VendorData::new(key))
             .insert(vendor_data_entry);
+    }
+    // Early-world guide shops have no 0104 VendorTable rows. Their paired
+    // later-world shops carry the same guide-specific catalog; preserve the
+    // early NPC type as the wire vendor ID and in every returned listing.
+    for (early, later) in [(643, 644), (645, 646), (647, 648), (649, 650)] {
+        if !vendor_data.contains_key(&early) {
+            if let Some(source) = vendor_data.get(&later) {
+                let catalog = source.with_vendor_id(early);
+                vendor_data.insert(early, catalog);
+            }
+        }
     }
     Ok(vendor_data)
 }
@@ -1810,6 +1843,9 @@ fn load_mission_data(root: &Map<String, Value>) -> Result<MissionData, String> {
                 0 => None,
                 x => Some(x),
             },
+            escort_follows_player: entry.m_iCSUDEFNPCID > 0
+                && (v.get("m_iCSUDEPNPCFollow").and_then(Value::as_i64).unwrap_or(0) != 0
+                    || (entry.m_iHTaskType == 6 && entry.m_iHTerminatorNPCID > 0)),
             prereq_npc_type: match entry.m_iHNPCID {
                 0 => None,
                 x => Some(x),
@@ -2059,6 +2095,10 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
         m_iCorruptionType: i16,
         #[serde(default)]
         m_iCorruptionTypeProb: i32,
+        #[serde(default)]
+        m_iMegaType: i16,
+        #[serde(default)]
+        m_iMegaTypeProb: i32,
     }
 
     #[derive(Deserialize)]
@@ -2109,6 +2149,9 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
                     prob: entry.m_iCorruptionTypeProb,
                 },
             ),
+            eruption: (entry.m_iMegaType > 0 && entry.m_iMegaTypeProb > 0).then_some(
+                NpcCorruption { skill_id: entry.m_iMegaType, prob: entry.m_iMegaTypeProb },
+            ),
         };
 
         let npc_strings = npc_strings.get(entry.m_iNpcName as usize).ok_or(format!(
@@ -2152,6 +2195,7 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
     fn load_npc_table(
         table: &Map<String, Value>,
         is_group: bool,
+        has_placement_ids: bool,
     ) -> Result<Vec<NPCSpawnData>, String> {
         #[derive(Deserialize)]
         struct FollowerDataEntry {
@@ -2183,6 +2227,7 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
                 .map_err(|e| format!("Malformed NPC data entry: {}", e))?;
             let key: i32 = k.parse().map_err(|e| format!("Malformed NPC key: {}", e))?;
             let npc_data_entry = NPCSpawnData {
+                placement_id: has_placement_ids.then_some(key),
                 group_id: if is_group { Some(key) } else { None },
                 npc_type: npc_data_entry.iNPCType,
                 pos: Position {
@@ -2217,15 +2262,40 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
 
     let npc_root = load_json("NPCs.json")?;
     let npc_table = get_object(&npc_root, NPC_TABLE_KEY)?;
-    npc_data.extend(load_npc_table(npc_table, false)?);
+    npc_data.extend(load_npc_table(npc_table, false, true)?);
 
     let mob_root = load_json("mobs.json")?;
     let mob_table = get_object(&mob_root, MOB_TABLE_KEY)?;
-    npc_data.extend(load_npc_table(mob_table, false)?);
+    npc_data.extend(load_npc_table(mob_table, false, false)?);
     let grouped_mob_table = get_object(&mob_root, MOB_GROUP_TABLE_KEY)?;
-    npc_data.extend(load_npc_table(grouped_mob_table, true)?);
+    npc_data.extend(load_npc_table(grouped_mob_table, true, false)?);
 
     Ok(npc_data)
+}
+
+fn load_code_items(root: &Map<String, Value>, references: &Map<String, Value>) -> Result<HashMap<String, Vec<i32>>, String> {
+    #[derive(Deserialize)]
+    struct CodeItem { Code: String, ItemReferenceIDs: Vec<i32> }
+    let mut result = HashMap::new();
+    // Older data files have no codes; do not invent production rewards.
+    if !root.contains_key("CodeItems") { return Ok(result); }
+    for value in get_table_values(root, "CodeItems")? {
+        let row: CodeItem = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        let code = row.Code.to_ascii_lowercase();
+        if code.is_empty() || code.len() > 256 || code.chars().any(char::is_whitespace) || row.ItemReferenceIDs.is_empty() {
+            return Err(format!("Invalid redeem code definition: {}", code));
+        }
+        for id in &row.ItemReferenceIDs {
+            let reference = references.values().find(|v| v.get("ItemReferenceID").and_then(Value::as_i64) == Some(*id as i64))
+                .ok_or_else(|| format!("Unknown item reference {} for code {}", id, code))?;
+            let item: ItemReference = serde_json::from_value(reference.clone()).map_err(|e| e.to_string())?;
+            if item.ItemID <= 0 || item.ItemID > i16::MAX as i32 || i16::try_from(item.Type).ok().and_then(|ty| ItemType::try_from(ty).ok()).is_none() {
+                return Err(format!("Invalid item reference {} for code {}", id, code));
+            }
+        }
+        if result.insert(code.clone(), row.ItemReferenceIDs).is_some() { return Err(format!("Duplicate redeem code: {}", code)); }
+    }
+    Ok(result)
 }
 
 fn load_drop_data() -> Result<DropData, String> {
@@ -2294,6 +2364,7 @@ fn load_drop_data() -> Result<DropData, String> {
     }
 
     Ok(DropData {
+        code_items: load_code_items(&drop_root, item_references_table)?,
         race_data,
         crate_drop_chances: load_drop_table(crate_drop_chances_table, CRATE_DROP_CHANCES_ID_KEY)?,
         crate_drop_types: load_drop_table(crate_drop_types_table, CRATE_DROP_TYPES_ID_KEY)?,
@@ -2463,19 +2534,21 @@ fn load_path_data() -> Result<PathData, String> {
         Ok(Path::new(points, true))
     }
 
-    fn load_npc_paths(root: &Map<String, Value>) -> Result<HashMap<i32, Path>, String> {
+    fn load_npc_paths(root: &Map<String, Value>) -> Result<(HashMap<i32, Path>, HashMap<i32, Path>), String> {
         const NPC_TABLE_KEY: &str = "npc";
 
         #[derive(Deserialize)]
         struct NPCPathEntry {
             aNPCTypes: Option<Vec<i32>>,
-            aNPCIDs: Option<Vec<i64>>,
+            aNPCIDs: Option<Vec<i32>>,
+            bLoop: Option<bool>,
             iBaseSpeed: i32,
             aPoints: Vec<PathPointEntry>,
         }
 
         let npc_table = get_object(root, NPC_TABLE_KEY)?;
         let mut npc_paths = HashMap::new();
+        let mut placement_paths = HashMap::new();
         for (_, v) in npc_table {
             let npc_path_entry: NPCPathEntry = serde_json::from_value(v.clone())
                 .map_err(|e| format!("Malformed NPC path entry: {} {}", e, v))?;
@@ -2491,15 +2564,23 @@ fn load_path_data() -> Result<PathData, String> {
                     stop_ticks: point.iStopTicks.unwrap(),
                 });
             }
-            let cycle = if points[0] == points[points.len() - 1] {
+            if points.len() < 2 {
+                return Err("NPC path requires at least two points".into());
+            }
+            let closed = points[0] == points[points.len() - 1];
+            let cycle = npc_path_entry.bLoop.unwrap_or(closed);
+            if closed {
                 // cyclic NPC paths in tdata have the starting point
                 // duplicated at the end, but this messes up our math.
                 points.pop();
-                true
-            } else {
-                false
-            };
-            let npc_path = Path::new(points, cycle);
+            }
+            let mut npc_path = Path::new(points, cycle);
+            if cycle {
+                npc_path.start();
+            }
+            for id in npc_path_entry.aNPCIDs.unwrap_or_default() {
+                placement_paths.insert(id, npc_path.clone());
+            }
             for npc_type in &npc_path_entry.aNPCTypes.unwrap_or_default() {
                 // currently, OpenFusion tabledata for paths does not
                 // have a field for initial path state; however,
@@ -2512,14 +2593,16 @@ fn load_path_data() -> Result<PathData, String> {
                 npc_paths.insert(*npc_type, path_cloned);
             }
         }
-        Ok(npc_paths)
+        Ok((npc_paths, placement_paths))
     }
 
     let paths_root = load_json("paths.json")?;
+    let (npc_paths, npc_placement_paths) = load_npc_paths(&paths_root)?;
     Ok(PathData {
         skyway_paths: load_skyway_paths(&paths_root)?,
         slider_path: load_slider_path(&paths_root)?,
-        npc_paths: load_npc_paths(&paths_root)?,
+        npc_paths,
+        npc_placement_paths,
     })
 }
 
@@ -2588,6 +2671,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn redeem_definitions_validate_refs_and_normalize_codes() {
+        let refs = serde_json::json!({"0": {"ItemReferenceID": 0, "ItemID": 119, "Type": 7}});
+        let root = serde_json::json!({"CodeItems": [{"Code": "TEST", "ItemReferenceIDs": [0]}]});
+        let parse = |root: &Value| load_code_items(root.as_object().unwrap(), refs.as_object().unwrap());
+        assert_eq!(parse(&root).unwrap()["test"], [0]);
+        assert!(parse(&serde_json::json!({})).unwrap().is_empty());
+        for bad in [serde_json::json!({"CodeItems": [{"Code": "test", "ItemReferenceIDs": [999]}]}),
+            serde_json::json!({"CodeItems": [{"Code": "test", "ItemReferenceIDs": []}]}),
+            serde_json::json!({"CodeItems": [{"Code": "a b", "ItemReferenceIDs": [0]}]}),
+            serde_json::json!({"CodeItems": [root["CodeItems"][0], root["CodeItems"][0]]})] {
+            assert!(parse(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn early_guide_shops_receive_only_their_paired_stock() {
+        let root = serde_json::json!({
+            "m_pVendorTable": { "m_pItemData": [
+                {"m_iNpcNumber": 644, "m_iSortNumber": 0, "m_iItemType": 0, "m_iitemID": 419, "m_iSellCost": 0},
+                {"m_iNpcNumber": 646, "m_iSortNumber": 0, "m_iItemType": 0, "m_iitemID": 222, "m_iSellCost": 0},
+                {"m_iNpcNumber": 648, "m_iSortNumber": 0, "m_iItemType": 0, "m_iitemID": 346, "m_iSellCost": 0},
+                {"m_iNpcNumber": 650, "m_iSortNumber": 0, "m_iItemType": 0, "m_iitemID": 433, "m_iSellCost": 0}
+            ]}
+        });
+        let vendors = load_vendor_data(root.as_object().unwrap()).unwrap();
+        for (early, later, item) in [(643, 644, 419), (645, 646, 222), (647, 648, 346), (649, 650, 433)] {
+            assert!(vendors[&early].has_item(item, ItemType::Hand));
+            assert!(vendors[&later].has_item(item, ItemType::Hand));
+        }
+        assert!(!vendors.contains_key(&3277));
+    }
+
+    #[test]
+    fn bundled_guide_shop_reply_uses_placed_shop_id_and_twenty_wire_slots() {
+        let tables = tdata_init().unwrap();
+        for (early, later) in [(643, 644), (645, 646), (647, 648), (649, 650)] {
+            let early_reply = tables.get_vendor_data(early).unwrap().as_arr().unwrap();
+            let later_reply = tables.get_vendor_data(later).unwrap().as_arr().unwrap();
+            assert_eq!(early_reply.len(), SIZEOF_VENDOR_TABLE_SLOT as usize);
+            assert!(early_reply.iter().all(|row| row.iVendorID == early));
+            for (early_item, later_item) in early_reply.iter().zip(later_reply.iter()) {
+                assert_eq!(early_item.item.iID, later_item.item.iID);
+                assert_eq!(early_item.item.iType, later_item.item.iType);
+            }
+        }
+    }
+
+    #[test]
     fn spawn_numbers_match_openfusion_integer_conversion() {
         #[derive(Deserialize)]
         struct Spawn {
@@ -2620,6 +2751,34 @@ mod tests {
         let malformed = serde_json::json!({"Eggs": null});
         assert!(get_table_values(malformed.as_object().unwrap(), "Eggs").is_err());
         assert!(get_table_values(malformed.as_object().unwrap(), "EggTypes").is_err());
+    }
+
+    #[test]
+    fn placement_paths_follow_source_ids_across_channels_and_honor_loop_flag() {
+        let tdata = tdata_init().expect("Failed to load tabledata");
+        let mut entities = EntityMap::default();
+        // These routes explicitly loop without repeating the first point at the end.
+        for id in [428, 430] {
+            let route = &tdata.path_data.npc_placement_paths[&id];
+            assert!(route.is_started());
+        }
+        for channel in [1, 2] {
+            let npcs = tdata.make_all_npcs(&mut entities, channel);
+            for dat in tdata.npcs.iter().filter(|dat| dat.placement_id.is_some()) {
+                let Some(route) = tdata.path_data.npc_placement_paths.get(&dat.placement_id.unwrap()) else {
+                    continue;
+                };
+                let npc = npcs.iter().find(|npc| npc.ty == dat.npc_type
+                    && npc.spawn_position == dat.pos
+                    && npc.instance_id.map_num == dat.map_num.unwrap_or(ID_OVERWORLD))
+                    .expect("placed NPC with a route must spawn");
+                let actual = npc.path.as_ref().expect("ID route must be attached at spawn");
+                assert_eq!(actual.get_points(), route.get_points());
+                assert_eq!(actual.is_started(), route.is_started());
+                assert_eq!(npc.authored_path.as_ref().unwrap().get_points(), route.get_points());
+                assert_eq!(npc.instance_id.channel_num, channel);
+            }
+        }
     }
 
     #[test]

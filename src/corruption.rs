@@ -59,7 +59,7 @@ thread_local! {
 
 /// OpenFusion `Rand::rand(2000) * 1000`: table probabilities are out of
 /// 2,000,000, so the usual weight of 100,000 is a 5% chance per attack.
-fn roll() -> i32 {
+pub(crate) fn roll() -> i32 {
     #[cfg(test)]
     if let Some(roll) = FORCED_ROLL.with(|r| r.get()) {
         return roll;

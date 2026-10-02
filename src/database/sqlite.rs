@@ -150,6 +150,9 @@ impl SqliteDatabase {
             .await??;
         }
 
+        // Additive migration also runs for existing databases.
+        conn.interact(|conn| Self::exec(conn, "create_redeemed_codes", &[]))
+            .await??;
         Ok(Self { pool, path })
     }
 
@@ -328,6 +331,28 @@ impl SqliteDatabase {
                 &skyway_bytes.as_slice(),
                 &tip_bytes.as_slice(),
                 &quest_bytes.as_slice(),
+            ],
+        )?;
+
+        // Barber changes live in Player.style; persist them in the same transaction
+        // as the charged Taros and any clothes moved into inventory.
+        let style = player.style.unwrap_or_default();
+        let appearance_flag: Int = i32::from(player.style.is_some());
+        Self::exec_in(
+            tx,
+            "update_appearance",
+            &[
+                &pc_uid,
+                &(style.body as Int),
+                &(style.eye_color as Int),
+                &(style.face_style as Int),
+                &(style.gender as Int),
+                &(style.hair_color as Int),
+                &(style.hair_style as Int),
+                &(style.height as Int),
+                &(style.skin_color as Int),
+                &pc_uid,
+                &appearance_flag,
             ],
         )?;
 
@@ -977,6 +1002,27 @@ impl DbImpl for SqliteDatabase {
             Ok(())
         })
         .await?
+    }
+
+    async fn is_code_redeemed(&self, pc_uid: BigInt, code: &str) -> FFResult<bool> {
+        let conn = self.pool.get().await?;
+        let code = code.to_string();
+        conn.interact(move |conn| Self::query(conn, "is_code_redeemed", &[&pc_uid, &code]).map(|rows| !rows.is_empty())).await?
+    }
+
+    async fn redeem_code(&self, player: &Player, code: &str) -> FFResult<bool> {
+        let conn = self.pool.get().await?;
+        let player = player.clone();
+        let code = code.to_string();
+        conn.interact(move |conn| -> FFResult<bool> {
+            let tx = conn.transaction()?;
+            if Self::exec_in(&tx, "claim_code", &[&player.get_uid(), &code])? == 0 {
+                return Ok(false);
+            }
+            Self::save_player_sync(&tx, &player)?;
+            tx.commit()?;
+            Ok(true)
+        }).await?
     }
 
     async fn save_players(&self, players: &[&Player]) -> FFResult<()> {

@@ -175,6 +175,15 @@ pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) 
                     ),
                 ));
             }
+            if task_def.escort_follows_player {
+                if escort_npc.is_dead() || escort_npc.mission_escort.is_some() {
+                    return Err(FFError::build(Severity::Warning,
+                        format!("Escort NPC {} is dead or already assigned", escort_npc_id)));
+                }
+                state.entity_map.validate_proximity(
+                    &[EntityID::Player(pc_id), EntityID::NPC(escort_npc_id)], RANGE_INTERACT,
+                )?;
+            }
         }
 
         // check for free qitem slots. this is stricter than it needs to be but
@@ -195,23 +204,10 @@ pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) 
         let mut task: Task = task_def.into();
         let mission_def = task.get_mission_def();
 
-        // start escort path (non-destructive if start_task fails)
+        // Store the entity on the task before starting; movement is assigned
+        // only after the journal accepts the task.
         if task_def.obj_escort_npc_type.is_some() {
-            let escort_npc_id = pkt.iEscortNPC_ID;
-            let escort_npc = state.get_npc_mut(pkt.iEscortNPC_ID).unwrap();
-            if let Some(ref mut path) = escort_npc.path {
-                path.start();
-            } else {
-                // Don't override loose follow (for groups)
-                if escort_npc.loose_follow.is_none() {
-                    escort_npc.loose_follow = Some(EntityID::Player(pc_id));
-                }
-                state
-                    .entity_map
-                    .set_tick(EntityID::NPC(escort_npc_id), TickMode::Always)
-                    .unwrap();
-            }
-            task.escort_npc_id = Some(escort_npc_id);
+            task.escort_npc_id = Some(pkt.iEscortNPC_ID);
         }
 
         let player = state.get_player_mut(pc_id).unwrap();
@@ -227,6 +223,21 @@ pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) 
                 ),
             );
         }
+
+        if task_def.obj_escort_npc_type.is_some() {
+            if task_def.escort_follows_player {
+                crate::escort::start(state, pkt.iEscortNPC_ID, pc_id, pkt.iTaskNum);
+            } else {
+                let npc = state.get_npc_mut(pkt.iEscortNPC_ID).unwrap();
+                if let Some(path) = &mut npc.path {
+                    path.start();
+                } else if npc.loose_follow.is_none() {
+                    npc.loose_follow = Some(EntityID::Player(pc_id));
+                }
+                state.entity_map.set_tick(EntityID::NPC(pkt.iEscortNPC_ID), TickMode::Always).unwrap();
+            }
+        }
+        let player = state.get_player_mut(pc_id).unwrap();
 
         // grant qitems
         if !task_def.given_qitems.is_empty() {
@@ -451,7 +462,19 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
         // check escort NPC is alive (and at destination, if pathed)
         if let Some(escort_npc_id) = task.escort_npc_id {
             let escort_npc = state.get_npc(escort_npc_id)?;
-            if task_def.obj_npc_type.is_some()
+            if task_def.escort_follows_player {
+                if !escort_npc.mission_escort.as_ref().is_some_and(|escort|
+                    escort.player_id == pc_id && escort.task_id == pkt.iTaskNum)
+                {
+                    return Err(FFError::build(Severity::Warning, "Escort is no longer assigned".to_string()));
+                }
+                if task_def.obj_npc_type.is_some() {
+                    state.entity_map.validate_proximity(
+                        &[EntityID::Player(pc_id), EntityID::NPC(pkt.iNPC_ID), EntityID::NPC(escort_npc_id)],
+                        500,
+                    )?;
+                }
+            } else if task_def.obj_npc_type.is_some()
                 && escort_npc.path.as_ref().is_some_and(|path| !path.is_done())
             {
                 return Err(FFError::build(
@@ -521,6 +544,7 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
 
         // if escort following, stop it
         if let Some(escort_npc_id) = task.escort_npc_id {
+            crate::escort::release(state, escort_npc_id, false);
             let escort_npc = state.get_npc_mut(escort_npc_id).unwrap();
             escort_npc.loose_follow = None;
         }

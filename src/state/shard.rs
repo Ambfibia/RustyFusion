@@ -62,7 +62,10 @@ impl Default for ShardServerState {
 
         for channel_num in 1..=num_channels {
             for mut npc in tdata_get().make_all_npcs(&mut state.entity_map, channel_num) {
-                if let Some(path) = tdata_get().get_npc_path(npc.ty) {
+                if let Some(path) = npc.authored_path.clone()
+                    .or_else(|| tdata_get().get_npc_path(npc.ty))
+                {
+                    npc.authored_path = Some(path.clone());
                     npc.path = Some(path);
                 }
 

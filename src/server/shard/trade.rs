@@ -19,6 +19,12 @@ pub fn trade_offer(pkt: Packet, clients: &ClientMap, state: &mut ShardServerStat
     (|| {
         let client = clients.get_sender();
         let pc_id = client.get_player_id()?;
+        if pkt.iID_From != pc_id || pkt.iID_To == pc_id {
+            return Err(FFError::build(
+                Severity::Warning,
+                "Invalid trade participants".to_owned(),
+            ));
+        }
         state.entity_map.validate_proximity(
             &[EntityID::Player(pc_id), EntityID::Player(pkt.iID_To)],
             RANGE_INTERACT,
@@ -41,7 +47,9 @@ pub fn trade_offer(pkt: Packet, clients: &ClientMap, state: &mut ShardServerStat
             ));
         }
 
-        let other_client = other_player.get_client().unwrap();
+        let other_client = other_player.get_client().ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade peer disconnected".to_owned())
+        })?;
         let resp = sP_FE2CL_REP_PC_TRADE_OFFER {
             iID_Request: pc_id,
             iID_From: pc_id,
@@ -79,6 +87,29 @@ pub fn trade_offer_accept(
         let pc_id = clients.get_sender().get_player_id()?;
         let pc_id_other = pkt.iID_From;
 
+        if pc_id_other == pc_id || pkt.iID_To != pc_id {
+            return Err(FFError::build(
+                Severity::Warning,
+                "Invalid trade acceptance".to_owned(),
+            ));
+        }
+        state.entity_map.validate_proximity(
+            &[EntityID::Player(pc_id), EntityID::Player(pc_id_other)],
+            RANGE_INTERACT,
+        )?;
+        let player_to = state.get_player(pc_id)?;
+        if player_to.trade_id.is_some() || state.get_player(pc_id_other)?.trade_id.is_some() {
+            return Err(FFError::build(
+                Severity::Warning,
+                "Player already trading".to_owned(),
+            ));
+        }
+        let accepting_client = player_to.get_client().ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade recipient disconnected".to_owned())
+        })?;
+        let other_client = state.get_player(pc_id_other)?.get_client().ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade sender disconnected".to_owned())
+        })?;
         let player_from = state.get_player_mut(pc_id_other)?;
         if player_from.trade_offered_to != Some(pc_id) {
             return Err(FFError::build(
@@ -96,8 +127,8 @@ pub fn trade_offer_accept(
             iID_To: pc_id,
         };
 
-        let other_client = player_from.get_client().unwrap();
         other_client.send_packet(P_FE2CL_REP_PC_TRADE_OFFER_SUCC, &resp);
+        accepting_client.send_packet(P_FE2CL_REP_PC_TRADE_OFFER_SUCC, &resp);
 
         let player_to = state.get_player_mut(pc_id)?;
         player_to.trade_id = Some(trade_id);
@@ -109,13 +140,6 @@ pub fn trade_offer_accept(
         Ok(())
     })()
     .catch_fail(|| {
-        if let Ok(player_from) = state.get_player_mut(pkt.iID_From) {
-            player_from.trade_id = None;
-        }
-        if let Ok(player_to) = state.get_player_mut(pkt.iID_To) {
-            player_to.trade_id = None;
-        }
-
         let resp = sP_FE2CL_REP_PC_TRADE_OFFER_ABORT {
             iID_Request: pkt.iID_Request,
             iID_From: pkt.iID_From,
@@ -156,7 +180,10 @@ pub fn trade_offer_refusal(
         iID_To: pc_id,
     };
 
-    let other_client = state.get_player(resp.iID_From)?.get_client().unwrap();
+    let other_client = state
+        .get_player(resp.iID_From)?
+        .get_client()
+        .ok_or_else(|| FFError::build(Severity::Warning, "Trade peer disconnected".to_owned()))?;
 
     other_client.send_packet(P_FE2CL_REP_PC_TRADE_OFFER_REFUSAL, &resp);
     Ok(())
@@ -168,26 +195,27 @@ pub fn trade_offer_cancel(
     state: &mut ShardServerState,
 ) -> FFResult<()> {
     let client = clients.get_sender();
-    let _pkt: &sP_CL2FE_REQ_PC_TRADE_OFFER_CANCEL = pkt.get()?;
-
+    let pkt: &sP_CL2FE_REQ_PC_TRADE_OFFER_CANCEL = pkt.get()?;
     let pc_id = client.get_player_id()?;
-    let player = state.get_player(pc_id)?;
-    let trade_id = player.trade_id.ok_or(FFError::build(
-        Severity::Warning,
-        format!("Player {} is not trading", player.get_player_id()),
-    ))?;
-
-    let trade = state.ongoing_trades.get(&trade_id).unwrap();
-    let other_pc_id = trade.get_other_id(pc_id);
-
+    let player = state.get_player_mut(pc_id)?;
+    if pkt.iID_From != pc_id || player.trade_offered_to != Some(pkt.iID_To) {
+        return Err(FFError::build(
+            Severity::Warning,
+            "Trade offer expired".to_owned(),
+        ));
+    }
+    player.trade_offered_to = None;
     let resp = sP_FE2CL_REP_PC_TRADE_OFFER_CANCEL {
         iID_Request: pc_id,
-        iID_From: trade.get_id_from(),
-        iID_To: trade.get_id_to(),
+        iID_From: pc_id,
+        iID_To: pkt.iID_To,
     };
-
-    let other_client = state.get_player(other_pc_id)?.get_client().unwrap();
-    other_client.send_packet(P_FE2CL_REP_PC_TRADE_OFFER_CANCEL, &resp);
+    client.send_packet(P_FE2CL_REP_PC_TRADE_OFFER_CANCEL, &resp);
+    if let Ok(peer) = state.get_player(pkt.iID_To) {
+        if let Some(peer) = peer.get_client() {
+            peer.send_packet(P_FE2CL_REP_PC_TRADE_OFFER_CANCEL, &resp);
+        }
+    }
     Ok(())
 }
 
@@ -219,7 +247,10 @@ pub fn trade_cash_register(
             ));
         }
 
-        let trade = state.ongoing_trades.get_mut(&trade_id).unwrap();
+        let trade = state
+            .ongoing_trades
+            .get_mut(&trade_id)
+            .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
         trade.set_taros(pc_id, req_taros)?;
 
         let resp = sP_FE2CL_REP_PC_TRADE_CASH_REGISTER_SUCC {
@@ -229,7 +260,9 @@ pub fn trade_cash_register(
             iCandy: req_taros as i32,
         };
         let other_id = trade.get_other_id(pc_id);
-        let other_client = state.get_player(other_id)?.get_client().unwrap();
+        let other_client = state.get_player(other_id)?.get_client().ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade peer disconnected".to_owned())
+        })?;
         other_client.send_packet(P_FE2CL_REP_PC_TRADE_CASH_REGISTER_SUCC, &resp);
         client.send_packet(P_FE2CL_REP_PC_TRADE_CASH_REGISTER_SUCC, &resp);
         Ok(())
@@ -265,7 +298,9 @@ pub fn trade_item_register(
 
         // client sends an iOpt of 0 for unstackables
         let quantity = if pkt.Item.iOpt > 0 {
-            pkt.Item.iOpt as u16
+            u16::try_from(pkt.Item.iOpt).map_err(|_| {
+                FFError::build(Severity::Warning, "Invalid trade quantity".to_owned())
+            })?
         } else {
             1
         };
@@ -287,11 +322,20 @@ pub fn trade_item_register(
                 format!("Item not tradeable: {:?}", item),
             ));
         }
+        if pkt.Item.iID != item.id || pkt.Item.iType != item.ty as i16 {
+            return Err(FFError::build(
+                Severity::Warning,
+                "Trade item identity mismatch".to_owned(),
+            ));
+        }
 
-        let trade = state.ongoing_trades.get_mut(&trade_id).unwrap();
+        let trade = state
+            .ongoing_trades
+            .get_mut(&trade_id)
+            .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
         let trade_slot_num = pkt.Item.iSlotNum as usize;
-        let quantity_left =
-            item.quantity - trade.add_item(pc_id, trade_slot_num, inven_slot_num, quantity)?;
+        let quantity_left = item.quantity
+            - trade.add_inventory_item(pc_id, trade_slot_num, inven_slot_num, quantity, item)?;
 
         let resp = sP_FE2CL_REP_PC_TRADE_ITEM_REGISTER_SUCC {
             iID_Request: pc_id,
@@ -305,7 +349,9 @@ pub fn trade_item_register(
         };
 
         let other_id = trade.get_other_id(pc_id);
-        let other_client = state.get_player(other_id)?.get_client().unwrap();
+        let other_client = state.get_player(other_id)?.get_client().ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade peer disconnected".to_owned())
+        })?;
         other_client.send_packet(P_FE2CL_REP_PC_TRADE_ITEM_REGISTER_SUCC, &resp);
         client.send_packet(P_FE2CL_REP_PC_TRADE_ITEM_REGISTER_SUCC, &resp);
         Ok(())
@@ -339,7 +385,10 @@ pub fn trade_item_unregister(
             format!("Player {} is not trading", player.get_player_id()),
         ))?;
 
-        let trade = state.ongoing_trades.get_mut(&trade_id).unwrap();
+        let trade = state
+            .ongoing_trades
+            .get_mut(&trade_id)
+            .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
         let from_id = trade.get_id_from();
         let to_id = trade.get_id_to();
         let other_pc_id = trade.get_other_id(pc_id);
@@ -347,13 +396,15 @@ pub fn trade_item_unregister(
         let trade_slot_num = pkt.Item.iSlotNum as usize;
         let (quantity_left, inven_slot_num) = trade.remove_item(pc_id, trade_slot_num)?;
         let item = state
-            .get_player(pc_id)
-            .unwrap()
-            .get_item(ItemLocation::Inven, inven_slot_num)
-            .unwrap()
-            .unwrap();
+            .get_player(pc_id)?
+            .get_item(ItemLocation::Inven, inven_slot_num)?
+            .ok_or_else(|| {
+                FFError::build(Severity::Warning, "Trade item disappeared".to_owned())
+            })?;
 
-        let quantity = item.quantity - quantity_left;
+        let quantity = item.quantity.checked_sub(quantity_left).ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade quantity changed".to_owned())
+        })?;
 
         let resp = sP_FE2CL_REP_PC_TRADE_ITEM_UNREGISTER_SUCC {
             iID_Request: pc_id,
@@ -370,7 +421,9 @@ pub fn trade_item_unregister(
             },
         };
 
-        let other_client = state.get_player(other_pc_id)?.get_client().unwrap();
+        let other_client = state.get_player(other_pc_id)?.get_client().ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade peer disconnected".to_owned())
+        })?;
         other_client.send_packet(P_FE2CL_REP_PC_TRADE_ITEM_UNREGISTER_SUCC, &resp);
         client.send_packet(P_FE2CL_REP_PC_TRADE_ITEM_UNREGISTER_SUCC, &resp);
         Ok(())
@@ -405,10 +458,13 @@ pub fn trade_confirm_cancel(
 
     player.trade_id = None;
 
-    let trade = state.ongoing_trades.remove(&trade_id).unwrap();
+    let trade = state
+        .ongoing_trades
+        .remove(&trade_id)
+        .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
 
     let other_pc_id = trade.get_other_id(pc_id);
-    let other_player = state.get_player_mut(other_pc_id).unwrap();
+    let other_player = state.get_player_mut(other_pc_id)?;
     other_player.trade_id = None;
 
     let resp = sP_FE2CL_REP_PC_TRADE_CONFIRM_CANCEL {
@@ -417,7 +473,9 @@ pub fn trade_confirm_cancel(
         iID_To: trade.get_id_to(),
     };
 
-    let other_client = other_player.get_client().unwrap();
+    let other_client = other_player
+        .get_client()
+        .ok_or_else(|| FFError::build(Severity::Warning, "Trade peer disconnected".to_owned()))?;
     other_client.send_packet(P_FE2CL_REP_PC_TRADE_CONFIRM_CANCEL, &resp);
     Ok(())
 }
@@ -431,7 +489,10 @@ pub async fn trade_confirm(clients: &ClientMap<'_>, state: &mut ShardServerState
         format!("Player {} is not trading", player.get_player_id()),
     ))?;
 
-    let trade = state.ongoing_trades.get_mut(&trade_id).unwrap();
+    let trade = state
+        .ongoing_trades
+        .get_mut(&trade_id)
+        .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
     let pc_id_other = trade.get_other_id(pc_id);
     let both_ready = trade.lock_in(pc_id)?;
 
@@ -442,7 +503,10 @@ pub async fn trade_confirm(clients: &ClientMap<'_>, state: &mut ShardServerState
     };
 
     client.send_packet(P_FE2CL_REP_PC_TRADE_CONFIRM, &resp);
-    let client_other = state.get_player(pc_id_other)?.get_client().unwrap();
+    let client_other = state
+        .get_player(pc_id_other)?
+        .get_client()
+        .ok_or_else(|| FFError::build(Severity::Warning, "Trade peer disconnected".to_owned()))?;
     client_other.send_packet(P_FE2CL_REP_PC_TRADE_CONFIRM, &resp);
 
     if !both_ready {
@@ -451,28 +515,37 @@ pub async fn trade_confirm(clients: &ClientMap<'_>, state: &mut ShardServerState
 
     // carry out trade
 
-    let player = state.get_player_mut(pc_id).unwrap();
+    let player = state.get_player_mut(pc_id)?;
     player.trade_id = None;
     let mut player = player.clone();
 
-    let player_other = state.get_player_mut(pc_id_other).unwrap();
+    let player_other = state.get_player_mut(pc_id_other)?;
     player_other.trade_id = None;
     let mut player_other = player_other.clone();
 
-    let trade = state.ongoing_trades.remove(&trade_id).unwrap();
+    let trade = state
+        .ongoing_trades
+        .remove(&trade_id)
+        .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
     let id_from = trade.get_id_from();
     let id_to = trade.get_id_to();
     if let Ok((items, items_other)) = trade.resolve((&mut player, &mut player_other)) {
         let player_taros = player.get_taros();
         let player_other_taros = player_other.get_taros();
 
-        // save traded state
-        *state.get_player_mut(pc_id).unwrap() = player.clone();
-        *state.get_player_mut(pc_id_other).unwrap() = player_other.clone();
-
-        // update the players in the DB
         let db = db_get();
-        log_if_failed(db.save_players(&[&player, &player_other]).await);
+        if let Err(error) = db.save_players(&[&player, &player_other]).await {
+            let abort = sP_FE2CL_REP_PC_TRADE_CONFIRM_ABORT {
+                iID_Request: pc_id,
+                iID_From: id_from,
+                iID_To: id_to,
+            };
+            client.send_packet(P_FE2CL_REP_PC_TRADE_CONFIRM_ABORT, &abort);
+            client_other.send_packet(P_FE2CL_REP_PC_TRADE_CONFIRM_ABORT, &abort);
+            return Err(error);
+        }
+        *state.get_player_mut(pc_id)? = player.clone();
+        *state.get_player_mut(pc_id_other)? = player_other.clone();
 
         let resp = sP_FE2CL_REP_PC_TRADE_CONFIRM_SUCC {
             iID_Request: pc_id,
@@ -521,7 +594,10 @@ pub fn trade_emotes_chat(
             Severity::Warning,
             format!("Player {} is not trading", player.get_player_id()),
         ))?;
-        let trade = state.ongoing_trades.get(&trade_id).unwrap();
+        let trade = state
+            .ongoing_trades
+            .get(&trade_id)
+            .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
         let id_from = trade.get_id_from();
         let id_to = trade.get_id_to();
 
@@ -535,9 +611,13 @@ pub fn trade_emotes_chat(
             iEmoteCode: pkt.iEmoteCode,
         };
 
-        let client_one = state.get_player(id_from)?.get_client().unwrap();
+        let client_one = state.get_player(id_from)?.get_client().ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade peer disconnected".to_owned())
+        })?;
         client_one.send_packet(P_FE2CL_REP_PC_TRADE_EMOTES_CHAT, &resp);
-        let client_two = state.get_player(id_to)?.get_client().unwrap();
+        let client_two = state.get_player(id_to)?.get_client().ok_or_else(|| {
+            FFError::build(Severity::Warning, "Trade peer disconnected".to_owned())
+        })?;
         client_two.send_packet(P_FE2CL_REP_PC_TRADE_EMOTES_CHAT, &resp);
         Ok(())
     })()
@@ -556,3 +636,6 @@ pub fn trade_emotes_chat(
             .send_packet(P_FE2CL_REP_PC_TRADE_EMOTES_CHAT_FAIL, &resp);
     })
 }
+
+#[cfg(test)]
+mod tests;
