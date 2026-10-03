@@ -124,6 +124,102 @@ fn move_player(state: &mut ShardServerState, pos: Position) {
 }
 
 #[test]
+fn eduardo_goto_trigger_starts_outgoing_escort_before_interaction_range() {
+    let (mut state, clients, mut rx) = fixture();
+    let player = state.get_player_mut(1).unwrap();
+    player.mission_journal.remove_task(5208).unwrap();
+    player.set_level(3).unwrap();
+    player.instance_id.map_num = 11;
+    player.unlock_nano(3).unwrap();
+    player
+        .mission_journal
+        .start_task(tdata_get().get_task_definition(575).unwrap().into(), 3)
+        .unwrap();
+    let instance = player.instance_id;
+    for (id, ty, offset) in [(NPC_ID, 1007, 0), (TARGET_ID, 1114, -40)] {
+        state.entity_map.untrack(EntityID::NPC(id));
+        let npc = NPC::new(
+            id,
+            ty,
+            Position {
+                x: BASE.x + offset,
+                ..BASE
+            },
+            0,
+            instance,
+        )
+        .unwrap();
+        let chunk = npc.get_chunk_coords();
+        let eid = state.entity_map.track(Box::new(npc), TickMode::Never);
+        state.entity_map.update(eid, Some(chunk), false);
+    }
+    let sight = tdata_get().get_npc_stats(1114).unwrap().sight_range;
+    assert_eq!(sight, 1500);
+    move_player(
+        &mut state,
+        Position {
+            x: BASE.x + 1400,
+            ..BASE
+        },
+    );
+    // The real trigger is within its 1500-unit sight radius, but Eduardo is
+    // still outside RANGE_INTERACT (800). END and outgoing START both succeed.
+    end(&mut state, &clients, 575, TARGET_ID).unwrap();
+    // Trigger range remains bounded; an outgoing chain is not permission to
+    // start following an NPC from anywhere in the instance.
+    move_player(
+        &mut state,
+        Position {
+            x: BASE.x + 2000,
+            ..BASE
+        },
+    );
+    assert!(mission::task_start(
+        Packet::new(
+            P_CL2FE_REQ_PC_TASK_START,
+            &sP_CL2FE_REQ_PC_TASK_START {
+                iTaskNum: 576,
+                iNPC_ID: 0,
+                iEscortNPC_ID: NPC_ID,
+            }
+        )
+        .unwrap(),
+        &clients[&1],
+        &mut state,
+    )
+    .is_err());
+    assert!(state.get_npc(NPC_ID).unwrap().mission_escort.is_none());
+    while rx.try_recv().is_ok() {}
+    move_player(
+        &mut state,
+        Position {
+            x: BASE.x + 1400,
+            ..BASE
+        },
+    );
+    begin(&mut state, &clients, 576);
+    assert!(state
+        .get_player(1)
+        .unwrap()
+        .mission_journal
+        .get_current_tasks()
+        .iter()
+        .any(|task| task.get_task_id() == 576 && !task.completed && !task.failed));
+    assert_eq!(
+        state
+            .get_npc(NPC_ID)
+            .unwrap()
+            .mission_escort
+            .as_ref()
+            .unwrap()
+            .task_id,
+        576
+    );
+    assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|msg| matches!(msg, ClientMessage::SendPacket(p) if p.id() == P_FE2CL_REP_PC_TASK_START_FAIL)));
+}
+
+#[test]
 fn escort_group_start_zero_speed_follow_chain_and_delivery_round_trip() {
     let (mut state, clients, mut rx) = fixture();
     let stats = tdata_get().get_npc_stats(2567).unwrap();

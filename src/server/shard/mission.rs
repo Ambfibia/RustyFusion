@@ -180,8 +180,28 @@ pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) 
                     return Err(FFError::build(Severity::Warning,
                         format!("Escort NPC {} is dead or already assigned", escort_npc_id)));
                 }
+                // GotoLocation completes at trigger distance, then the client
+                // immediately starts its outgoing escort. Requiring interaction
+                // distance here strands Eduardo's 575 -> 576 chain.
+                let range = if task_def.prereq_npc_type.is_none()
+                    && player
+                        .mission_journal
+                        .get_current_tasks()
+                        .iter()
+                        .any(|previous| {
+                            let definition = previous.get_task_def();
+                            previous.completed
+                                && definition.task_type == TaskType::GotoLocation
+                                && definition.succ_task_id == Some(pkt.iTaskNum)
+                        })
+                {
+                    RANGE_TRIGGER
+                } else {
+                    RANGE_INTERACT
+                };
                 state.entity_map.validate_proximity(
-                    &[EntityID::Player(pc_id), EntityID::NPC(escort_npc_id)], RANGE_INTERACT,
+                    &[EntityID::Player(pc_id), EntityID::NPC(escort_npc_id)],
+                    range,
                 )?;
             }
         }

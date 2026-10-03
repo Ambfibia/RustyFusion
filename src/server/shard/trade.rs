@@ -259,7 +259,7 @@ pub fn trade_cash_register(
             iID_To: trade.get_id_to(),
             iCandy: req_taros as i32,
         };
-        let other_id = trade.get_other_id(pc_id);
+        let other_id = trade.get_other_id(pc_id)?;
         let other_client = state.get_player(other_id)?.get_client().ok_or_else(|| {
             FFError::build(Severity::Warning, "Trade peer disconnected".to_owned())
         })?;
@@ -348,7 +348,7 @@ pub fn trade_item_register(
             },
         };
 
-        let other_id = trade.get_other_id(pc_id);
+        let other_id = trade.get_other_id(pc_id)?;
         let other_client = state.get_player(other_id)?.get_client().ok_or_else(|| {
             FFError::build(Severity::Warning, "Trade peer disconnected".to_owned())
         })?;
@@ -391,7 +391,7 @@ pub fn trade_item_unregister(
             .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
         let from_id = trade.get_id_from();
         let to_id = trade.get_id_to();
-        let other_pc_id = trade.get_other_id(pc_id);
+        let other_pc_id = trade.get_other_id(pc_id)?;
 
         let trade_slot_num = pkt.Item.iSlotNum as usize;
         let (quantity_left, inven_slot_num) = trade.remove_item(pc_id, trade_slot_num)?;
@@ -463,7 +463,7 @@ pub fn trade_confirm_cancel(
         .remove(&trade_id)
         .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
 
-    let other_pc_id = trade.get_other_id(pc_id);
+    let other_pc_id = trade.get_other_id(pc_id)?;
     let other_player = state.get_player_mut(other_pc_id)?;
     other_player.trade_id = None;
 
@@ -493,7 +493,7 @@ pub async fn trade_confirm(clients: &ClientMap<'_>, state: &mut ShardServerState
         .ongoing_trades
         .get_mut(&trade_id)
         .ok_or_else(|| FFError::build(Severity::Warning, "Trade expired".to_owned()))?;
-    let pc_id_other = trade.get_other_id(pc_id);
+    let pc_id_other = trade.get_other_id(pc_id)?;
     let both_ready = trade.lock_in(pc_id)?;
 
     let resp = sP_FE2CL_REP_PC_TRADE_CONFIRM {

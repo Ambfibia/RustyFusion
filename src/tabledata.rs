@@ -2579,7 +2579,14 @@ fn load_path_data() -> Result<PathData, String> {
                 npc_path.start();
             }
             for id in npc_path_entry.aNPCIDs.unwrap_or_default() {
-                placement_paths.insert(id, npc_path.clone());
+                // paths.json uses the server NPC ID (NPCs.json key + 1).
+                // Keep placement_id in the NPCs.json key space so an ID route
+                // cannot attach to the next, unrelated placed NPC.
+                let placement_id = id
+                    .checked_sub(1)
+                    .filter(|id| *id >= 0)
+                    .ok_or_else(|| format!("Invalid NPC path ID {id}"))?;
+                placement_paths.insert(placement_id, npc_path.clone());
             }
             for npc_type in &npc_path_entry.aNPCTypes.unwrap_or_default() {
                 // currently, OpenFusion tabledata for paths does not
@@ -2758,10 +2765,32 @@ mod tests {
         let tdata = tdata_init().expect("Failed to load tabledata");
         let mut entities = EntityMap::default();
         // These routes explicitly loop without repeating the first point at the end.
-        for id in [428, 430] {
+        for id in [427, 429] {
             let route = &tdata.path_data.npc_placement_paths[&id];
             assert!(route.is_started());
         }
+        // Bug 73: the path IDs are OpenFusion NPC IDs, one above the
+        // NPCs.json placement keys. These adjacent static actors were
+        // incorrectly walking routes owned by the preceding placements.
+        for (owner, static_neighbor) in [
+            (136, 137),   // car route / passengercar_02 (ID 414)
+            (637, 638),   // car route / Guide Changer (ID 2561)
+            (758, 759),   // car route / Monkey Skyway Agent (ID 2695)
+            (942, 943),   // car route / Talkingtree (ID 2900)
+            (987, 988),   // car route / Dexbot Q-63 (ID 2949)
+            (955, 956),   // car route / Fusion Eddy's Secret Lair (ID 2914)
+            (1031, 1032), // car route / Sweet Revenge (ID 40)
+            (1438, 1439), // car route / Numbuh 255 (ID 491)
+        ] {
+            assert!(tdata.path_data.npc_placement_paths.contains_key(&owner));
+            assert!(!tdata
+                .path_data
+                .npc_placement_paths
+                .contains_key(&static_neighbor));
+        }
+        // The separately reported "number 133" is placement 1116 on this
+        // dataset. It has no ID path either before or after normalization.
+        assert!(!tdata.path_data.npc_placement_paths.contains_key(&1116));
         for channel in [1, 2] {
             let npcs = tdata.make_all_npcs(&mut entities, channel);
             for dat in tdata.npcs.iter().filter(|dat| dat.placement_id.is_some()) {

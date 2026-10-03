@@ -2,7 +2,7 @@ use crate::{
     defines::*,
     entity::Player,
     enums::*,
-    error::{panic_log, FFError, FFResult, Severity},
+    error::{FFError, FFResult, Severity},
     item::Item,
     net::packet::*,
 };
@@ -100,16 +100,13 @@ impl TradeContext {
         self.to_pc_id
     }
 
-    pub fn get_other_id(&self, pc_id: i32) -> i32 {
-        if self.from_pc_id != pc_id {
-            return self.from_pc_id;
+    pub fn get_other_id(&self, pc_id: i32) -> FFResult<i32> {
+        if self.from_pc_id == self.to_pc_id {
+            return Err(trade_error("Self trade"));
         }
-
-        if self.to_pc_id != pc_id {
-            return self.to_pc_id;
-        }
-
-        panic_log("Bad trade state");
+        if pc_id == self.from_pc_id { return Ok(self.to_pc_id); }
+        if pc_id == self.to_pc_id { return Ok(self.from_pc_id); }
+        Err(trade_error("Player is not a trade participant"))
     }
 
     fn get_offer_mut(&mut self, pc_id: i32) -> FFResult<&mut TradeOffer> {
@@ -316,6 +313,14 @@ fn trade_error(message: &str) -> FFError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trade_peer_lookup_rejects_stale_identity_and_self_trade_without_panicking() {
+        let trade = TradeContext::new(1, 2);
+        assert_eq!(trade.get_other_id(1).unwrap(), 2);
+        assert_eq!(trade.get_other_id(2).unwrap(), 1);
+        assert!(trade.get_other_id(3).is_err());
+        assert!(TradeContext::new(1, 1).get_other_id(1).is_err());
+    }
     fn players() -> (Player, Player) {
         crate::tabledata::tdata_init().unwrap();
         let mut a = Player::new(1, 0);

@@ -2273,8 +2273,7 @@ impl Entity for Player {
         // cleanup ongoing trade
         if let Some(trade_id) = self.trade_id {
             if let Some(trade) = state.ongoing_trades.remove(&trade_id) {
-            let pc_id_other = trade.get_other_id(pc_id);
-            if let Ok(player_other) = state.get_player_mut(pc_id_other) {
+            if let Ok(player_other) = trade.get_other_id(pc_id).and_then(|id| state.get_player_mut(id)) {
                 if player_other.trade_id == Some(trade_id) { player_other.trade_id = None; }
                 if let Some(client_other) = player_other.get_client() {
                     let pkt_cancel = sP_FE2CL_REP_PC_TRADE_CONFIRM_CANCEL {

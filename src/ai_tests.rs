@@ -168,8 +168,16 @@ fn authored_npc_route_survives_idle_ai_and_reaches_both_watchers() {
     tick(&mut state, npc_id); // duplicated starting waypoint
     tick(&mut state, npc_id);
     assert_eq!(state.get_npc(npc_id).unwrap().get_position().x, BASE.x + 50);
-    assert!(!only(&drain(&mut first), P_FE2CL_NPC_MOVE).is_empty());
-    assert!(!only(&drain(&mut second), P_FE2CL_NPC_MOVE).is_empty());
+    for receiver in [&mut first, &mut second] {
+        let packets = drain(receiver);
+        let moves = only(&packets, P_FE2CL_NPC_MOVE);
+        assert!(!moves.is_empty());
+        for packet in moves {
+            let movement = PacketReader::new(packet).get_struct::<sP_FE2CL_NPC_MOVE>().unwrap();
+            assert_eq!(movement.iMoveStyle, 0, "authored routes walk even above walk speed");
+            assert_eq!(movement.iSpeed, 400, "keep authored path timing");
+        }
+    }
 
     tick(&mut state, npc_id); // arrive and pause
     for _ in 0..8 {
@@ -269,6 +277,80 @@ fn ordinary_mobs_and_fusions_get_the_roaming_mob_script() {
         assert_eq!(ai.as_deref(), Some("mob"), "type {ty}");
         assert!(matches!(tick_mode, TickMode::WhenLoaded));
     }
+}
+
+#[test]
+fn routed_civilian_is_not_a_mob_target() {
+    let mob_id = 2_000_000_940;
+    let civilian_id = 2_000_000_941;
+    let (mut state, _rx) = fixture(mob_id, ROAMING_MOB, 3000);
+    let civilian_pos = Position {
+        x: BASE.x + 100,
+        ..BASE
+    };
+    let mut civilian = NPC::new(civilian_id, 3000, civilian_pos, 0, InstanceID::default()).unwrap();
+    assert_eq!(tdata_get().get_npc_stats(3000).unwrap().ai_type, 0);
+    civilian.path = Some(Path::new_single(
+        Position {
+            x: BASE.x + 200,
+            ..BASE
+        },
+        300,
+    ));
+    let (ai, tick_mode) = make_for_npc(&civilian, false);
+    assert!(
+        ai.is_none(),
+        "a route must not assign combat AI to a civilian"
+    );
+    assert!(matches!(tick_mode, TickMode::Always));
+    assert!(civilian.as_combatant().is_none());
+    civilian.ai = ai;
+    let chunk = civilian.get_chunk_coords();
+    state.entity_map.track(Box::new(civilian), tick_mode);
+    state
+        .entity_map
+        .update(EntityID::NPC(civilian_id), Some(chunk), false);
+
+    for _ in 0..5 {
+        tick(&mut state, mob_id);
+    }
+    assert_eq!(state.get_npc(mob_id).unwrap().target_id, None);
+    assert_eq!(
+        state.get_npc(civilian_id).unwrap().get_hp(),
+        state.get_npc(civilian_id).unwrap().get_max_hp()
+    );
+
+    let player_pos = Position {
+        x: BASE.x + 150,
+        ..BASE
+    };
+    state
+        .get_player_mut(PC_ID)
+        .unwrap()
+        .set_position(player_pos);
+    let chunk = ChunkCoords::from_pos_inst(player_pos, InstanceID::default());
+    state
+        .entity_map
+        .update(EntityID::Player(PC_ID), Some(chunk), false);
+    for _ in 0..5 {
+        tick(&mut state, mob_id);
+    }
+    assert_eq!(
+        state.get_npc(mob_id).unwrap().target_id,
+        Some(EntityID::Player(PC_ID))
+    );
+}
+
+#[test]
+fn combat_ally_and_ai_less_patrol_mob_remain_combatants() {
+    tdata_init().unwrap();
+    let ally = NPC::new(1, 1013, BASE, 0, InstanceID::default()).unwrap();
+    assert!(ally.as_combatant().is_some());
+
+    let mut patrol_mob = NPC::new(2, 2568, BASE, 0, InstanceID::default()).unwrap();
+    assert_eq!(tdata_get().get_npc_stats(2568).unwrap().ai_type, 0);
+    patrol_mob.path = Some(Path::new_single(BASE, 300));
+    assert!(patrol_mob.as_combatant().is_some());
 }
 
 #[test]

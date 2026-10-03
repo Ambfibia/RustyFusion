@@ -209,7 +209,13 @@ impl NPC {
             // broadcast movement
             let npc = state.get_npc(npc_id).unwrap(); // re-borrow
             let stats = tdata_get().get_npc_stats(npc.ty).unwrap();
-            let move_style = if speed > stats.walk_speed {
+            // Authored civilian routes use Walk even when their travel speed
+            // differs from XDT's generic walk speed (e.g. Numbuh 2020: 300/200).
+            // Combat and escort paths keep their independent speed-based style.
+            let authored_walk = npc.authored_path.as_ref().is_some_and(|authored|
+                authored.get_points() == path.get_points())
+                && npc.target_id.is_none() && !npc.retreating && npc.mission_escort.is_none();
+            let move_style = if !authored_walk && speed > stats.walk_speed {
                 MoveStyle::Run
             } else {
                 MoveStyle::Walk
@@ -231,13 +237,16 @@ impl NPC {
     }
 
     fn can_fight(&self) -> bool {
-        // to reduce calculations in downstream code,
-        // we don't consider NPCs with certain AI types combatants.
-        // we check the stats instead of self.ai since the
-        // AI object is taken out during tick.
+        // A route only makes a civilian move; it must not turn an AI-less
+        // friendly NPC into a combatant (or a target for nearby mobs).
+        // Check table stats first because the AI is taken out during tick.
+        let stats = tdata_get().get_npc_stats(self.ty).unwrap();
+        if stats.ai_type == 11 || (stats.ai_type == 0 && stats.team != CombatantTeam::Mob) {
+            return false;
+        }
 
         if self.path.is_some() {
-            // exception: some NPCs have AI type 0, but are still combatants
+            // Some patrolling mobs have AI type 0 but are still combatants.
             return true;
         }
 
@@ -245,9 +254,7 @@ impl NPC {
             return true;
         }
 
-        let stats = tdata_get().get_npc_stats(self.ty).unwrap();
-        stats.ai_type != 0 // no npcs without AI
-        && stats.ai_type != 11 // no cars or animals
+        stats.ai_type != 0
     }
 
     pub fn tick(state: &mut ShardServerState, npc_id: i32) {
