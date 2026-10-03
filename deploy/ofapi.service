@@ -1,0 +1,18 @@
+[Unit]
+Description=SlavicFall account API
+After=network-online.target rustyfusion.service
+Wants=network-online.target
+Requires=rustyfusion.service
+
+[Service]
+Type=simple
+User=user1
+Group=user1
+WorkingDirectory=/opt/ofapi
+ExecStart=/opt/ofapi/target/release/ofapi
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

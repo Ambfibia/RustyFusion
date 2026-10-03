@@ -6,4 +6,5 @@ motd.txt*
 *.mmdb
 *.db*
 scripts/globals.d.luau
+/backups/
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=RustyFusion FFOne game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user1
+Group=user1
+WorkingDirectory=/opt/rustyfusion
+ExecStart=/opt/rustyfusion/target/release/hybrid
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
