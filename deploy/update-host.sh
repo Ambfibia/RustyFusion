@@ -38,6 +38,11 @@ source.close()
 PY
 sudo -n install -m 644 deploy/rustyfusion.service /etc/systemd/system/rustyfusion.service
 sudo -n install -m 644 deploy/ofapi.service /etc/systemd/system/ofapi.service
+sudo -n install -m 644 deploy/api.slavicfall.ru.nginx.conf /etc/nginx/sites-available/api.slavicfall.ru
+sudo -n install -d -o www-data -g www-data /var/www/ofapi-static
+sudo -n install -m 644 deploy/ofapi-static/* /var/www/ofapi-static/
+sudo -n nginx -t
+sudo -n systemctl reload nginx
 sudo -n systemctl daemon-reload
 sudo -n systemctl start rustyfusion ofapi
 trap - EXIT

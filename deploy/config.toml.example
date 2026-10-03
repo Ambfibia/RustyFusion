@@ -1,0 +1,19 @@
+# Copy to /opt/rustyfusion/config.toml on initial installation; keep the live file ignored.
+[general]
+enable_tui = false
+server_key = "REPLACE_WITH_RANDOM_SECRET"
+db_path = "database.db"
+table_data_path = "tabledata/"
+
+[login]
+listen_addr = "0.0.0.0:23000"
+allow_plaintext_passwords = false
+auto_create_accounts = false
+monitor_enabled = true
+monitor_addr = "127.0.0.1:8003"
+
+[shard]
+listen_addr = "0.0.0.0:23001"
+external_addr = "176.123.166.58:23001"
+login_server_addr = "127.0.0.1:23000"
+num_channels = 1
