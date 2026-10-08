@@ -1984,7 +1984,7 @@ impl Player {
     fn tick_regen(&mut self, time: &SystemTime) -> bool {
         const REGEN_INTERVAL: Duration = Duration::from_secs(4);
 
-        if self.in_combat {
+        if self.in_combat || self.has_buff(BuffID::Infection, None) {
             return false;
         }
 

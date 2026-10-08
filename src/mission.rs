@@ -249,6 +249,11 @@ impl MissionJournal {
         Ok(())
     }
 
+    pub fn clear_mission_completed(&mut self,mission_id:i32)->FFResult<()> {
+        self.completed_mission_flags.set((mission_id-1) as usize,false)?;
+        Ok(())
+    }
+
     pub fn set_active_mission_id(&mut self, mission_id: i32) -> FFResult<usize> {
         let mut current_mission_slot = None;
         for idx in 0..6 {
@@ -302,13 +307,19 @@ impl MissionJournal {
     }
 
     pub fn start_task(&mut self, task: Task, player_level: i16) -> FFResult<bool> {
+        self.start_task_with_policy(task,player_level,false)
+    }
+    pub fn start_editor_task(&mut self, task: Task, player_level: i16) -> FFResult<bool> {
+        self.start_task_with_policy(task,player_level,true)
+    }
+    fn start_task_with_policy(&mut self, task:Task,player_level:i16,administrative:bool)->FFResult<bool> {
         let mission_def = task.get_mission_def();
         if self.is_mission_completed(mission_def.mission_id)? {
             return Ok(false);
         }
 
         // Ensure correct nano mission
-        if task.get_task_def().is_growth_nano_mission() {
+        if !administrative && task.get_task_def().is_growth_nano_mission() {
             let expected_mission_id = tdata_get()
                 .get_player_stats(player_level)
                 .expect("Player loads with valid level")

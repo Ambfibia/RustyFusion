@@ -199,6 +199,7 @@ pub fn handle_packet<'a>(
             }
             //
             P_CL2FE_REQ_PC_ATTACK_NPCs => combat::pc_attack_npcs(pkt, &clients, state),
+            P_CL2FE_DOT_DAMAGE_ONOFF => crate::infection::on_off(pkt, &clients, state),
             P_CL2FE_REQ_PC_ATTACK_CHARs => combat::pc_attack_pcs(pkt, &clients, state),
             P_CL2FE_REQ_NANO_SKILL_USE => combat::nano_skill_use(pkt, &clients, state),
             P_CL2FE_REQ_PC_ROCKET_STYLE_READY => {

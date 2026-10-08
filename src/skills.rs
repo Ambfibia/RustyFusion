@@ -171,6 +171,7 @@ impl From<BuffUpdate> for sP_FE2CL_PC_BUFF_UPDATE {
 
 #[derive(Debug)]
 pub enum BuffEffect {
+    Infection { target: EntityID },
     HealEntity {
         target: EntityID,
         amount: i32,
@@ -320,6 +321,7 @@ impl BuffStack {
     /// the client acts on, so they do nothing here.
     fn tick_effects(&mut self, buff_id: BuffID, target: EntityID, effects: &mut Vec<BuffEffect>) {
         let effect = match buff_id {
+            BuffID::Infection => BuffEffect::Infection { target },
             BuffID::BoundingBall => BuffEffect::DrainEntity {
                 target,
                 source: self.get_last_source(),
@@ -476,8 +478,9 @@ impl BuffContainer {
 
     pub fn has_buff(&self, buff_id: BuffID, buff_type: Option<BuffType>) -> bool {
         match buff_type {
-            Some(buff_type) => self.buff_stacks.values().any(|s| s.has_stack(buff_type)),
-            None => self.buff_stacks.contains_key(&buff_id),
+            Some(buff_type) => self.buff_stacks.get(&buff_id)
+                .is_some_and(|stack| stack.has_stack(buff_type)),
+            None => self.buff_stacks.get(&buff_id).is_some_and(|stack| !stack.buffs.is_empty()),
         }
     }
 

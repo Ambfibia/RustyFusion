@@ -15,6 +15,9 @@ use crate::{
 
 pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) -> FFResult<()> {
     let pkt: &sP_CL2FE_REQ_PC_TASK_START = pkt.get()?;
+    start_requested_task(pkt,client,state,false)
+}
+pub(super) fn start_requested_task(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFClient,state:&mut ShardServerState,administrative:bool)->FFResult<()> {
     (|| {
         let pc_id = client.get_player_id()?;
         let player = state.get_player(pc_id)?;
@@ -31,6 +34,7 @@ pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) 
             return Ok(());
         }
 
+        if !administrative {
         // check giver NPC type + proximity
         if let Some(giver_npc_type) = task_def.prereq_npc_type {
             let req_npc_id = pkt.iNPC_ID;
@@ -153,6 +157,7 @@ pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) 
             ));
         }
 
+        }
         // check escort npc
         if let Some(escort_npc_type) = task_def.obj_escort_npc_type {
             let escort_npc_id = pkt.iEscortNPC_ID;
@@ -231,10 +236,12 @@ pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) 
         }
 
         let player = state.get_player_mut(pc_id).unwrap();
-        if player
-            .mission_journal
-            .start_task(task, player.get_level())?
-        {
+        let level=player.get_level();
+        let started=if administrative {player.mission_journal.start_editor_task(task,level)?} else {player.mission_journal.start_task(task,level)?};
+        if !player.mission_journal.get_current_tasks().iter().any(|t|t.get_task_id()==pkt.iTaskNum) {
+            return Err(FFError::build(Severity::Warning,"Mission journal rejected the task".into()));
+        }
+        if started {
             log(
                 Severity::Info,
                 &format!(

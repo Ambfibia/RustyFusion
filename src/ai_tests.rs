@@ -222,6 +222,95 @@ fn every_placed_bundled_npc_route_advances_without_a_watcher() {
     }
 }
 
+#[test]
+fn bug019_bundled_civilians_walk_at_table_speed_after_watcher_reentry() {
+    tdata_init().unwrap();
+    let _ = scripting_init();
+    for (ty, expected_speed) in [(2895, 200), (2596, 100), (2918, 800)] {
+        let mut state = ShardServerState::default();
+        let npc_id = state.entity_map.get_all_ids().find_map(|id| match id {
+            EntityID::NPC(id) if state.get_npc(id).is_ok_and(|npc|
+                npc.ty == ty && npc.authored_path.is_some()) => Some(id),
+            _ => None,
+        }).expect("the reported civilian must own a bundled route");
+        assert!(state.entity_map.get_tickable_ids().any(|id| id == EntityID::NPC(npc_id)));
+        let origin = state.get_npc(npc_id).unwrap().get_position();
+        let authored_speed = state.get_npc(npc_id).unwrap().authored_path.as_ref()
+            .unwrap().get_points()[0].speed;
+        assert!(authored_speed > expected_speed, "fixture must reproduce the old excess speed");
+        let mut rx = add_player(&mut state, 1, origin, false);
+        for reentry in [false, true] {
+            if reentry {
+                let pc = state.get_player_mut(1).unwrap();
+                pc.set_position(BASE);
+                let chunk = pc.get_chunk_coords();
+                state.entity_map.update(EntityID::Player(1), Some(chunk), true);
+                drain(&mut rx);
+                for _ in 0..8 { tick(&mut state, npc_id); }
+                let current = state.get_npc(npc_id).unwrap().get_position();
+                let pc = state.get_player_mut(1).unwrap();
+                pc.set_position(current);
+                let chunk = pc.get_chunk_coords();
+                state.entity_map.update(EntityID::Player(1), Some(chunk), true);
+                let packets = drain(&mut rx);
+                assert!(!only(&packets, P_FE2CL_NPC_ENTER).is_empty());
+            }
+            let before = state.get_npc(npc_id).unwrap().get_position();
+            for _ in 0..8 {
+                let old = state.get_npc(npc_id).unwrap().get_position();
+                tick(&mut state, npc_id);
+                let new = state.get_npc(npc_id).unwrap().get_position();
+                assert!(old.distance_to(&new) <= (expected_speed / 8 + 2) as u32,
+                    "type {ty} moved faster than its walk velocity");
+            }
+            assert_ne!(state.get_npc(npc_id).unwrap().get_position(), before);
+            let packets = drain(&mut rx);
+            let moves = only(&packets, P_FE2CL_NPC_MOVE);
+            assert!(!moves.is_empty(), "type {ty} stopped broadcasting after reentry={reentry}");
+            for packet in moves {
+                let movement = PacketReader::new(packet).get_struct::<sP_FE2CL_NPC_MOVE>().unwrap();
+                assert_eq!({movement.iSpeed}, expected_speed, "type {ty}");
+                assert_eq!({movement.iMoveStyle}, 0, "type {ty} must select Walk");
+            }
+        }
+        assert_eq!(state.get_npc(npc_id).unwrap().authored_path.as_ref()
+            .unwrap().get_points()[0].speed, authored_speed, "keep the authored route intact");
+    }
+}
+
+#[test]
+fn bug019_speed_cap_keeps_slow_legs_and_combat_paths() {
+    tdata_init().unwrap();
+    let mut state = ShardServerState::default();
+    let npc_id = 2_000_000_919;
+    let mut rx = add_player(&mut state, 1, BASE, false);
+    let npc = NPC::new(npc_id, 2895, BASE, 0, InstanceID::default()).unwrap();
+    let chunk = npc.get_chunk_coords();
+    state.entity_map.track(Box::new(npc), TickMode::Always);
+    state.entity_map.update(EntityID::NPC(npc_id), Some(chunk), false);
+    for (authored, targeted, retreating, path_speed, expected_speed, expected_style) in [
+        (true, false, false, 80, 80, 0),
+        (true, false, false, 300, 200, 0),
+        (false, false, false, 300, 300, 1),
+        (true, true, false, 300, 300, 1),
+        (true, false, true, 300, 300, 1),
+    ] {
+        let mut path = Path::new_single(Position { x: BASE.x + 10_000, ..BASE }, path_speed);
+        path.start();
+        let npc = state.get_npc_mut(npc_id).unwrap();
+        npc.authored_path = authored.then(|| path.clone());
+        npc.target_id = targeted.then_some(EntityID::Player(1));
+        npc.retreating = retreating;
+        NPC::tick_movement_along_path(npc_id, &mut path, &mut state);
+        let packets = drain(&mut rx);
+        let moves = only(&packets, P_FE2CL_NPC_MOVE);
+        assert_eq!(moves.len(), 1);
+        let movement = PacketReader::new(moves[0]).get_struct::<sP_FE2CL_NPC_MOVE>().unwrap();
+        assert_eq!({movement.iSpeed}, expected_speed);
+        assert_eq!({movement.iMoveStyle}, expected_style);
+    }
+}
+
 fn move_npc(state: &mut ShardServerState, npc_id: i32, pos: Position) {
     let npc = state.get_npc_mut(npc_id).unwrap();
     npc.set_position(pos);

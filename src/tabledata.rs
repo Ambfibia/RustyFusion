@@ -92,6 +92,7 @@ fn validate_nano_skills(nano_data: &NanoData, skill_data: &SkillData) -> Result<
 
 #[derive(Debug)]
 struct NPCSpawnData {
+    path_id: Option<i32>,
     placement_id: Option<i32>,
     group_id: Option<i32>,
     npc_type: i32,
@@ -351,6 +352,7 @@ struct DropData {
 }
 
 struct PathData {
+    npc_routes: HashMap<i32, Path>,
     skyway_paths: HashMap<i32, Path>,
     slider_path: Path,
     npc_paths: HashMap<i32, Path>,
@@ -384,7 +386,7 @@ impl TableData {
     }
 
     fn load() -> Result<Self, String> {
-        Ok(Self {
+        let data=Self {
             xdt_data: XDTData::load().map_err(|e| format!("Error loading XDT: {}", e))?,
             world_name_data: load_world_name_data()
                 .map_err(|e| format!("Error loading world name data: {}", e))?,
@@ -392,7 +394,13 @@ impl TableData {
             drop_data: load_drop_data().map_err(|e| format!("Error loading drop data: {}", e))?,
             path_data: load_path_data().map_err(|e| format!("Error loading path data: {}", e))?,
             egg_data: load_egg_data().map_err(|e| format!("Error loading egg data: {}", e))?,
-        })
+        };
+        for npc in &data.npcs {
+            if let Some(id)=npc.path_id {
+                if !data.path_data.npc_routes.contains_key(&id){return Err(format!("NPC type {} references missing path ID {id}",npc.npc_type));}
+            }
+        }
+        Ok(data)
     }
 
     pub fn get_item_stats(&self, item_id: i16, item_type: ItemType) -> FFResult<&ItemStats> {
@@ -612,8 +620,9 @@ impl TableData {
         let mut npcs = Vec::new();
         for dat in &self.npcs {
             let mut spawned = Self::make_npcs_from_spawn_data(dat, entity_map, channel_num);
-            if let Some(path) = dat.placement_id
+            if let Some(path) = dat.path_id.and_then(|id| self.path_data.npc_routes.get(&id)).or_else(|| dat.placement_id
                 .and_then(|id| self.path_data.npc_placement_paths.get(&id))
+            )
             {
                 // Only the placed NPC owns an ID route; followers have their own types.
                 if let Some(npc) = spawned.last_mut() {
@@ -636,11 +645,15 @@ impl TableData {
         for dat in &self.npcs {
             // inefficient, but not worth having a separate data structure for
             if dat.group_id == Some(group_id) {
-                npcs.extend(Self::make_npcs_from_spawn_data(
+                let mut spawned=Self::make_npcs_from_spawn_data(
                     dat,
                     entity_map,
                     channel_num,
-                ));
+                );
+                if let Some(path)=dat.path_id.and_then(|id|self.path_data.npc_routes.get(&id)) {
+                    if let Some(npc)=spawned.last_mut(){npc.authored_path=Some(path.clone());npc.path=Some(path.clone());}
+                }
+                npcs.extend(spawned);
                 break;
             }
         }
@@ -2208,6 +2221,7 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
 
         #[derive(Deserialize)]
         struct NPCSpawnDataEntry {
+            iPathID: Option<i32>,
             aFollowers: Option<Vec<FollowerDataEntry>>,
             #[serde(deserialize_with = "deserialize_spawn_integer")]
             iAngle: i32,
@@ -2227,6 +2241,7 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
                 .map_err(|e| format!("Malformed NPC data entry: {}", e))?;
             let key: i32 = k.parse().map_err(|e| format!("Malformed NPC key: {}", e))?;
             let npc_data_entry = NPCSpawnData {
+                path_id: npc_data_entry.iPathID,
                 placement_id: has_placement_ids.then_some(key),
                 group_id: if is_group { Some(key) } else { None },
                 npc_type: npc_data_entry.iNPCType,
@@ -2534,7 +2549,7 @@ fn load_path_data() -> Result<PathData, String> {
         Ok(Path::new(points, true))
     }
 
-    fn load_npc_paths(root: &Map<String, Value>) -> Result<(HashMap<i32, Path>, HashMap<i32, Path>), String> {
+    fn load_npc_paths(root: &Map<String, Value>) -> Result<(HashMap<i32, Path>, HashMap<i32, Path>, HashMap<i32, Path>), String> {
         const NPC_TABLE_KEY: &str = "npc";
 
         #[derive(Deserialize)]
@@ -2549,7 +2564,8 @@ fn load_path_data() -> Result<PathData, String> {
         let npc_table = get_object(root, NPC_TABLE_KEY)?;
         let mut npc_paths = HashMap::new();
         let mut placement_paths = HashMap::new();
-        for (_, v) in npc_table {
+        let mut routes=HashMap::new();
+        for (key, v) in npc_table {
             let npc_path_entry: NPCPathEntry = serde_json::from_value(v.clone())
                 .map_err(|e| format!("Malformed NPC path entry: {} {}", e, v))?;
             let mut points = Vec::new();
@@ -2578,6 +2594,9 @@ fn load_path_data() -> Result<PathData, String> {
             if cycle {
                 npc_path.start();
             }
+            let id:i32=key.parse().map_err(|_|format!("Invalid NPC route ID {key}"))?;
+            if id<0{return Err(format!("Invalid NPC route ID {key}"));}
+            routes.insert(id,npc_path.clone());
             for id in npc_path_entry.aNPCIDs.unwrap_or_default() {
                 // paths.json uses the server NPC ID (NPCs.json key + 1).
                 // Keep placement_id in the NPCs.json key space so an ID route
@@ -2600,12 +2619,13 @@ fn load_path_data() -> Result<PathData, String> {
                 npc_paths.insert(*npc_type, path_cloned);
             }
         }
-        Ok((npc_paths, placement_paths))
+        Ok((npc_paths, placement_paths, routes))
     }
 
     let paths_root = load_json("paths.json")?;
-    let (npc_paths, npc_placement_paths) = load_npc_paths(&paths_root)?;
+    let (npc_paths, npc_placement_paths, npc_routes) = load_npc_paths(&paths_root)?;
     Ok(PathData {
+        npc_routes,
         skyway_paths: load_skyway_paths(&paths_root)?,
         slider_path: load_slider_path(&paths_root)?,
         npc_paths,
@@ -2828,6 +2848,34 @@ mod tests {
     #[test]
     fn test_load() {
         tdata_init().expect("Failed to load tabledata");
+    }
+
+    #[test]
+    fn explicit_editor_path_ids_apply_to_npcs_mobs_and_group_respawns() {
+        tdata_init().unwrap();
+        let mut tdata=TableData::load().unwrap();
+        let npc=tdata.npcs.iter().position(|n|n.placement_id.is_some()).unwrap();
+        let mob=tdata.npcs.iter().position(|n|n.placement_id.is_none()&&n.group_id.is_none()).unwrap();
+        let group=tdata.npcs.iter().position(|n|n.group_id.is_some()).unwrap();
+        let mut route=Path::new(vec![
+            PathPoint{pos:Position{x:100,y:200,z:300},speed:300,stop_ticks:2},
+            PathPoint{pos:Position{x:400,y:500,z:600},speed:300,stop_ticks:0},
+        ],true);
+        route.start();tdata.path_data.npc_routes.insert(123456,route.clone());
+        for i in [npc,mob,group]{tdata.npcs[i].path_id=Some(123456);}
+        let mut entities=EntityMap::default();
+        let spawned=tdata.make_all_npcs(&mut entities,2);
+        for i in [npc,mob,group] {
+            let dat=&tdata.npcs[i];
+            let actor=spawned.iter().find(|n|n.ty==dat.npc_type&&n.spawn_position==dat.pos&&n.instance_id.map_num==dat.map_num.unwrap_or(ID_OVERWORLD)).unwrap();
+            assert_eq!(actor.path.as_ref().unwrap().get_points(),route.get_points());
+            assert_eq!(actor.authored_path.as_ref().unwrap().get_points(),route.get_points());
+            assert!(actor.path.as_ref().unwrap().is_started());
+        }
+        let respawned=tdata.make_group_npcs(&mut entities,2,tdata.npcs[group].group_id.unwrap());
+        let leader=respawned.last().unwrap();
+        assert_eq!(leader.authored_path.as_ref().unwrap().get_points(),route.get_points());
+        assert_eq!(leader.path.as_ref().unwrap().get_points(),route.get_points());
     }
 
     fn nano_root(nanos: Value, tunes: Value) -> Map<String, Value> {

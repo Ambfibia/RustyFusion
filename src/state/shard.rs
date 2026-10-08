@@ -355,6 +355,10 @@ impl ShardServerState {
         let buff_effects = std::mem::take(&mut self.pending_buff_effects);
         for buff_effect in buff_effects {
             match buff_effect {
+                BuffEffect::Infection { target: EntityID::Player(pc_id) } => {
+                    log_if_failed(crate::infection::tick(pc_id, self));
+                }
+                BuffEffect::Infection { .. } => {}
                 BuffEffect::HealEntity { target, amount } => {
                     if let Some(combatant) = log_if_failed(self.get_combatant_mut(target)) {
                         combatant.heal(amount);

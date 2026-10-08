@@ -23,6 +23,32 @@ const PLAYER_POS: Position = Position {
     z: 0,
 };
 
+#[test]
+fn quest_commands_start_a_mission_and_clear_only_its_completed_flag() {
+    let mut f=fixture(50,1);
+    let id=1;
+    f.state.get_player_mut(1).unwrap().mission_journal.set_mission_completed(id).unwrap();
+    f.state.get_player_mut(1).unwrap().mission_journal.set_mission_completed(2).unwrap();
+    f.chat("/deletequest 1");
+    let journal=&f.state.get_player(1).unwrap().mission_journal;
+    assert!(!journal.is_mission_completed(1).unwrap());assert!(journal.is_mission_completed(2).unwrap());
+    assert_eq!(system_messages(&drain(&mut f.rx)),["Quest 1 removed from completed missions."]);
+    f.chat("/startquest 1");
+    let out=drain(&mut f.rx);
+    assert!(out.iter().any(|p|p.id()==P_FE2CL_REP_PC_TASK_START_SUCC),"{:?}",system_messages(&out));
+    assert!(f.state.get_player(1).unwrap().mission_journal.get_current_tasks().iter().any(|t|t.get_mission_def().mission_id==1));
+    f.chat("/startquest 1");assert_eq!(system_messages(&drain(&mut f.rx)),["Quest 1 is already active."]);
+}
+
+#[test]
+fn quest_commands_reject_access_invalid_ids_and_extra_arguments() {
+    let mut f=fixture(51,1);f.chat("/startquest 1");assert_eq!(system_messages(&drain(&mut f.rx)),["You don't have access to that command!"]);
+    assert!(f.state.get_player(1).unwrap().mission_journal.get_current_tasks().is_empty());
+    let mut f=fixture(50,1);
+    for command in ["/startquest 0","/startquest 1 extra","/deletequest -1"] {f.chat(command);assert!(system_messages(&drain(&mut f.rx))[0].starts_with("Usage:"));}
+    f.chat("/startquest 999999");assert_eq!(system_messages(&drain(&mut f.rx)),["Unknown mission ID: 999999"]);
+}
+
 fn place(state: &mut ShardServerState, entity: Box<dyn Entity>) {
     let id = entity.get_id();
     let coords = ChunkCoords::from_pos_inst(entity.get_position(), InstanceID::default());

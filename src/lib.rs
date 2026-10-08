@@ -61,6 +61,7 @@ pub mod ai;
 pub mod chunk;
 pub mod corruption;
 pub mod eruption;
+pub mod infection;
 pub mod email;
 pub mod entity;
 pub mod item;

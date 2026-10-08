@@ -19,6 +19,8 @@ const CUSTOM_COMMAND_PREFIXES: [char; 2] = [CUSTOM_COMMAND_PREFIX, '!'];
 
 #[path = "chat_redeem.rs"]
 mod redeem;
+#[path="chat_quest_commands.rs"]
+mod quests;
 
 pub async fn send_freechat_message(
     pkt: Packet,
@@ -546,7 +548,7 @@ mod commands {
 
     fn init_commands() -> HashMap<&'static str, Command> {
         #[rustfmt::skip]
-        let commands: [(&'static str, &'static str, CommandHandler); 19] = [
+        let commands: [(&'static str, &'static str, CommandHandler); 21] = [
             ("about", "Show information about the server", cmd_about),
             ("level", "Change your character's level", cmd_level),
             ("levelx", "Change your character's level", cmd_level), // for Academy
@@ -565,6 +567,8 @@ mod commands {
             ("registerall", "Register all transportation locations", cmd_registerall),
             ("unregisterall", "Unregister all transportation locations", cmd_unregisterall),
             ("help", "Show this help message", cmd_help),
+            ("startquest", "Start a mission by its mission ID", quests::start),
+            ("deletequest", "Remove a mission from completed missions", quests::delete),
             ("redeem", "Redeem a code item", redeem::cmd_redeem),
         ];
 

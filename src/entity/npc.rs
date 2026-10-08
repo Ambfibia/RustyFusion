@@ -188,7 +188,20 @@ impl NPC {
     }
 
     pub fn tick_movement_along_path(npc_id: i32, path: &mut Path, state: &mut ShardServerState) {
+        let npc = state.get_npc(npc_id).unwrap();
+        let stats = tdata_get().get_npc_stats(npc.ty).unwrap();
+        let authored_walk = npc.authored_path.as_ref().is_some_and(|authored|
+            authored.get_points() == path.get_points())
+            && npc.target_id.is_none() && !npc.retreating && npc.mission_escort.is_none();
         let mut speed = path.get_speed();
+        // Civilian route timing must agree with the table's walking velocity.
+        // Selecting Walk alone still made ghostduck travel at 300 instead of
+        // 100, Numbuh 2020 at 300 instead of 200, and traffic at 900 instead
+        // of 800. Keep slower authored legs and routes without a walk speed.
+        // Combat patrols and escort paths retain their authored velocities.
+        if authored_walk && !npc.can_fight() && stats.walk_speed > 0 {
+            speed = speed.min(stats.walk_speed);
+        }
         if state.get_npc(npc_id).unwrap().has_buff(BuffID::DnMoveSpeed, None) {
             speed /= 2;
         }
@@ -208,13 +221,6 @@ impl NPC {
 
             // broadcast movement
             let npc = state.get_npc(npc_id).unwrap(); // re-borrow
-            let stats = tdata_get().get_npc_stats(npc.ty).unwrap();
-            // Authored civilian routes use Walk even when their travel speed
-            // differs from XDT's generic walk speed (e.g. Numbuh 2020: 300/200).
-            // Combat and escort paths keep their independent speed-based style.
-            let authored_walk = npc.authored_path.as_ref().is_some_and(|authored|
-                authored.get_points() == path.get_points())
-                && npc.target_id.is_none() && !npc.retreating && npc.mission_escort.is_none();
             let move_style = if !authored_walk && speed > stats.walk_speed {
                 MoveStyle::Run
             } else {
