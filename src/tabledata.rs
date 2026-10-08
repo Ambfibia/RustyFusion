@@ -2678,6 +2678,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bundled_tabledata_loads_academy_soulo_shell() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tabledata/xdt.json");
+        let root: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let npcs = load_npc_data(root.as_object().unwrap()).unwrap();
+        let shell = &npcs[&3622];
+        assert_eq!(shell.name, "Soulo Shell");
+        assert_eq!(shell.stats.level, 1);
+        assert_eq!(shell.stats.max_hp, 100);
+        assert_eq!(shell.stats.radius, 60);
+        assert_eq!(shell.stats.height, 80);
+        assert_eq!(shell.stats.power, -260);
+        assert_eq!(shell.stats.defense, 100);
+    }
+
+    #[test]
     fn redeem_definitions_validate_refs_and_normalize_codes() {
         let refs = serde_json::json!({"0": {"ItemReferenceID": 0, "ItemID": 119, "Type": 7}});
         let root = serde_json::json!({"CodeItems": [{"Code": "TEST", "ItemReferenceIDs": [0]}]});
