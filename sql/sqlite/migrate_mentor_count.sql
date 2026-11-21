@@ -1,0 +1,3 @@
+ALTER TABLE Players ADD COLUMN MentorCount INTEGER DEFAULT 0 NOT NULL
+    CHECK (MentorCount BETWEEN 0 AND 32767);
+UPDATE Players SET MentorCount = 1 WHERE Mentor <> 5;

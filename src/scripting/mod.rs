@@ -89,6 +89,19 @@ impl FromLua for Position {
 
 static SCRIPTING: OnceLock<Mutex<ScriptingEngine>> = OnceLock::new();
 
+// A script may retain entity IDs across yields. The shard borrow belongs only to the
+// synchronous resume that is currently running on this VM.
+const ACTIVE_SHARD: &str = "RustyFusion.ActiveShard";
+
+fn with_active_shard<T>(
+    lua: &Lua,
+    f: impl FnOnce(&mut ShardServerState) -> LuaResult<T>,
+) -> LuaResult<T> {
+    let shard: Option<LuaAnyUserData> = lua.named_registry_value(ACTIVE_SHARD)?;
+    let shard = shard.ok_or_else(|| LuaError::runtime("no active shard for this script"))?;
+    shard.borrow_mut_scoped(f)?
+}
+
 pub fn scripting_init() -> FFResult<()> {
     let engine = ScriptingEngine::new()?;
     SCRIPTING.set(Mutex::new(engine)).map_err(|_| {
@@ -433,8 +446,15 @@ impl ScriptingEngine {
             return;
         }
 
-        let handle = NpcScriptContext::new(npc_id, state);
-        match co.resume::<LuaValue>(handle) {
+        let result = self.vm.scope(|scope| {
+            let shard = scope.create_any_userdata_ref_mut(state)?;
+            self.vm.set_named_registry_value(ACTIVE_SHARD, shard)?;
+            scope.add_destructor(|| {
+                let _ = self.vm.unset_named_registry_value(ACTIVE_SHARD);
+            });
+            co.resume::<LuaValue>(NpcScriptContext::new(npc_id))
+        });
+        match result {
             Ok(value) => {
                 let co_state = self.coroutines.get_mut(&npc_id).unwrap();
                 let wait_seconds = match &value {
@@ -531,5 +551,112 @@ mod tests {
     fn test_load() {
         // AI tests may already have set the global engine; load a separate one
         ScriptingEngine::new().expect("Failed to load scripting engine");
+    }
+
+    #[test]
+    fn retained_handles_follow_the_current_shard_after_a_yield() {
+        use crate::chunk::TickMode;
+        use crate::entity::{Entity, EntityID, Player};
+
+        crate::tabledata::tdata_init().unwrap();
+        let mut shard = ShardServerState {
+            shard_id: None,
+            login_server_conn_id: None,
+            login_data: Default::default(),
+            entity_map: Default::default(),
+            buyback_lists: Default::default(),
+            ongoing_trades: Default::default(),
+            groups: Default::default(),
+            player_uid_to_id: Default::default(),
+            pending_entering_uids: Default::default(),
+            pending_buff_effects: Default::default(),
+            ongoing_races: Default::default(),
+        };
+        let mut actor = NPC::new(1, 59, Position::default(), 0, Default::default()).unwrap();
+        actor.ai = Some("retained".into());
+        actor.target_id = Some(EntityID::Player(2));
+        let mut target = Player::new(2, 0);
+        target.set_player_id(2);
+        target.set_position(Position::default());
+        shard.entity_map.track(Box::new(actor), TickMode::Never);
+        shard.entity_map.track(Box::new(target), TickMode::Never);
+
+        let vm = Lua::new();
+        let script: LuaFunction = vm.load(r#"
+            return function(npc)
+                savedNpc = npc
+                savedTarget = npc:target()
+                assert(savedTarget:position().x == 0)
+                local resumedNpc = coroutine.yield()
+                assert(resumedNpc == savedNpc and savedTarget == npc:target())
+                assert(npc:distance_to_entity(savedTarget) == 120)
+                npc:set_spawn_position(savedTarget:position().x, 0, 0)
+                npc:clear_target()
+                npc:set_target(savedTarget)
+                completed = true
+                error("script finished with a handled error")
+            end
+        "#).eval().unwrap();
+        let key = vm.create_registry_value(script).unwrap();
+        let mut engine = ScriptingEngine {
+            vm,
+            scripts: HashMap::from([("retained".into(), key)]),
+            coroutines: HashMap::new(),
+        };
+
+        // Both slots live throughout the test; the same shard changes address between ticks.
+        let mut first = Box::new(Some(shard));
+        let mut second = Box::new(None);
+        engine.tick_npc(1, first.as_mut().as_mut().unwrap());
+        let assert_inactive = |vm: &Lua| {
+            assert!(matches!(vm.named_registry_value::<LuaValue>(ACTIVE_SHARD).unwrap(), LuaValue::Nil));
+            vm.load(r#"
+                local ok, err = pcall(function() savedNpc:spawn_position() end)
+                assert(not ok and string.find(tostring(err), "no active shard"))
+                ok, err = pcall(function() savedTarget:position() end)
+                assert(not ok and string.find(tostring(err), "no active shard"))
+            "#).exec().unwrap();
+        };
+        assert_inactive(&engine.vm);
+        std::mem::swap(&mut *first, &mut *second);
+        let moved = second.as_mut().as_mut().unwrap();
+        moved.get_player_mut(2).unwrap().set_position(Position { x: 120, y: 0, z: 0 });
+        engine.tick_npc(1, moved);
+        assert!(engine.vm.globals().get::<bool>("completed").unwrap());
+        let actor = moved.get_npc(1).unwrap();
+        assert_eq!(actor.spawn_position.x, 120);
+        assert_eq!(actor.target_id, Some(EntityID::Player(2)));
+        assert_inactive(&engine.vm);
+    }
+
+    #[test]
+    fn departed_target_retreats_without_dereferencing_stale_entity() {
+        let lua = Lua::new();
+        let behaviors: LuaTable = lua.load(include_str!("../../scripts/lib/behaviors.luau")).eval().unwrap();
+        lua.globals().set("behaviors", behaviors).unwrap();
+        lua.load(r#"
+            local cleared, retreating, moved, reset = false, false, false, false
+            local stale = {
+                exists = function() return false end,
+                is_dead = function() error("dereferenced departed player") end,
+                position = function() error("read departed player position") end,
+            }
+            local npc = {
+                target = function() return stale end,
+                combat_origin = function() return { x=12, y=34, z=56 } end,
+                combat_range = function() return 4000 end,
+                clear_target = function() cleared = true end,
+                set_retreating = function(_, value) retreating = value end,
+                run_speed = function() return 300 end,
+                move_to = function(_, x, y, z, speed)
+                    assert(x==12 and y==34 and z==56 and speed==600)
+                    moved = true
+                end,
+                is_moving = function() return false end,
+                return_home = function() reset = true end,
+            }
+            assert(behaviors.check_retreat(npc))
+            assert(cleared and retreating and moved and reset)
+        "#).exec().unwrap();
     }
 }

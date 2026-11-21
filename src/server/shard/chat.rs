@@ -17,6 +17,11 @@ use crate::{
 const CUSTOM_COMMAND_PREFIX: char = '/';
 const CUSTOM_COMMAND_PREFIXES: [char; 2] = [CUSTOM_COMMAND_PREFIX, '!'];
 
+#[cfg(test)]
+pub(super) fn registered_command_help_for_test() -> Vec<String> {
+    commands::registered_help_for_test()
+}
+
 #[path = "chat_redeem.rs"]
 mod redeem;
 #[path="chat_quest_commands.rs"]
@@ -520,6 +525,8 @@ mod helpers {
     }
 }
 
+#[path = "chat_user_view.rs"]
+mod user_view;
 mod commands {
     use std::{collections::HashMap, future::Future, pin::Pin, sync::OnceLock, time::SystemTime};
 
@@ -548,7 +555,7 @@ mod commands {
 
     fn init_commands() -> HashMap<&'static str, Command> {
         #[rustfmt::skip]
-        let commands: [(&'static str, &'static str, CommandHandler); 21] = [
+        let commands: [(&'static str, &'static str, CommandHandler); 22] = [
             ("about", "Show information about the server", cmd_about),
             ("level", "Change your character's level", cmd_level),
             ("levelx", "Change your character's level", cmd_level), // for Academy
@@ -564,6 +571,7 @@ mod commands {
             ("perms", "View or change a player's permissions level", cmd_perms),
             ("ping", "View your current ping to the server", cmd_ping),
             ("refresh", "Reinsert the player into the current chunk", cmd_refresh),
+            ("user", "Toggle ordinary player view, respecting hidden NPCs", user_view::command),
             ("registerall", "Register all transportation locations", cmd_registerall),
             ("unregisterall", "Unregister all transportation locations", cmd_unregisterall),
             ("help", "Show this help message", cmd_help),
@@ -584,6 +592,15 @@ mod commands {
                 )
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn registered_help_for_test() -> Vec<String> {
+        let mut entries: Vec<_> = init_commands().into_iter()
+            .map(|(name, command)| format!("{}{}: {}", CUSTOM_COMMAND_PREFIX, name, command.description))
+            .collect();
+        entries.sort_unstable();
+        entries
     }
 
     fn parse_pc_id(token: &str) -> Result<Option<i32>, ()> {

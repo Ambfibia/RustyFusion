@@ -100,7 +100,13 @@ impl<S: Send + 'static> FFConnection<S> {
         mut rx: UnboundedReceiver<ClientMessage>,
         tx: UnboundedSender<ServerMessage>,
     ) {
-        let mut lc_interval = self.live_check.map(|(dur, _)| tokio::time::interval(dur));
+        // interval() ticks immediately. An outbound LoginServer connection is
+        // typed before authentication, so that first ping can cross the key
+        // transition and be decoded with the wrong key. Start after one normal
+        // interval, preserving the configured response deadline and cadence.
+        let mut lc_interval = self.live_check.map(|(dur, _)| {
+            tokio::time::interval_at(tokio::time::Instant::now() + dur, dur)
+        });
 
         loop {
             enum Event {
@@ -374,5 +380,47 @@ impl<S: Send + 'static> FFConnection<S> {
         let bytes = pkt.read_bytes();
         self.out_buf.push_bytes(bytes)?;
         self.flush().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{packet::sP_FE2LS_REQ_LIVE_CHECK, ClientMetadata};
+    use tokio::{net::TcpListener, sync::mpsc};
+
+    #[tokio::test]
+    async fn first_service_heartbeat_waits_for_the_interval_and_uses_the_negotiated_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (socket, address) = listener.accept().await.unwrap();
+        let (commands, incoming) = mpsc::unbounded_channel();
+        // Outbound services have this type before their handshake completes.
+        let client = FFClient::new(commands.clone(), ClientMetadata::new(address, Some(ClientType::LoginServer)));
+        let clients = Arc::new(RwLock::new(HashMap::from([(1, client.clone())])));
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let mut connection = FFConnection::new(1, socket, client,
+            |_, _, _, _| Box::pin(async { Ok(()) }),
+            Some((Duration::from_millis(250), |client| client.send_packet(
+                PacketID::P_FE2LS_REQ_LIVE_CHECK, &sP_FE2LS_REQ_LIVE_CHECK { iTempValue: 0 }))),
+            clients, Arc::new(Mutex::new(())));
+        let task = tokio::spawn(async move { connection.run(incoming, events).await; });
+        tokio::task::yield_now().await;
+        assert!(tokio::time::timeout(Duration::from_millis(50), peer.read_u32_le()).await.is_err(),
+            "A service heartbeat escaped before the authentication/key transition could complete");
+
+        let negotiated_key = 0x1234_5678_90ab_cdef;
+        commands.send(ClientMessage::UpdateEncryption {
+            new_e_key: Some(negotiated_key), new_fe_key: None, new_mode: None,
+        }).unwrap();
+        let size = tokio::time::timeout(Duration::from_secs(2), peer.read_u32_le()).await.unwrap().unwrap() as usize;
+        let mut payload = vec![0; size];
+        peer.read_exact(&mut payload).await.unwrap();
+        crypto::decrypt_payload(&mut payload, negotiated_key);
+        let wire_id = u32::from_le_bytes(payload[..PACKET_ID_SIZE].try_into().unwrap());
+        assert_eq!(unwrap_packet_id(wire_id), PacketID::P_FE2LS_REQ_LIVE_CHECK as u32);
+        commands.send(ClientMessage::Shutdown).unwrap();
+        task.await.unwrap();
+        assert!(matches!(event_rx.recv().await, Some(ServerMessage::ClientDisconnected(1))));
     }
 }

@@ -46,7 +46,9 @@ pub trait Entity: Send + Display {
     fn set_position(&mut self, pos: Position);
     fn set_rotation(&mut self, rot: i32);
     fn send_enter(&self, client: &FFClient);
+    fn send_enter_for(&self,client:&FFClient,_observer:&dyn Entity){self.send_enter(client);}
     fn send_exit(&self, client: &FFClient);
+    fn visible_to(&self, _observer: &dyn Entity) -> bool { true }
 
     fn cleanup(self: Box<Self>, state: &mut ShardServerState);
 

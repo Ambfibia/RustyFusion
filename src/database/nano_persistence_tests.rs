@@ -69,9 +69,9 @@ async fn retuned_skill_survives_reload_when_tune_differs_from_skill() {
         .unwrap();
     let mut player = Player::new(304, 0);
     db.init_player(account.id, &player).await.unwrap();
-    // Nano 38 tune 201 grants skill 13; the skill, not the tune, is stored
-    player.unlock_nano(38).unwrap();
-    player.tune_nano(38, Some(13)).unwrap();
+    // Johnny Bravo tune 201 grants skill 13; the skill, not the tune, is stored
+    player.unlock_nano(42).unwrap();
+    player.tune_nano(42, Some(13)).unwrap();
     db.save_player(&player).await.unwrap();
     drop(db);
 
@@ -81,7 +81,7 @@ async fn retuned_skill_survives_reload_when_tune_differs_from_skill() {
         .await
         .unwrap()
         .unwrap();
-    let nano = loaded.get_nano(38).unwrap();
+    let nano = loaded.get_nano(42).unwrap();
     assert_eq!(nano.selected_skill, Some(13));
     assert!(nano.get_skill().is_some(), "stored skill resolves for use");
 }

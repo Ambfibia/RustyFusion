@@ -8,6 +8,12 @@ include!(concat!(env!("OUT_DIR"), "/config_generated.rs"));
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 static CONFIG_DEFAULT: OnceLock<Config> = OnceLock::new();
+#[cfg(test)]
+pub(crate) fn use_isolated_test_tables(root:&std::path::Path){
+    let path=serde_json::to_string(&root.to_string_lossy()).unwrap();
+    let config=Config::from_str(&format!("[general]\ntable_data_path = {path}\n")).unwrap();
+    assert!(CONFIG.set(config).is_ok(),"isolated table fixture needs a fresh test process");
+}
 
 fn auto_quote_toml_value(value: &str) -> String {
     // Already a quoted TOML string

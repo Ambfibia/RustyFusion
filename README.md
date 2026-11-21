@@ -143,7 +143,7 @@ A stock build 104 client will not get past the handshake.
 Items that are ***highlighted*** are in planning or WIP. Items marked with `+` are either new and not present in OpenFusion or enhanced from OpenFusion (bug fixes not included). Some items have dependencies in other categories, so the list won't get completed in order.
 
 ## Developing
-The development commands follow FFOneClient. The pinned toolchain is Rust 1.98.1;
+The pinned toolchain is Rust 1.98.1;
 development builds use optimization level 1 with line-table debug information,
 dependencies use level 3, and release builds use thin LTO with one codegen unit.
 Windows MSVC builds use `rust-lld.exe`.
@@ -169,16 +169,16 @@ cargo dev -- --general.enable_tui=false
 cargo release --no-default-features --features postgres
 ```
 
-`cargo release` builds without launching, just like FFOneClient. Separate `login`
+`cargo release` builds without launching. Separate `login`
 and `shard` binaries remain available through the ordinary Cargo commands below.
 See [the local OpenFusion migration audit](docs/openfusion-migration-audit.md)
 for verified compatibility and the remaining migration blockers.
 
 SQLite is the default database backend. Configure its file path in `config.toml`. If explicitly building with PostgreSQL, configure its connection parameters and create the database first; the optional development `docker-compose.yml` can provision that service.
 
-Cargo (Rust's package manager) makes working with Rust projects extremely easy to setup. Just clone the repo (recursively, to grab critical tabledata), build, and run:
+Clone recursively to retrieve the pinned server tables, then build and run:
 ```
-git clone --recurse-submodules https://github.com/gsemaj/RustyFusion
+git clone --recurse-submodules https://github.com/Ambfibia/RustyFusion
 cd RustyFusion
 cargo build
 cargo run --bin login  # for login server

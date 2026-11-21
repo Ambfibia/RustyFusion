@@ -52,7 +52,7 @@ function behaviors.check_retreat(npc: Npc)
     local combat_range = npc:combat_range()
     local should_retreat = false
 
-    if target:is_dead() then
+    if not target:exists() or target:is_dead() then
         -- Target dead or gone
         should_retreat = true
     else
@@ -162,7 +162,9 @@ function behaviors.try_attack(npc: Npc)
         return true
     end
 
-    npc:attack()
+    if not npc:try_active_skill() then
+        npc:attack()
+    end
     wait(npc:delay_time(), function()
         -- Interrupt delay if npc dies
         return npc:is_dead()

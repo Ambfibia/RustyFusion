@@ -1,13 +1,16 @@
 //! Mission-owned delivery escorts, independent of social group membership and
 //! the NPC table's idle AI. Defence missions continue to use authored routes.
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::{Duration, Instant}};
 
 use crate::{
     ai::make_for_npc,
     chunk::TickMode,
     defines::SHARD_TICKS_PER_SECOND,
-    entity::{Combatant, Entity, EntityID, NPC},
+    entity::{Combatant, Entity, EntityID, NPC, Player},
+    enums::CombatantTeam,
     path::Path,
+    skills::{do_basic_attack, AttackContext},
+    tabledata::tdata_get,
     state::ShardServerState,
     Position,
 };
@@ -21,6 +24,8 @@ pub struct Escort {
     previous_ai: Option<String>,
     trail: VecDeque<Position>,
     last_player: Position,
+    pub(crate) fights: bool,
+    next_attack: Instant,
 }
 
 pub fn start(state: &mut ShardServerState, npc_id: i32, player_id: i32, task_id: i32) {
@@ -34,6 +39,8 @@ pub fn start(state: &mut ShardServerState, npc_id: i32, player_id: i32, task_id:
         previous_ai: npc.ai.take(),
         trail: VecDeque::from([player_pos]),
         last_player: player_pos,
+        fights: tdata_get().get_task_definition(task_id).is_ok_and(|task| task.escort_fights),
+        next_attack: Instant::now(),
     });
     state
         .entity_map
@@ -87,7 +94,16 @@ pub fn tick(state: &mut ShardServerState, npc_id: i32) -> bool {
         release(state, npc_id, true);
         return true;
     }
-    let player_pos = player.unwrap().get_position();
+    let player = player.unwrap();
+    let player_pos = player.get_position();
+    if let Some((target_id, delay)) = escort_target(state, npc, player, escort.fights) {
+        let now = Instant::now();
+        if now >= escort.next_attack {
+            state.get_npc_mut(npc_id).unwrap().mission_escort.as_mut().unwrap().next_attack = now + delay;
+            let _ = do_basic_attack(EntityID::NPC(npc_id), &[target_id], false, AttackContext::default(), state);
+        }
+        return true;
+    }
     let npc = state.get_npc_mut(npc_id).unwrap();
     let pos = npc.get_position();
     let escort = npc.mission_escort.as_mut().unwrap();
@@ -126,4 +142,14 @@ pub fn tick(state: &mut ShardServerState, npc_id: i32) -> bool {
         NPC::tick_movement_along_path(npc_id, &mut path, state);
     }
     true
+}
+
+fn escort_target(state: &ShardServerState, npc: &NPC, leader: &Player, fights: bool) -> Option<(EntityID, Duration)> {
+    if !fights || npc.get_position().distance_to(&leader.get_position()) > 2500 { return None; }
+    let EntityID::NPC(id) = leader.get_target().or(npc.last_attacked_by)? else { return None; };
+    let target = state.get_npc(id).ok()?;
+    let stats = tdata_get().get_npc_stats(npc.ty).ok()?;
+    (target.instance_id == npc.instance_id && !target.hidden && !target.is_dead() &&
+        target.get_team() == CombatantTeam::Mob && npc.get_position().distance_to(&target.get_position()) <= stats.attack_range + stats.radius)
+        .then(|| (EntityID::NPC(id), Duration::from_millis(100 * stats.delay_time.max(1))))
 }

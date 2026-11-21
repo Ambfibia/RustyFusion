@@ -171,6 +171,7 @@ pub fn gm_pc_goto(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState
 
     let player = state.get_player_mut(pc_id)?;
     player.set_position(new_pos);
+    player.clear_recall_point();
     player.instance_id = InstanceID {
         map_num: ID_OVERWORLD,
         instance_num: None,
@@ -550,6 +551,7 @@ pub fn gm_target_pc_teleport(
     };
 
     let player = state.get_player_mut(target_pc_id).unwrap();
+    player.clear_recall_point();
     player.set_pre_warp();
     player.set_position(dest_pos);
     player.instance_id = dest_inst_id;

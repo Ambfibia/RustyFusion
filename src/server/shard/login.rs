@@ -320,14 +320,14 @@ pub fn login_get_buddy_state(pkt: Packet, state: &mut ShardServerState) -> FFRes
         aBuddyState: [0; SIZEOF_BUDDYLIST_SLOT as usize],
     };
     for (i, buddy_uid) in buddy_info.iter().map(|info| info.pc_uid).enumerate() {
-        let online = query_results.get(&buddy_uid).is_some_and(|v| *v != 0);
+        // Login-server metadata is a periodic snapshot. A player already present
+        // on this shard must not flicker offline while that snapshot catches up.
+        let local_id = state.get_player_by_uid(buddy_uid).map(|p| p.get_player_id());
+        let online = local_id.is_some() || query_results.get(&buddy_uid).is_some_and(|v| *v != 0);
         resp.aBuddyState[i] = if online { 1 } else { 0 };
         if online {
             // lookup shard-local ID
-            let buddy_id = state
-                .get_player_by_uid(buddy_uid)
-                .map(|p| p.get_player_id())
-                .unwrap_or(0);
+            let buddy_id = local_id.unwrap_or(0);
             resp.aBuddyID[i] = buddy_id;
         }
     }

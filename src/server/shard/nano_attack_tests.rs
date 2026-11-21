@@ -75,6 +75,39 @@ fn hp(state: &ShardServerState, id: i32) -> i32 {
 }
 
 #[test]
+fn transport_blocks_nano_activation_and_cast_without_consuming_stamina() {
+    use crate::{enums::TransportationType, path::Path, tabledata::TripData};
+
+    static RIDE: TripData = TripData {
+        npc_id: 1,
+        transportation_type: TransportationType::Wyvern,
+        start_location: 1,
+        end_location: 2,
+        cost: 0,
+        speed: 100,
+        route_number: 1,
+    };
+    for skyway in [false, true] {
+        let (mut state, clients, _) = fixture(7, 19);
+        let client_map = ClientMap::new(1, &clients);
+        let player = state.get_player_mut(1).unwrap();
+        if skyway {
+            player.start_skyway_ride(&RIDE, Path::new_single(player.get_position(), 100));
+        } else {
+            player.vehicle_speed = Some(1000);
+        }
+        let activate = Packet::new(
+            P_CL2FE_REQ_NANO_ACTIVE,
+            &sP_CL2FE_REQ_NANO_ACTIVE { iNanoSlotNum: 0, ..Default::default() },
+        ).unwrap();
+        assert!(super::nano::nano_active(activate, &client_map, &mut state).is_err());
+        assert!(nano_skill_use(request(&[10]), &client_map, &mut state).is_err());
+        assert_eq!(stamina(&state), 150);
+        assert_eq!(hp(&state, 10), 350);
+    }
+}
+
+#[test]
 fn single_and_area_return_authoritative_hp_and_one_cost() {
     for (nano, skill, ids, cost, damage) in [
         (7, 19, vec![10], 26, 200),

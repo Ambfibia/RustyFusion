@@ -401,18 +401,54 @@ fn do_warp(
         ));
     }
 
-    if let Some((item_type, item_id)) = warp_data.req_item {
-        let item = player
-            .get_item(req_item_location_ord.try_into()?, req_item_slot)?
-            .as_ref();
-        if !item.is_some_and(|item| item.ty == item_type && item.id == item_id) {
+    if let Some((_, task_id)) = warp_data.req_task {
+        if !player.mission_journal.get_current_task_ids().contains(&task_id) {
             return Err(FFError::build(
                 Severity::Warning,
-                format!(
-                    "Player {} doesn't have the required item ({:?}) to warp",
-                    player.get_player_id(),
-                    warp_data.req_item
-                ),
+                "Required warp quest stage is not active".into(),
+            ));
+        }
+    }
+    if let Some(mission_id) = warp_data.req_completed_mission {
+        if !player.mission_journal.is_mission_completed(mission_id)? {
+            return Err(FFError::build(
+                Severity::Warning,
+                "Required warp quest is not completed".into(),
+            ));
+        }
+    }
+    if let Some((item_type, item_id)) = warp_data.req_item {
+        let count = if item_type == ItemType::Quest {
+            player.get_quest_item_count(item_id)
+        } else {
+            let item = player
+                .get_item(req_item_location_ord.try_into()?, req_item_slot)?
+                .as_ref();
+            if !item.is_some_and(|item| item.ty == item_type && item.id == item_id) {
+                return Err(FFError::build(
+                    Severity::Warning,
+                    "Required warp item slot does not match".into(),
+                ));
+            }
+            if warp_data.req_item_count == 0 {
+                1
+            } else {
+                let slots = player.find_items(ItemLocation::Inven, |item| {
+                    item.ty == item_type && item.id == item_id
+                });
+                let mut count = 0;
+                for slot in slots {
+                    if let Some(item) = player.get_item(ItemLocation::Inven, slot)? {
+                        count += usize::from(item.quantity.max(1));
+                    }
+                }
+                count
+            }
+        };
+        if !warp_item_quantity_allowed(warp_data.req_item_count, count) {
+            return Err(FFError::build(
+                Severity::Warning,
+                "Not enough required warp items".into(),
             ));
         }
     }
@@ -429,7 +465,7 @@ fn do_warp(
                     }
 
                     let member = state.get_player(member_pc_id).unwrap();
-                    if member.get_position().distance_to(&position) > RANGE_GROUP_WARP {
+                    if member.instance_id != player.instance_id || member.get_position().distance_to(&position) > RANGE_GROUP_WARP {
                         return Err(FFError::build(
                             Severity::Warning,
                             format!(
@@ -492,8 +528,14 @@ fn do_warp(
     };
 
     for warping_pc_id in pc_ids_to_warp {
+        // A committed portal warp ends the run, including group passengers.
+        // Do this after all warp validation, so a failed warp keeps the race.
+        // The warp success is the authoritative client lifecycle edge; sending
+        // a race-cancel reply here would be an uncorrelated transaction.
+        state.ongoing_races.remove(&warping_pc_id);
         let player = state.get_player_mut(warping_pc_id)?;
         let client = player.get_client().unwrap();
+        player.clear_recall_point();
         player.set_pre_warp();
         player.set_position(warp_data.pos);
         let instance_id = InstanceID {
@@ -542,12 +584,111 @@ fn do_warp(
             client.send_packet(P_FE2CL_REP_PC_WARP_USE_NPC_SUCC, &resp);
         }
 
-        helpers::broadcast_state(pc_id, player.get_state_bit_flag(), state);
+        helpers::broadcast_state(warping_pc_id, player.get_state_bit_flag(), state);
 
         // we remove the player from the chunk here and wait for PC_LOADING_COMPLETE to put them back.
         // it needs to be done this way or the client will miss the PC/NPC_ENTER packets.
-        state.entity_map.update(EntityID::Player(pc_id), None, true);
+        state.entity_map.update(EntityID::Player(warping_pc_id), None, true);
     }
 
     Ok(item_consumed)
+}
+
+// A zero authoring count preserves the legacy one-item presence requirement.
+fn warp_item_quantity_allowed(required: u16, available: usize) -> bool {
+    available >= usize::from(required.max(1))
+}
+
+#[cfg(test)]
+mod warp_condition_tests {
+    use super::*;
+    #[test]
+    fn group_warp_detaches_each_passenger_and_rejects_other_instances() {
+        use crate::{chunk::{ChunkCoords, TickMode}, entity::{Group, Player}, net::{ClientMetadata, ClientType}, tabledata::tdata_init};
+        use std::collections::HashMap;
+        tdata_init().unwrap();
+        let mut state = ShardServerState::default();
+        let mut connections = HashMap::new();
+        let mut receivers = Vec::new();
+        let group_id = uuid::Uuid::new_v4();
+        let mut group = Group::new(EntityID::Player(1)); group.add_member(EntityID::Player(2)).unwrap();
+        state.groups.insert(group_id, group);
+        for id in [1, 2] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); receivers.push(rx);
+            let client = FFClient::new(tx, ClientMetadata::new(format!("127.0.0.1:{}", 39300 + id).parse().unwrap(),
+                Some(ClientType::GameClient { account_id: id as i64, serial_key: id as i64, pc_id: Some(id) })));
+            let mut player = Player::new(id as i64, 0); player.set_player_id(id); player.set_client(client.clone()); player.group_id = Some(group_id);
+            let chunk = ChunkCoords::from_pos_inst(player.get_position(), player.instance_id);
+            state.entity_map.track(Box::new(player), TickMode::Always);
+            state.entity_map.update(EntityID::Player(id), Some(chunk), false); connections.insert(id as usize, client);
+        }
+        let clients = ClientMap::new(1, &connections);
+        state.get_player_mut(2).unwrap().instance_id.map_num = 1;
+        for id in [1, 2] {
+            let player = state.get_player_mut(id).unwrap();
+            player.register_recall_point(100 + id, player.get_position());
+        }
+        assert!(do_warp(&clients, &mut state, None, 4, 4, 0, 4, 0).is_err());
+        for id in [1, 2] { assert!(state.get_player(id).unwrap().get_recall_point().is_some(), "rejected group warp preserves passenger {id}'s Recall registration"); }
+        assert!(state.entity_map.get_entity_chunk(EntityID::Player(1)).is_some());
+        assert!(state.entity_map.get_entity_chunk(EntityID::Player(2)).is_some());
+        state.get_player_mut(2).unwrap().instance_id = state.get_player(1).unwrap().instance_id;
+        let player = state.get_player_mut(2).unwrap();
+        player.register_recall_point(102, player.get_position());
+        do_warp(&clients, &mut state, None, 4, 4, 0, 4, 0).unwrap();
+        assert_eq!(state.get_player(1).unwrap().instance_id, state.get_player(2).unwrap().instance_id);
+        for id in [1, 2] {
+            assert!(state.entity_map.get_entity_chunk(EntityID::Player(id)).is_none(), "passenger {id} waits for loading complete");
+            assert!(state.get_player(id).unwrap().get_recall_point().is_none(), "committed group warp clears passenger {id}'s Recall registration");
+        }
+    }
+    #[test]
+    fn warp_count_preserves_legacy_presence_and_checks_exact_threshold() {
+        assert!(!warp_item_quantity_allowed(0,0));
+        assert!(warp_item_quantity_allowed(0,1));
+        assert!(!warp_item_quantity_allowed(3,2));
+        assert!(warp_item_quantity_allowed(3,3));
+        assert!(warp_item_quantity_allowed(3,4));
+    }
+
+    #[test]
+    fn portal_commit_retires_race_but_rejected_warp_preserves_it() {
+        use std::collections::{HashMap, HashSet};
+        use crate::{
+            chunk::{EntityMap, TickMode}, entity::Player,
+            net::{ClientMetadata, ClientType}, racing::RaceState, tabledata::tdata_init,
+        };
+        tdata_init().unwrap();
+        let warp_id = (1..10000).find(|id| tdata_get().get_warp_data(*id).is_ok_and(|warp| {
+            warp.req_task.is_none() && warp.req_completed_mission.is_none()
+                && warp.req_item.is_none() && warp.req_item_consumed.is_none()
+        })).expect("published unconditional portal");
+        let warp = tdata_get().get_warp_data(warp_id).unwrap();
+        let destination = warp.pos;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = FFClient::new(tx, ClientMetadata::new(
+            "127.0.0.1:39013".parse().unwrap(),
+            Some(ClientType::GameClient { account_id: 1, serial_key: 1, pc_id: Some(1) }),
+        ));
+        let mut player = Player::new(1, 0);
+        player.set_player_id(1);
+        player.set_client(client.clone());
+        player.set_level(warp.min_level.max(1)).unwrap();
+        player.set_taros(warp.cost);
+        let mut state = ShardServerState {
+            shard_id: None, login_server_conn_id: None, login_data: HashMap::new(),
+            entity_map: EntityMap::default(), buyback_lists: HashMap::new(),
+            ongoing_trades: HashMap::new(), groups: HashMap::new(), player_uid_to_id: HashMap::new(),
+            pending_entering_uids: HashSet::new(), pending_buff_effects: Vec::new(),
+            ongoing_races: HashMap::from([(1, RaceState::new(1, 1, RacingMode::Record, 0, None))]),
+        };
+        state.entity_map.track(Box::new(player), TickMode::Always);
+        let clients = HashMap::from([(1, client)]);
+        let clients = ClientMap::new(1, &clients);
+        assert!(do_warp(&clients, &mut state, None, -1, 0, 0, 0, 0).is_err());
+        assert!(state.ongoing_races.contains_key(&1));
+        do_warp(&clients, &mut state, None, warp_id, 0, 0, 0, 0).unwrap();
+        assert!(!state.ongoing_races.contains_key(&1));
+        assert_eq!(state.get_player(1).unwrap().get_position(), destination);
+    }
 }

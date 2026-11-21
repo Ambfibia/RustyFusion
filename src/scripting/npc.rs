@@ -6,46 +6,30 @@ use crate::{
     entity::{Combatant, Entity, EntityID, NPC},
     error::log_if_failed,
     helpers, skills,
-    state::ShardServerState,
+    path::Path,
     tabledata::tdata_get,
     Position,
 };
 
-use super::EntityScriptContext;
+use super::{with_active_shard, EntityScriptContext};
 
 /// NPC context used in Lua script. Provides NPC bindings to Lua.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NpcScriptContext {
     npc_id: i32,
-    state: *mut ShardServerState,
 }
 impl NpcScriptContext {
-    pub(super) fn new(npc_id: i32, state: &mut ShardServerState) -> Self {
-        Self {
-            npc_id,
-            state: state as *mut ShardServerState,
-        }
+    pub(super) fn new(npc_id: i32) -> Self {
+        Self { npc_id }
     }
 
-    fn with_state<T>(&self, f: impl FnOnce(&mut ShardServerState) -> LuaResult<T>) -> LuaResult<T> {
-        // SAFETY: see unsafe impl Send below.
-        // These wrappers help avoid aliasing issues by ensuring we only have one mutable reference
-        // to state at a time. DO NOT directly dereference self.state outside of these wrappers.
-        let state = unsafe { &mut *self.state };
-        f(state)
-    }
-
-    fn with_npc<T>(&self, f: impl FnOnce(&mut NPC) -> LuaResult<T>) -> LuaResult<T> {
-        self.with_state(|state| {
+    fn with_npc<T>(&self, lua: &Lua, f: impl FnOnce(&mut NPC) -> LuaResult<T>) -> LuaResult<T> {
+        with_active_shard(lua, |state| {
             let npc = state.get_npc_mut(self.npc_id)?;
             f(npc)
         })
     }
 }
-
-// SAFETY: NpcScriptContext is only used within a single synchronous resume() call.
-// The state pointer is guaranteed valid for that duration.
-unsafe impl Send for NpcScriptContext {}
 
 impl FromLua for NpcScriptContext {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
@@ -65,28 +49,28 @@ impl LuaUserData for NpcScriptContext {
 
             luau_method!(methods, "id" -> "number", |_, this, ()| Ok(this.npc_id));
 
-            luau_method!(methods, "ty" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "ty" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 Ok(npc.ty)
             }));
 
-            luau_method!(methods, "spawn_position" -> "Position", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "spawn_position" -> "Position", |lua, this, ()| this.with_npc(lua, |npc| {
                 Ok(npc.spawn_position)
             }));
 
-            luau_method!(methods, "retreating" -> "boolean", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "retreating" -> "boolean", |lua, this, ()| this.with_npc(lua, |npc| {
                 Ok(npc.retreating)
             }));
 
-            luau_method!(methods, "is_moving" -> "boolean", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "is_moving" -> "boolean", |lua, this, ()| this.with_npc(lua, |npc| {
                 Ok(npc.path.is_some())
             }));
-            luau_method!(methods, "has_authored_path" -> "boolean", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "has_authored_path" -> "boolean", |lua, this, ()| this.with_npc(lua, |npc| {
                 Ok(npc.authored_path.is_some())
             }));
 
             // Stats
 
-            luau_method!(methods, "walk_speed" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "walk_speed" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 let stats = tdata_get()
                     .get_npc_stats(npc.ty)
                     .unwrap();
@@ -94,7 +78,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(stats.walk_speed)
             }));
 
-            luau_method!(methods, "run_speed" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "run_speed" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 let stats = tdata_get()
                     .get_npc_stats(npc.ty)
                     .unwrap();
@@ -102,7 +86,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(stats.run_speed)
             }));
 
-            luau_method!(methods, "sight_range" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "sight_range" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 let stats = tdata_get()
                     .get_npc_stats(npc.ty)
                     .unwrap();
@@ -110,7 +94,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(stats.sight_range)
             }));
 
-            luau_method!(methods, "idle_range" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "idle_range" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 let stats = tdata_get()
                     .get_npc_stats(npc.ty)
                     .unwrap();
@@ -118,7 +102,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(stats.idle_range)
             }));
 
-            luau_method!(methods, "combat_range" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "combat_range" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 let stats = tdata_get()
                     .get_npc_stats(npc.ty)
                     .unwrap();
@@ -126,7 +110,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(stats.combat_range)
             }));
 
-            luau_method!(methods, "attack_range" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "attack_range" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 let stats = tdata_get()
                     .get_npc_stats(npc.ty)
                     .map_err(|e| LuaError::runtime(e.to_string()))?;
@@ -134,7 +118,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(stats.attack_range)
             }));
 
-            luau_method!(methods, "regen_time" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "regen_time" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 let stats = tdata_get()
                     .get_npc_stats(npc.ty)
                     .map_err(|e| LuaError::runtime(e.to_string()))?;
@@ -143,7 +127,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(stats.regen_time as f64 / 10.0)
             }));
 
-            luau_method!(methods, "delay_time" -> "number", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "delay_time" -> "number", |lua, this, ()| this.with_npc(lua, |npc| {
                 let stats = tdata_get()
                     .get_npc_stats(npc.ty)
                     .map_err(|e| LuaError::runtime(e.to_string()))?;
@@ -154,21 +138,21 @@ impl LuaUserData for NpcScriptContext {
 
             // Actions
 
-            luau_method!(methods, "clear_target" -> "()", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "clear_target" -> "()", |lua, this, ()| this.with_npc(lua, |npc| {
                 npc.target_id = None;
                 Ok(())
             }));
 
-            luau_method!(methods, "set_target" -> "()", |_, this, target: EntityScriptContext| this.with_npc(|npc| {
+            luau_method!(methods, "set_target" -> "()", |lua, this, target: EntityScriptContext| this.with_npc(lua, |npc| {
                 npc.acquire_target(target.id());
                 Ok(())
             }));
 
-            luau_method!(methods, "combat_origin" -> "Position", |_, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "combat_origin" -> "Position", |lua, this, ()| this.with_npc(lua, |npc| {
                 Ok(npc.combat_origin.unwrap_or(npc.spawn_position))
             }));
 
-            luau_method!(methods, "attack" -> "()", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "attack" -> "()", |lua, this, ()| with_active_shard(lua, |state| {
                 let npc = state.get_npc(this.npc_id)?;
                 let target_id = match npc.target_id {
                     Some(id) => id,
@@ -185,29 +169,32 @@ impl LuaUserData for NpcScriptContext {
                 Ok(())
             }));
 
-            luau_method!(methods, "try_begin_corruption" -> "boolean", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "try_begin_corruption" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
                 Ok(corruption::try_begin(this.npc_id, state)?)
             }));
 
-            luau_method!(methods, "corruption_interrupted" -> "boolean", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "corruption_interrupted" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
                 Ok(corruption::is_interrupted(this.npc_id, state))
             }));
 
-            luau_method!(methods, "finish_corruption" -> "boolean", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "finish_corruption" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
                 Ok(corruption::finish(this.npc_id, state)?)
             }));
-            luau_method!(methods, "try_begin_eruption" -> "boolean", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "try_active_skill" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
+                Ok(crate::ai::try_active_skill(this.npc_id, state)?)
+            }));
+            luau_method!(methods, "try_begin_eruption" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
                 Ok(crate::eruption::try_begin(this.npc_id, state)?)
             }));
-            luau_method!(methods, "eruption_interrupted" -> "boolean", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "eruption_interrupted" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
                 Ok(crate::eruption::is_interrupted(this.npc_id, state))
             }));
-            luau_method!(methods, "finish_eruption" -> "boolean", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "finish_eruption" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
                 Ok(crate::eruption::finish(this.npc_id, state)?)
             }));
 
             luau_method!(methods, "move_to" -> "()",
-                |_, this, (x, y, z, speed): (i32, i32, i32, Option<i32>)| this.with_state(|state| {
+                |lua, this, (x, y, z, speed): (i32, i32, i32, Option<i32>)| with_active_shard(lua, |state| {
                     let target_pos = Position { x, y, z };
                     let npc = state.get_npc_mut(this.npc_id)?;
                     npc.move_towards(target_pos, speed);
@@ -215,7 +202,7 @@ impl LuaUserData for NpcScriptContext {
                 })
             );
 
-            luau_method!(methods, "move_toward_entity" -> "()", |_, this, (target, speed): (EntityScriptContext, Option<i32>)| this.with_state(|state| {
+            luau_method!(methods, "move_toward_entity" -> "()", |lua, this, (target, speed): (EntityScriptContext, Option<i32>)| with_active_shard(lua, |state| {
                 let target_pos = match state.entity_map.get_entity_raw(target.id()) {
                     Some(entity) => entity.get_position(),
                     None => return Err(LuaError::runtime("Entity not found")),
@@ -226,21 +213,32 @@ impl LuaUserData for NpcScriptContext {
                 Ok(())
             }));
 
-            luau_method!(methods, "stop" -> "()", |_, this, ()| this.with_npc(|npc| {
+            // Formation offsets already account for spacing. Applying the
+            // combat collision radius here leaves followers behind their slot.
+            luau_method!(methods, "move_to_exact" -> "()",
+                |lua, this, (x, y, z, speed): (i32, i32, i32, i32)| this.with_npc(lua, |npc| {
+                    let mut path = Path::new_single(Position { x, y, z }, speed);
+                    path.start();
+                    npc.set_path(path);
+                    Ok(())
+                })
+            );
+
+            luau_method!(methods, "stop" -> "()", |lua, this, ()| this.with_npc(lua, |npc| {
                 npc.path = None;
                 Ok(())
             }));
 
-            luau_method!(methods, "set_retreating" -> "()", |_, this, retreating: bool| this.with_npc(|npc| {
+            luau_method!(methods, "set_retreating" -> "()", |lua, this, retreating: bool| this.with_npc(lua, |npc| {
                 npc.retreating = retreating;
                 Ok(())
             }));
 
-            luau_method!(methods, "return_home" -> "()", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "return_home" -> "()", |lua, this, ()| with_active_shard(lua, |state| {
                 Ok(crate::ai::return_home(this.npc_id, state)?)
             }));
 
-            luau_method!(methods, "begin_death" -> "()", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "begin_death" -> "()", |lua, this, ()| with_active_shard(lua, |state| {
                 // a corpse keeps no conditions or windup (OpenFusion MobAI::onDeath)
                 state.get_npc_mut(this.npc_id)?.clear_buffs();
                 corruption::cancel(this.npc_id, state)?;
@@ -258,7 +256,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(())
             }));
 
-            luau_method!(methods, "despawn" -> "()", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "despawn" -> "()", |lua, this, ()| with_active_shard(lua, |state| {
                 let entity_id = EntityID::NPC(this.npc_id);
                 let summoned = state.get_npc(this.npc_id)?.summoned;
                 state.entity_map.update(entity_id, None, true);
@@ -268,7 +266,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(())
             }));
 
-            luau_method!(methods, "respawn" -> "()", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "respawn" -> "()", |lua, this, ()| with_active_shard(lua, |state| {
                 let chunk_pos = {
                     let npc = state.get_npc_mut(this.npc_id)?;
                     npc.reset();
@@ -280,7 +278,7 @@ impl LuaUserData for NpcScriptContext {
             }));
 
             luau_method!(methods, "summon_npc" -> "number",
-                |_, this, (ty, offset_x, offset_y, offset_z): (i32, i32, i32, i32)| this.with_state(|state| {
+                |lua, this, (ty, offset_x, offset_y, offset_z): (i32, i32, i32, i32)| with_active_shard(lua, |state| {
                     tdata_get()
                         .get_npc_stats(ty)
                         .map_err(|e| LuaError::runtime(e.to_string()))?;
@@ -309,7 +307,7 @@ impl LuaUserData for NpcScriptContext {
             );
 
             luau_method!(methods, "set_spawn_position" -> "()",
-                |_, this, (x, y, z): (i32, i32, i32)| this.with_npc(|npc| {
+                |lua, this, (x, y, z): (i32, i32, i32)| this.with_npc(lua, |npc| {
                     npc.spawn_position = Position { x, y, z };
                     Ok(())
                 })
@@ -317,7 +315,7 @@ impl LuaUserData for NpcScriptContext {
 
             // Helpers
 
-            luau_method!(methods, "in_attack_range" -> "boolean", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "in_attack_range" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
                 let npc = state.get_npc(this.npc_id)?;
                 let target_id = match npc.target_id {
                     Some(id) => id,
@@ -335,7 +333,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(npc_pos.distance_to(&target.get_position()) <= attack_range)
             }));
 
-            luau_method!(methods, "find_nearest_enemy" -> "Entity?", |_, this, range: u32| this.with_state(|state| {
+            luau_method!(methods, "find_nearest_enemy" -> "Entity?", |lua, this, range: u32| with_active_shard(lua, |state| {
                 let (npc_team, npc_pos) = {
                     let npc = state.get_npc(this.npc_id)?;
                     (npc.get_team(), npc.get_position())
@@ -364,20 +362,20 @@ impl LuaUserData for NpcScriptContext {
                 }
 
                 match nearest_id {
-                    Some(eid) => Ok(Some(EntityScriptContext::new(eid, state))),
+                    Some(eid) => Ok(Some(EntityScriptContext::new(eid))),
                     None => Ok(None),
                 }
             }));
 
-            luau_method!(methods, "get_follow_target" -> "Entity?", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "get_follow_target" -> "Entity?", |lua, this, ()| with_active_shard(lua, |state| {
                 let loose_follow = state.get_npc(this.npc_id)?.loose_follow;
                 match loose_follow {
-                    Some(eid) => Ok(Some(EntityScriptContext::new(eid, state))),
+                    Some(eid) => Ok(Some(EntityScriptContext::new(eid))),
                     None => Ok(None),
                 }
             }));
 
-            luau_method!(methods, "get_pack_leader" -> "Npc?", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "get_pack_leader" -> "Npc?", |lua, this, ()| with_active_shard(lua, |state| {
                 let tight_follow = state.get_npc(this.npc_id)?.tight_follow;
                 let leader_id = match tight_follow {
                     Some((leader_id, _)) => leader_id,
@@ -389,10 +387,10 @@ impl LuaUserData for NpcScriptContext {
                     _ => return Ok(None),
                 };
 
-                Ok(Some(NpcScriptContext::new(leader_npc_id, state)))
+                Ok(Some(NpcScriptContext::new(leader_npc_id)))
             }));
 
-            luau_method!(methods, "get_pack_offset" -> "Position", |lua, this, ()| this.with_npc(|npc| {
+            luau_method!(methods, "get_pack_offset" -> "Position", |lua, this, ()| this.with_npc(lua, |npc| {
                 let offset = npc.tight_follow
                     .map(|(_, off)| off)
                     .unwrap_or_default();
@@ -404,7 +402,7 @@ impl LuaUserData for NpcScriptContext {
                 Ok(table)
             }));
 
-            luau_method!(methods, "find_enemies_in_range" -> "{Entity}", |lua, this, range: u32| this.with_state(|state| {
+            luau_method!(methods, "find_enemies_in_range" -> "{Entity}", |lua, this, range: u32| with_active_shard(lua, |state| {
                 let (npc_team, npc_pos) = {
                     let npc = state.get_npc(this.npc_id)?;
                     (npc.get_team(), npc.get_position())
@@ -430,7 +428,7 @@ impl LuaUserData for NpcScriptContext {
                         npc_pos.distance_to(&cb.get_position()) <= range
                     };
                     if in_range {
-                        result.set(idx, EntityScriptContext::new(eid, state))?;
+                        result.set(idx, EntityScriptContext::new(eid))?;
                         idx += 1;
                     }
                 }
@@ -442,13 +440,11 @@ impl LuaUserData for NpcScriptContext {
                 Ok(this.npc_id == other.npc_id)
             });
 
-            methods.add_meta_method(LuaMetaMethod::ToString, |_, this, ()| this.with_npc(|npc| {
+            methods.add_meta_method(LuaMetaMethod::ToString, |lua, this, ()| this.with_npc(lua, |npc| {
                 Ok(format!("{}", npc))
             }));
 
             methods.add_meta_method(LuaMetaMethod::Index, |lua, _, key: String| {
-                // Only capture the key — no state pointer in the closure.
-                // The NpcScriptContext (with its fresh pointer) is extracted from self at call time.
                 let wrapper = lua.create_function(move |lua, args: LuaMultiValue| {
                     let mut args_vec: Vec<_> = args.into_iter().collect();
                     let this_val = args_vec
@@ -457,13 +453,11 @@ impl LuaUserData for NpcScriptContext {
                         .clone();
 
                     let npc = NpcScriptContext::from_lua(this_val, lua)?;
-                    npc.with_state(|state| {
-                        let entity = EntityScriptContext::new(EntityID::NPC(npc.npc_id), state);
-                        let entity_ud = lua.create_userdata(entity)?;
-                        let method: LuaFunction = entity_ud.get(key.clone())?;
-                        args_vec[0] = LuaValue::UserData(entity_ud);
-                        method.call::<LuaMultiValue>(LuaMultiValue::from_vec(args_vec))
-                    })
+                    let entity = EntityScriptContext::new(EntityID::NPC(npc.npc_id));
+                    let entity_ud = lua.create_userdata(entity)?;
+                    let method: LuaFunction = entity_ud.get(key.as_str())?;
+                    args_vec[0] = LuaValue::UserData(entity_ud);
+                    method.call::<LuaMultiValue>(LuaMultiValue::from_vec(args_vec))
                 })?;
                 Ok(LuaValue::Function(wrapper))
             });

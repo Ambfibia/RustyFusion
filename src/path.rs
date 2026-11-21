@@ -1,6 +1,6 @@
 use crate::{defines::SHARD_TICKS_PER_SECOND, Position};
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone,serde::Serialize,serde::Deserialize)]
 pub struct PathPoint {
     pub pos: Position,
     pub speed: i32, // from previous point
@@ -13,7 +13,7 @@ impl PartialEq for PathPoint {
 }
 impl Eq for PathPoint {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone,serde::Serialize,serde::Deserialize)]
 pub enum PathState {
     Pending,
     Moving,
@@ -21,7 +21,7 @@ pub enum PathState {
     Done,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone,serde::Serialize,serde::Deserialize)]
 pub struct Path {
     points: Vec<PathPoint>,
     cycle: bool,
@@ -29,6 +29,7 @@ pub struct Path {
     state: PathState,
 }
 impl Path {
+    pub fn once(&self)->Self{let mut points=self.points.clone();if self.cycle&&points.len()>1&&points.first()!=points.last(){points.push(points[0]);}let mut path=Self::new(points,false);path.start();path}
     pub fn new(points: Vec<PathPoint>, cycle: bool) -> Self {
         Self {
             points,

@@ -202,6 +202,7 @@ pub async fn pc_enter(
     clients
         .get_sender()
         .send_packet(P_FE2CL_REP_PC_ENTER_SUCC, &resp);
+    crate::mission_stage::resume_branches(clients.get_sender(),state.get_player(pc_id)?);
 
     // ...and the contents afterwards, while the client is loading
     let player = state.get_player(pc_id)?;
@@ -749,8 +750,8 @@ pub fn pc_regen(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
             ));
             Some(player.get_chunk_coords())
         }
-        PCRegenType::HereByPhoenix => todo!(),
-        PCRegenType::HereByPhoenixGroup => todo!(),
+        PCRegenType::HereByPhoenix => { player.do_phoenix_revive(false)?; None }
+        PCRegenType::HereByPhoenixGroup => { player.do_phoenix_revive(true)?; None }
         PCRegenType::Unstick => {
             // check warp away timer
             if let Some(last_warp_away) = player.last_warp_away_time {
@@ -779,7 +780,7 @@ pub fn pc_regen(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
             ));
         }
     };
-    player.do_revive();
+    if !matches!(revive_type, PCRegenType::HereByPhoenix | PCRegenType::HereByPhoenixGroup) { player.do_revive(); }
 
     let (regen_data, regen_data_bcast) = player.get_regen_data();
 

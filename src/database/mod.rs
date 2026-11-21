@@ -38,7 +38,11 @@ mod sqlite;
 #[cfg(test)]
 pub(crate) mod test_suite;
 #[cfg(all(test, feature = "sqlite"))]
+mod mentor_persistence_tests;
+#[cfg(all(test, feature = "sqlite"))]
 mod nano_persistence_tests;
+#[cfg(all(test,feature="sqlite"))]
+pub(crate) mod native_stage_persistence_tests;
 
 type Int = i32;
 type BigInt = i64;

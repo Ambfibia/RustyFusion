@@ -229,7 +229,7 @@ pub async fn race_end(
         // fusion matter reward, scaled by the racing reward rate
         let player = state.get_player_mut(pc_id)?;
         let fm_rate = player
-            .reward_data
+            .effective_reward_data()
             .get_reward_rate(RewardType::FusionMatter, RewardCategory::Racing as usize)
             .unwrap_or(1.0);
         let fm_reward = (base_fm as f32 * fm_rate) as u32;
@@ -237,7 +237,8 @@ pub async fn race_end(
 
         // rank reward crate, if the player has room for it
         let mut reward_item = sItemReward::default();
-        if let Some(crate_id) = race_data.get_reward_crate_id(rank) {
+        if let Some(items)=tdata_get().economy_race_loot(ep_id,rank.saturating_sub(1) as u8,player)? {log_if_failed(crate::economy::give_items(player,&items));}
+        else if let Some(crate_id) = race_data.get_reward_crate_id(rank) {
             match player.find_free_slot(ItemLocation::Inven) {
                 Ok(slot_num) => {
                     let item = Item::new(ItemType::Chest, crate_id);

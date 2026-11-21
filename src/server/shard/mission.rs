@@ -1,7 +1,7 @@
 use crate::{
     chunk::TickMode,
     defines::{RANGE_INTERACT, RANGE_TRIGGER},
-    entity::{Combatant, EntityID},
+    entity::{Combatant, Entity, EntityID},
     enums::{ItemLocation, ItemType, MissionType, TaskType},
     error::*,
     mission::Task,
@@ -18,6 +18,10 @@ pub fn task_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState) 
     start_requested_task(pkt,client,state,false)
 }
 pub(super) fn start_requested_task(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFClient,state:&mut ShardServerState,administrative:bool)->FFResult<()> {
+    start_requested_task_with_reply(pkt,client,state,administrative,true)
+}
+fn start_requested_task_with_reply(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFClient,state:&mut ShardServerState,administrative:bool,reply:bool)->FFResult<()> {
+    let mut inventory_full=false;
     (|| {
         let pc_id = client.get_player_id()?;
         let player = state.get_player(pc_id)?;
@@ -28,7 +32,7 @@ pub(super) fn start_requested_task(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFCli
             .mission_journal
             .get_current_tasks()
             .iter()
-            .any(|t| t.get_task_id() == pkt.iTaskNum)
+            .any(|t| t.get_task_id() == pkt.iTaskNum && !t.completed && !t.failed)
         {
             // benign client bug; ignore
             return Ok(());
@@ -39,7 +43,8 @@ pub(super) fn start_requested_task(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFCli
         if let Some(giver_npc_type) = task_def.prereq_npc_type {
             let req_npc_id = pkt.iNPC_ID;
             let req_npc = state.get_npc(req_npc_id)?;
-            if req_npc.ty != giver_npc_type {
+            if !req_npc.interactable||!req_npc.visible_to(player) {return Err(FFError::build(Severity::Warning,"NPC interaction is disabled or hidden".into()));}
+            if req_npc.ty != giver_npc_type && !(task_def.task_type==TaskType::SelfCompleting&&!reply&&task_def.stage.completion(req_npc.ty).is_some()) {
                 return Err(FFError::build(
                     Severity::Warning,
                     format!(
@@ -225,6 +230,13 @@ pub(super) fn start_requested_task(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFCli
             ));
         }
 
+        if !administrative&&!task_def.required_bark.allows(player){return Err(FFError::build(Severity::Warning,"Required NPC bark is missing or expired".into()));}
+        if !player.mission_requirements_allowed(&task_def.inventory){return Err(FFError::build(Severity::Warning,"Required item, equipment or currency is missing".into()));}
+        let inventory_plan=if task_def.inventory.start.is_empty(){None}else{
+            if player.mission_journal.get_current_tasks().iter().any(|t|t.get_task_id()==pkt.iTaskNum&&!t.completed&&!t.failed){return Err(FFError::build(Severity::Warning,"Inventory start actions already applied".into()));}
+            Some(player.plan_mission_inventory(&task_def.inventory,false,&[]).map_err(|e|{inventory_full=e.get_msg()=="Mission item destination is full";e})?)
+        };
+
         // all clear, start the task
         let mut task: Task = task_def.into();
         let mission_def = task.get_mission_def();
@@ -241,6 +253,7 @@ pub(super) fn start_requested_task(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFCli
         if !player.mission_journal.get_current_tasks().iter().any(|t|t.get_task_id()==pkt.iTaskNum) {
             return Err(FFError::build(Severity::Warning,"Mission journal rejected the task".into()));
         }
+        if let Some(plan)=inventory_plan {player.commit_mission_inventory(plan,task_def.task_id)?;}
         if started {
             log(
                 Severity::Info,
@@ -283,12 +296,12 @@ pub(super) fn start_requested_task(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFCli
 
             for (qitem_id, qitem_count_mod) in &task_def.given_qitems {
                 let curr_count = player.get_quest_item_count(*qitem_id) as isize;
-                let new_count = (curr_count + *qitem_count_mod) as usize;
+                let new_count = (curr_count + *qitem_count_mod).max(0) as usize;
                 let qitem_slot = player.set_quest_item_count(*qitem_id, new_count).unwrap();
                 qitem_pkt.push(&sItemReward {
                     sItem: sItemBase {
-                        iType: ItemType::Quest as i16,
-                        iID: *qitem_id,
+                        iType: if new_count == 0 { 0 } else { ItemType::Quest as i16 },
+                        iID: if new_count == 0 { 0 } else { *qitem_id },
                         iOpt: new_count as i32,
                         iTimeLimit: unused!(),
                     },
@@ -310,16 +323,17 @@ pub(super) fn start_requested_task(pkt:&sP_CL2FE_REQ_PC_TASK_START,client:&FFCli
                 .unwrap_or(unused!()),
         };
 
-        client.send_packet(P_FE2CL_REP_PC_TASK_START_SUCC, &resp);
+        if reply {client.send_packet(P_FE2CL_REP_PC_TASK_START_SUCC, &resp);}
+        if reply{crate::mission_stage::stage_started(state,pc_id,pkt.iTaskNum,false);}
         Ok(())
     })()
     .catch_fail(|| {
         let resp = sP_FE2CL_REP_PC_TASK_START_FAIL {
             iTaskNum: pkt.iTaskNum,
-            iErrorCode: unused!(),
+            iErrorCode: if inventory_full {13}else{unused!()},
         };
 
-        client.send_packet(P_FE2CL_REP_PC_TASK_START_FAIL, &resp);
+        if reply {client.send_packet(P_FE2CL_REP_PC_TASK_START_FAIL, &resp);}
     })
 }
 
@@ -354,14 +368,22 @@ pub fn task_stop(pkt: Packet, client: &FFClient, state: &mut ShardServerState) -
         iTaskNum: pkt.iTaskNum,
     };
     client.send_packet(P_FE2CL_REP_PC_TASK_STOP_SUCC, &resp);
+    crate::mission_stage::reset(state,pc_id,task_def.mission_id);
     Ok(())
 }
 
 pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) -> FFResult<()> {
     let pkt: &sP_CL2FE_REQ_PC_TASK_END = pkt.get()?;
     let mut error_code = codes::TaskEndErr::NotComplete; // N.B. true failures are handled in player tick
+    let mut instant_journal=None;
     (|| {
         let pc_id = clients.get_sender().get_player_id()?;
+        let definition=tdata_get().get_task_definition(pkt.iTaskNum)?;
+        if definition.task_type==TaskType::SelfCompleting && !state.get_player(pc_id)?.mission_journal.get_current_tasks().iter().any(|t|t.get_task_id()==pkt.iTaskNum) {
+            if !definition.inventory.start.is_empty() || !definition.given_qitems.is_empty() || definition.obj_escort_npc_type.is_some(){return Err(FFError::build(Severity::Warning,"Self-completing stages cannot have start actions or escorts".into()));}
+            instant_journal=Some((pc_id,state.get_player(pc_id)?.mission_journal.clone()));
+            start_requested_task_with_reply(&sP_CL2FE_REQ_PC_TASK_START{iTaskNum:pkt.iTaskNum,iNPC_ID:pkt.iNPC_ID,iEscortNPC_ID:0},clients.get_sender(),state,false,false)?;
+        }
         let player = state.get_player(pc_id)?;
         let running_tasks = player.mission_journal.get_current_tasks();
         let task = running_tasks
@@ -378,6 +400,19 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
         }
 
         let task_def = task.get_task_def();
+        let branch=if task_def.stage.completions.is_empty(){None}else{
+            let npc=state.get_npc(pkt.iNPC_ID)?;
+            let (index,branch)=task_def.stage.completion(npc.ty).ok_or_else(||FFError::build(Severity::Warning,"NPC does not own a completion variant".into()))?;
+            if !crate::mission_stage::conditions_allowed(player,&branch.conditions){return Err(FFError::build(Severity::Warning,"Completion variant requirements are not met".into()));}
+            Some((index,branch))
+        };
+        let succ_task_id=branch.map(|(_,c)|c.next_task).or(task_def.succ_task_id).filter(|id|*id>0);
+        if task_def.task_type==TaskType::SelfCompleting {
+            if !player.mission_requirements_allowed(&task_def.inventory){return Err(FFError::build(Severity::Warning,"Self-completing mission requirements are no longer met".into()));}
+            let npc=state.get_npc(pkt.iNPC_ID)?;
+            if !npc.interactable || (branch.is_none()&&task_def.prereq_npc_type!=Some(npc.ty)){return Err(FFError::build(Severity::Warning,"Invalid self-completing mission giver".into()));}
+            state.entity_map.validate_proximity(&[EntityID::Player(pc_id),EntityID::NPC(pkt.iNPC_ID)],RANGE_INTERACT)?;
+        }
 
         if task.completed
             || player
@@ -392,7 +427,7 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
 
         // Validate the acquisition before committing items, rewards or completed flags.
         // A Nano previously obtained by GM does not skip this mission's progression.
-        let nano_progression = if task_def.succ_task_id.is_none() {
+        let nano_progression = if succ_task_id.is_none() {
             if let Some(nano_id) = task_def.succ_nano_id {
                 tdata_get().get_nano_stats(nano_id)?;
                 if nano_id <= 0
@@ -434,9 +469,10 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
         };
 
         // check target npc type + proximity
-        if let Some(target_npc_type) = task_def.obj_npc_type {
+        if let Some(target_npc_type) = branch.map(|(_,c)|c.npc).or(task_def.obj_npc_type) {
             let target_npc_id = pkt.iNPC_ID;
             let target_npc = state.get_npc(target_npc_id)?;
+            if !target_npc.visible_to(player)||(!target_npc.interactable && !matches!(task_def.task_type,TaskType::GotoLocation|TaskType::EscortDefence)) {return Err(FFError::build(Severity::Warning,"NPC interaction is disabled or hidden".into()));}
             if target_npc.ty != target_npc_type {
                 return Err(FFError::build(
                     Severity::Warning,
@@ -534,10 +570,15 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
         }
 
         // check for inventory space for rewards
+        let native_inventory=!task_def.inventory.before_finish.is_empty()||!task_def.inventory.after_finish.is_empty();
+        let inventory_plan=if native_inventory {
+            let rewards=task_def.succ_reward.map(|id|tdata_get().get_mission_reward(id)).transpose()?.map(|r|r.items).unwrap_or_default();
+            Some(player.plan_mission_inventory(&task_def.inventory,true,&rewards).map_err(|e|{if e.get_msg()=="Mission item destination is full"{error_code=codes::TaskEndErr::InventoryFull;}e})?)
+        }else{None};
         if let Some(reward_id) = task_def.succ_reward {
             let reward = tdata_get().get_mission_reward(reward_id)?;
             let inv_space = player.get_free_slots(ItemLocation::Inven);
-            if reward.items.len() > inv_space {
+            if !native_inventory && reward.items.len() > inv_space {
                 error_code = codes::TaskEndErr::InventoryFull;
                 return Err(FFError::build(
                     Severity::Warning,
@@ -566,8 +607,10 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
         }
 
         // all clear, mark the task completed. it'll be overwritten by the next task
+        if task_def.task_type==TaskType::SelfCompleting{crate::mission_stage::stage_started(state,pc_id,pkt.iTaskNum,false);}
         let player = state.get_player_mut(pc_id).unwrap();
-        player.mission_journal.complete_task(pkt.iTaskNum)?;
+        player.mission_journal.complete_task_branch(pkt.iTaskNum,branch.map(|(i,_)|i))?;
+        if let Some((index,_))=branch{player.native_stage.branches.insert(pkt.iTaskNum,index);}
 
         // if escort following, stop it
         if let Some(escort_npc_id) = task.escort_npc_id {
@@ -598,8 +641,8 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
                 let qitem_slot = player.set_quest_item_count(*qitem_id, new_count).unwrap();
                 qitem_pkt.push(&sItemReward {
                     sItem: sItemBase {
-                        iType: ItemType::Quest as i16,
-                        iID: *qitem_id,
+                        iType: if new_count == 0 { 0 } else { ItemType::Quest as i16 },
+                        iID: if new_count == 0 { 0 } else { *qitem_id },
                         iOpt: new_count as i32,
                         iTimeLimit: unused!(),
                     },
@@ -616,7 +659,7 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
         if let Some(reward_id) = task_def.succ_reward {
             match tdata_get()
                 .get_mission_reward(reward_id)
-                .map(|r| r.with_rates(&player.reward_data))
+                .map(|r| r.with_rates(&player.effective_reward_data()))
             {
                 Err(e) => log_error(e),
                 Ok(reward) => {
@@ -628,7 +671,7 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
                             m_iFusionMatter: player.set_fusion_matter(fm_new) as i32,
                             m_iBatteryN: player.get_nano_potions() as i32,
                             m_iBatteryW: player.get_weapon_boosts() as i32,
-                            iItemCnt: reward.items.len() as i8,
+                            iItemCnt: if native_inventory {0}else{reward.items.len() as i8},
                             iFatigue: 100,
                             iFatigue_Level: 1,
                             iNPC_TypeID: unused!(),
@@ -636,7 +679,7 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
                         },
                     );
 
-                    for item in &reward.items {
+                    for item in reward.items.iter().filter(|_|!native_inventory) {
                         let slot_num = player.find_free_slot(ItemLocation::Inven).unwrap();
                         let item_reward = *item;
                         player
@@ -656,7 +699,8 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
             }
         }
 
-        if task_def.succ_task_id.is_none() {
+        if let Some(plan)=inventory_plan {player.commit_mission_inventory(plan,task_def.task_id)?;}
+        if succ_task_id.is_none() {
             // Final task, mission complete
             let mission_def = tdata_get()
                 .get_mission_definition(task_def.mission_id)
@@ -718,18 +762,22 @@ pub fn task_end(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
         let resp = sP_FE2CL_REP_PC_TASK_END_SUCC {
             iTaskNum: pkt.iTaskNum,
         };
+        if let Some((index,c))=branch{clients.get_sender().send_packet(P_FE2CL_COMPLETION_BRANCH,&NativeCompletionBranch{task:pkt.iTaskNum,variant:index as i32+1,npc:c.npc,next_task:c.next_task});}
 
         clients
             .get_sender()
             .send_packet(P_FE2CL_REP_PC_TASK_END_SUCC, &resp);
+        crate::mission_stage::stage_started(state,pc_id,pkt.iTaskNum,true);
 
         Ok(())
     })()
     .catch_fail(|| {
         let resp = sP_FE2CL_REP_PC_TASK_END_FAIL {
+        // A failed one-click hand-in must leave the mission unaccepted.
             iTaskNum: pkt.iTaskNum,
             iErrorCode: error_code as i32,
         };
+        if let Some((pc_id,journal))=instant_journal.take(){if let Ok(player)=state.get_player_mut(pc_id){player.mission_journal=journal;}}
 
         clients
             .get_sender()

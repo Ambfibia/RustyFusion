@@ -345,7 +345,7 @@ pub fn item_chest_open(
         }
 
         let chest = player
-            .set_item(location, pkt.iSlotNum as usize, None)?
+            .get_item(location, pkt.iSlotNum as usize)?
             .ok_or(FFError::build(
                 Severity::Warning,
                 format!("C.R.A.T.E. in empty slot: {}", pkt.iSlotNum),
@@ -358,17 +358,20 @@ pub fn item_chest_open(
             ));
         }
 
-        let reward_item = tdata_get()
-            .get_item_from_crate(chest.id, player.get_style().iGender as i32)
-            .unwrap_or_else(|e| {
-                // If for some reason we can't find a valid drop for the crate,
-                // give the player a random gumball instead.
-                // This idea was taken from OpenFusion <3
-                log_error(e);
-                util::get_random_gumball()
-            });
-
-        player.set_item(location, pkt.iSlotNum as usize, Some(reward_item))?;
+        let capsule = tdata_get().nano_capsule(chest.id);
+        let reward_item = if capsule.is_some() {
+            None
+        } else if let Some(items) = tdata_get().economy_loot(
+            crate::tabledata_contracts::economy::LootCategory::Mission, chest.id as i32, player)? {
+            Some(items.into_iter().next().ok_or_else(||
+                FFError::build(Severity::Warning, "No eligible crate reward".into()))?)
+        } else {
+            Some(tdata_get().get_item_from_crate(chest.id, player.get_style().iGender as i32)
+                .unwrap_or_else(|e| {
+                    log_error(e);
+                    util::get_random_gumball()
+                }))
+        };
 
         let reward_pkt = PacketBuilder::new(P_FE2CL_REP_REWARD_ITEM)
             .with(&sP_FE2CL_REP_REWARD_ITEM {
@@ -383,12 +386,18 @@ pub fn item_chest_open(
                 iTaskID: unused!(),
             })
             .with(&sItemReward {
-                sItem: Some(reward_item).into_proto(),
+                sItem: reward_item.into_proto(),
                 eIL: location as i32,
                 iSlotNum: pkt.iSlotNum,
             })
             .build()?;
 
+        // The authenticated inventory slot and packet are validated before changing either reward.
+        let new_nano = match capsule {
+            Some(id) if player.get_nano(id).is_none() => Some(player.unlock_nano(id)?.clone()),
+            _ => None,
+        };
+        player.set_item(location, pkt.iSlotNum as usize, reward_item)?;
         client.send_payload(reward_pkt);
 
         let resp = sP_FE2CL_REP_ITEM_CHEST_OPEN_SUCC {
@@ -396,6 +405,22 @@ pub fn item_chest_open(
         };
 
         client.send_packet(P_FE2CL_REP_ITEM_CHEST_OPEN_SUCC, &resp);
+        if let Some(nano) = new_nano {
+            let grant = sP_FE2CL_REP_PC_NANO_CREATE_SUCC {
+                iPC_FusionMatter: player.get_fusion_matter() as i32,
+                iQuestItemSlotNum: -1,
+                QuestItem: None.into_proto(),
+                Nano: Some(&nano).into_proto(),
+                iPC_Level: player.get_level(),
+            };
+            client.send_packet(P_FE2CL_REP_PC_NANO_CREATE_SUCC, &grant);
+        } else if capsule.is_some() {
+            let already_owned = sP_FE2CL_REP_PC_NANO_CREATE_FAIL {
+                iPC_ID: client.get_player_id()?,
+                iErrorCode: 2,
+            };
+            client.send_packet(P_FE2CL_REP_PC_NANO_CREATE_FAIL, &already_owned);
+        }
         Ok(())
     })()
     .catch_fail(|| {
@@ -428,13 +453,14 @@ pub fn vendor_start(pkt: Packet, client: &FFClient, state: &mut ShardServerState
     })
 }
 
-pub fn vendor_table_update(pkt: Packet, client: &FFClient) -> FFResult<()> {
+pub fn vendor_table_update(pkt: Packet, client: &FFClient, state: &ShardServerState) -> FFResult<()> {
     (|| {
         let pkt: &sP_CL2FE_REQ_PC_VENDOR_TABLE_UPDATE = pkt.get()?;
+        validate_vendor(client, state, pkt.iNPC_ID, pkt.iVendorID)?;
 
         let vendor_data = tdata_get().get_vendor_data(pkt.iVendorID)?;
         let resp = sP_FE2CL_REP_PC_VENDOR_TABLE_UPDATE_SUCC {
-            item: vendor_data.as_arr()?,
+            item: vendor_data.as_arr_for(Some(state.get_player(client.get_player_id()?)?))?,
         };
 
         client.send_packet(P_FE2CL_REP_PC_VENDOR_TABLE_UPDATE_SUCC, &resp);
@@ -461,12 +487,19 @@ pub fn vendor_item_buy(
         validate_vendor(client, state, pkt.iNPC_ID, pkt.iVendorID)?;
 
         // sanitize the item
-        let item: Option<Item> = pkt.Item.try_into_proto()?;
+        let mut requested = pkt.Item;
+        requested.iTimeLimit = 0;
+        let item: Option<Item> = requested.try_into_proto()?;
         let mut item = item.ok_or(FFError::build(
             Severity::Warning,
             "Tried to buy nothing".to_string(),
         ))?;
-
+        let stats = item.get_stats()?;
+        validate_vendor_quantity(item.quantity as i32, stats.max_stack_size.max(1))?;
+        if pkt.Item.iOpt & !0xffff != 0 {
+            return Err(FFError::build(Severity::Warning, "Vendor purchase cannot forge an appearance".into()));
+        }
+        validate_vendor_destination(state.get_player(client.get_player_id()?)?, pkt.iInvenSlotNum)?;
         if item.ty == ItemType::Vehicle {
             // set expiration date
             let duration_min = config_get().shard.vehicle_duration.get();
@@ -487,8 +520,9 @@ pub fn vendor_item_buy(
         }
 
         let stats = item.get_stats()?;
-        let price = stats.buy_price * item.quantity as u32;
         let player = state.get_player_mut(client.get_player_id()?)?;
+        let price=vendor_data.price_for(item.id,item.ty,player)?.checked_mul(item.quantity as u32)
+            .ok_or_else(||FFError::build(Severity::Warning,"Vendor purchase price overflow".into()))?;
         if !guide_shop_purchase_allowed(
             pkt.iVendorID,
             stats.mentor,
@@ -557,9 +591,19 @@ pub fn vendor_item_sell(
             ));
         }
 
+        validate_vendor_quantity(pkt.iItemCnt, item.quantity)?;
+        let raw: sItemBase = Some(item).into_proto();
+        if raw.iOpt & !0xffff != 0 {
+            return Err(FFError::build(Severity::Warning, "Combined items cannot be sold".into()));
+        }
+        let quantity = pkt.iItemCnt as u16;
+        let sell_price = stats.sell_price.checked_mul(quantity as u32)
+            .ok_or_else(|| FFError::build(Severity::Warning, "Vendor sale price overflow".into()))?;
+        let balance = player.get_taros().checked_add(sell_price)
+            .ok_or_else(|| FFError::build(Severity::Warning, "Vendor sale balance overflow".into()))?;
+
         let mut remaining_item =
             player.set_item(ItemLocation::Inven, pkt.iInvenSlotNum as usize, None)?;
-        let quantity = pkt.iItemCnt as u16;
         let item = Item::split_items(&mut remaining_item, quantity);
         player
             .set_item(
@@ -569,10 +613,10 @@ pub fn vendor_item_sell(
             )
             .unwrap();
 
-        let sell_price = stats.sell_price * quantity as u32;
-        let new_taros = player.set_taros(player.get_taros() + sell_price);
+        let new_taros = player.set_taros(balance);
         let buyback_list = state.buyback_lists.entry(pc_id).or_default();
         buyback_list.push(item.unwrap());
+        if buyback_list.len() > SIZEOF_RESTORE_SLOT as usize { buyback_list.remove(0); }
 
         let resp = sP_FE2CL_REP_PC_VENDOR_ITEM_SELL_SUCC {
             iCandy: new_taros as i32,
@@ -608,6 +652,12 @@ pub fn vendor_item_restore_buy(
             Severity::Warning,
             format!("Bad item for buyback {:?}", pkt.Item),
         ))?;
+        validate_vendor_destination(state.get_player(pc_id)?, pkt.iInvenSlotNum)?;
+        let cost = item.get_stats()?.sell_price.checked_mul(item.quantity as u32)
+            .ok_or_else(|| FFError::build(Severity::Warning, "Vendor restore price overflow".into()))?;
+        if state.get_player(pc_id)?.get_taros() < cost {
+            return Err(FFError::build(Severity::Warning, "Not enough taros for buyback".into()));
+        }
         let buyback_list = state.buyback_lists.get_mut(&pc_id).ok_or(FFError::build(
             Severity::Warning,
             format!("Player {} has not sold any items", pc_id),
@@ -629,7 +679,6 @@ pub fn vendor_item_restore_buy(
         ))?;
 
         let item = buyback_list.remove(found_idx);
-        let cost = item.get_stats()?.sell_price * item.quantity as u32; // sell price is cost for buyback
         let player = state.get_player_mut(pc_id)?;
 
         if player.get_taros() < cost {
@@ -677,16 +726,18 @@ pub fn vendor_battery_buy(
         validate_vendor(client, state, pkt.iNPC_ID, pkt.iVendorID)?;
 
         let battery_type = pkt.Item.iID;
-        let mut quantity = pkt.Item.iOpt as u32 * 100;
+        let mut quantity = u32::try_from(pkt.Item.iOpt).ok().filter(|n| *n > 0)
+            .and_then(|n| n.checked_mul(100))
+            .ok_or_else(|| FFError::build(Severity::Warning, "Invalid battery quantity".into()))?;
 
         let player = state.get_player_mut(client.get_player_id()?)?;
         match battery_type {
             BATTERY_TYPE_BOOST => {
-                quantity = min(player.get_weapon_boosts() + quantity, PC_BATTERY_MAX)
+                quantity = min(player.get_weapon_boosts().saturating_add(quantity), PC_BATTERY_MAX)
                     - player.get_weapon_boosts();
             }
             BATTERY_TYPE_POTION => {
-                quantity = min(player.get_nano_potions() + quantity, PC_BATTERY_MAX)
+                quantity = min(player.get_nano_potions().saturating_add(quantity), PC_BATTERY_MAX)
                     - player.get_nano_potions();
             }
             other => {
@@ -782,12 +833,16 @@ mod guide_shop_tests {
 
 fn validate_vendor(
     client: &FFClient,
-    state: &mut ShardServerState,
+    state: &ShardServerState,
     npc_id: i32,
     vendor_id: i32,
 ) -> FFResult<()> {
     let pc_id = client.get_player_id()?;
     let npc = state.get_npc(npc_id)?;
+    let player = state.get_player(pc_id)?;
+    if player.trade_id.is_some() || !npc.interactable || !npc.visible_to(player) {
+        return Err(FFError::build(Severity::Warning, "Vendor is unavailable".into()));
+    }
     if npc.ty != vendor_id {
         return Err(FFError::build(
             Severity::Warning,
@@ -808,16 +863,26 @@ fn validate_vendor(
         })
 }
 
+fn validate_vendor_quantity(quantity: i32, available: u16) -> FFResult<()> {
+    if quantity <= 0 || quantity > i32::from(available) {
+        return Err(FFError::build(Severity::Warning, "Invalid vendor item quantity".into()));
+    }
+    Ok(())
+}
+fn validate_vendor_destination(player: &crate::entity::Player, slot: i32) -> FFResult<()> {
+    if player.trade_id.is_some() || slot < 0 || player.get_item(ItemLocation::Inven, slot as usize)?.is_some() {
+        return Err(FFError::build(Severity::Warning, "Vendor destination must be an empty inventory slot".into()));
+    }
+    Ok(())
+}
+
 //
 // Usable general items.
 //
 
-/// Skill that backs a gumball's nano boost (`NanoStimPak`).
-const SKILL_ID_NANO_STIMPAK: i16 = 144;
-
-/// Uses a general item out of the main inventory. Right now that means
-/// gumballs; Nanocom boosters need three extra equip slots the client doesn't
-/// have, so they're politely rejected.
+/// Uses accepted subtype3 gumballs or subtype4 linked healing/timed buffs.
+/// Unsupported bank capacity/revive-token/Nanocom contracts remain rejected
+/// before consumption; a raw default LinkSkill1 is not a consumable contract.
 pub fn item_use(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) -> FFResult<()> {
     let pkt: &sP_CL2FE_REQ_ITEM_USE = pkt.get()?;
     let slot_num = pkt.iSlotNum;
@@ -860,13 +925,15 @@ pub fn item_use(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
             ));
         }
 
-        match item.id {
-            id if (ID_GUMBALL..ID_GUMBALL + 3).contains(&id) => {
-                use_gumball(pc_id, slot_num, nano_slot, id, clients, state)
-            }
-            other => Err(FFError::build(
+        if player.is_dead() || player.trade_id.is_some() {
+            return Err(FFError::build(Severity::Warning, "Item use is unavailable".into()));
+        }
+        match item.get_stats()?.general_kind {
+            Some(3) => use_gumball(pc_id, slot_num, nano_slot, item.id, clients, state),
+            Some(4) => use_linked_general_item(pc_id, slot_num, item.id, clients, state),
+            _ => Err(FFError::build(
                 Severity::Warning,
-                format!("General item {} is not usable", other),
+                format!("General item {} is not usable", item.id),
             )),
         }
     })()
@@ -876,6 +943,50 @@ pub fn item_use(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState) 
         };
         client.send_packet(P_FE2CL_REP_PC_ITEM_USE_FAIL, &resp);
     })
+}
+
+/// Ordinary item-linked skills were never dispatched by the Nano path. This
+/// continuation uses the accepted item's exact skill identity and source values.
+fn use_linked_general_item(pc_id: i32, slot_num: usize, item_id: i16, clients: &ClientMap,
+    state: &mut ShardServerState) -> FFResult<()> {
+    let stats = tdata_get().get_item_stats(item_id, ItemType::General)?;
+    let skill_id = stats.linked_skill.ok_or_else(|| FFError::build(Severity::Warning, "Item has no linked skill".into()))?;
+    let skill = tdata_get().get_skill(skill_id)?;
+    let buff_id = skill.get_buff_id();
+    if skill.skill_type == SkillType::ExtraBank || skill.passive || (buff_id.is_none() && skill.skill_type != SkillType::HealHP) {
+        return Err(FFError::build(Severity::Warning, "Linked item effect has no accepted usable contract".into()));
+    }
+    let player = state.get_player_mut(pc_id)?;
+    if !player.item_skill_is_ready(skill_id) { return Err(FFError::build(Severity::Warning, "Item skill cooldown is active".into())); }
+    // Validate the buff construction before removing an inventory item.
+    let buff = buff_id.map(|_| skill.make_buff_instance_forced(BuffType::CashItem, 0)).transpose()?;
+    Item::split_items(player.get_item_mut(ItemLocation::Inven, slot_num)?, 1)
+        .ok_or_else(|| FFError::build(Severity::Warning, "Cannot consume item".into()))?;
+    let remaining = *player.get_item(ItemLocation::Inven, slot_num)?;
+    player.start_item_skill_cooldown(skill_id, skill.cooldown);
+    let mut result = if let (Some(id), Some(buff)) = (buff_id, buff) {
+        player.apply_buff(id, buff, Some(EntityID::Player(pc_id)));
+        skills::SkillResult::Buff(sSkillResult_Buff { eCT: CharType::Player as i32, iID: pc_id,
+            bProtected: 0, iConditionBitFlag: player.get_condition_bit_flag() })
+    } else {
+        let healed = player.heal(player.get_max_hp() * skill.values_a[0] / 1000);
+        skills::SkillResult::HealHP(sSkillResult_Heal_HP { eCT: CharType::Player as i32,
+            iID: pc_id, iHealHP: healed, iHP: player.get_hp() })
+    };
+    let mut response = PacketBuilder::new(P_FE2CL_REP_PC_ITEM_USE_SUCC).with(&sP_FE2CL_REP_PC_ITEM_USE_SUCC {
+        iPC_ID: pc_id, eIL: ItemLocation::Inven as i32, iSlotNum: slot_num as i32,
+        RemainItem: remaining.into_proto(), iSkillID: skill_id, eST: skill.skill_type as i32, iTargetCnt: 1 });
+    let mut broadcast = PacketBuilder::new(P_FE2CL_PC_ITEM_USE).with(&sP_FE2CL_PC_ITEM_USE {
+        iPC_ID: pc_id, iSkillID: skill_id, eST: skill.skill_type as i32, iTargetCnt: 1 });
+    match &mut result {
+        skills::SkillResult::Buff(value) => { response.push(value); broadcast.push(value); }
+        skills::SkillResult::HealHP(value) => { response.push(value); broadcast.push(value); }
+        _ => unreachable!("Validated linked item result"),
+    }
+    clients.get_sender().send_payload(response.build()?);
+    let broadcast = broadcast.build()?;
+    state.entity_map.for_each_around(EntityID::Player(pc_id), |client| { if client.get_player_id().ok() != Some(pc_id) { client.send_payload(broadcast.clone()); } });
+    Ok(())
 }
 
 /// Eats a gumball, boosting the nano in `nano_slot` for the skill table's
@@ -895,10 +1006,13 @@ fn use_gumball(
         ));
     }
 
-    let required_style = match gumball_id - ID_GUMBALL {
-        0 => CombatStyle::Adaptium,
-        1 => CombatStyle::Blastons,
-        _ => CombatStyle::Cosmix,
+    let stats = tdata_get().get_item_stats(gumball_id, ItemType::General)?;
+    let skill_id = stats.linked_skill.ok_or_else(|| FFError::build(Severity::Warning, "Gumball has no linked skill".into()))?;
+    let skill = tdata_get().get_skill(skill_id)?;
+    if skill.skill_type != SkillType::NanoStimPak { return Err(FFError::build(Severity::Warning, "Invalid gumball linked skill".into())); }
+    let required_style = match stats.stimpack_attribute {
+        Some(1) => Some(CombatStyle::Adaptium), Some(2) => Some(CombatStyle::Blastons), Some(3) => Some(CombatStyle::Cosmix), Some(4) => None,
+        _ => return Err(FFError::build(Severity::Warning, "Unknown gumball flavor".into())),
     };
 
     let player = state.get_player(pc_id)?;
@@ -911,7 +1025,7 @@ fn use_gumball(
             )
         })?;
     let nano_style = tdata_get().get_nano_stats(nano_id)?.style;
-    if nano_style != required_style {
+    if required_style.is_some_and(|style| nano_style != style) {
         return Err(FFError::build(
             Severity::Warning,
             format!(
@@ -921,7 +1035,7 @@ fn use_gumball(
         ));
     }
 
-    let skill = tdata_get().get_skill(SKILL_ID_NANO_STIMPAK)?;
+    if !player.item_skill_is_ready(skill_id) { return Err(FFError::build(Severity::Warning, "Item skill cooldown is active".into())); }
     let buff_id = match nano_slot {
         0 => BuffID::StimPakSlot1,
         1 => BuffID::StimPakSlot2,
@@ -938,6 +1052,7 @@ fn use_gumball(
         )
     })?;
     let remaining = *player.get_item(ItemLocation::Inven, slot_num)?;
+    player.start_item_skill_cooldown(skill_id, skill.cooldown);
 
     let player_eid = player.get_id();
     skills::apply_skill_buff(
@@ -955,7 +1070,7 @@ fn use_gumball(
             eIL: ItemLocation::Inven as i32,
             iSlotNum: slot_num as i32,
             RemainItem: remaining.into_proto(),
-            iSkillID: SKILL_ID_NANO_STIMPAK,
+            iSkillID: skill_id,
             eST: skill.skill_type as i32,
             iTargetCnt: 1,
         })
@@ -968,16 +1083,12 @@ fn use_gumball(
         .build()?;
     clients.get_sender().send_payload(resp);
 
-    // everyone nearby should see the nano light up
-    let bcast = sP_FE2CL_PC_ITEM_USE {
-        iPC_ID: pc_id,
-        iSkillID: SKILL_ID_NANO_STIMPAK,
-        eST: skill.skill_type as i32,
-        iTargetCnt: 1,
-    };
-    state.entity_map.for_each_around(player_eid, |c| {
-        c.send_packet(P_FE2CL_PC_ITEM_USE, &bcast);
-    });
+    // Native count1 requires the typed16-byte trailer on the broadcast too.
+    let bcast = PacketBuilder::new(P_FE2CL_PC_ITEM_USE).with(&sP_FE2CL_PC_ITEM_USE {
+        iPC_ID: pc_id, iSkillID: skill_id, eST: skill.skill_type as i32, iTargetCnt: 1,
+    }).with(&sSkillResult_Buff { eCT: CharType::Player as i32, iID: pc_id,
+        bProtected: 0, iConditionBitFlag: player.get_condition_bit_flag() }).build()?;
+    state.entity_map.for_each_around(player_eid, |c| { c.send_payload(bcast.clone()); });
 
     Ok(())
 }
@@ -1013,6 +1124,11 @@ pub fn bank_open(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState)
         let bank_num = if npc_id == 0 {
             0
         } else {
+            state.entity_map.validate_proximity(&[EntityID::Player(pc_id), EntityID::NPC(npc_id)], RANGE_INTERACT)?;
+            let npc = state.get_npc(npc_id)?;
+            if !npc.interactable || !npc.visible_to(state.get_player(pc_id)?) {
+                return Err(FFError::build(Severity::Warning, "Banker is unavailable".into()));
+            }
             let npc_type = state.get_npc(npc_id)?.ty;
             match bank_for_npc_type(npc_type) {
                 Some((bank_num, card_id)) => {
@@ -1067,3 +1183,29 @@ pub fn bank_close(pkt: Packet, clients: &ClientMap, state: &mut ShardServerState
     client.send_packet(P_FE2CL_REP_PC_BANK_CLOSE_SUCC, &resp);
     Ok(())
 }
+
+#[cfg(test)]
+mod vendor_contract_tests {
+    use super::*;
+    #[test]
+    fn invalid_sale_counts_never_reach_the_split_or_currency_mutation() {
+        for count in [-1, 0, 2, 65536] { assert!(validate_vendor_quantity(count, 1).is_err()); }
+        assert!(validate_vendor_quantity(1, 1).is_ok());
+        assert!(validate_vendor_quantity(25, 25).is_ok());
+    }
+    #[test]
+    fn vendor_destination_must_be_empty_and_in_range() {
+        crate::tabledata::tdata_init().unwrap();
+        let mut player = crate::entity::Player::new(1, 0);
+        assert!(validate_vendor_destination(&player, 49).is_ok());
+        assert!(validate_vendor_destination(&player, -1).is_err());
+        assert!(validate_vendor_destination(&player, 50).is_err());
+        player.set_item(ItemLocation::Inven, 0, Some(Item::new(ItemType::UpperBody, 67))).unwrap();
+        assert!(validate_vendor_destination(&player, 0).is_err());
+        assert_eq!(player.get_item(ItemLocation::Inven, 0).unwrap().unwrap().id, 67);
+    }
+}
+
+#[cfg(test)]
+#[path = "item_buff_tests.rs"]
+mod buff_item_tests;

@@ -291,6 +291,71 @@ fn escort_group_start_zero_speed_follow_chain_and_delivery_round_trip() {
 }
 
 #[test]
+fn completed_escort_cannot_fail_while_waiting_for_outgoing_task_start() {
+    let (mut state, clients, mut rx) = fixture();
+    state.get_player_mut(1).unwrap().set_hp(1000);
+    begin(&mut state, &clients, 5209);
+    state.get_player_mut(1).unwrap().mission_journal.mark_enemy_defeated(344);
+    end(&mut state, &clients, 5209, 0).unwrap();
+    assert!(state.get_npc(NPC_ID).unwrap().mission_escort.is_none());
+    // Successful completion releases its escort before the client can send
+    // TASK_START for the next stage. A world tick in that gap must preserve
+    // the committed success rather than publish EscortFailed for the release.
+    while rx.try_recv().is_ok() {}
+    Player::tick(&mut state, 1, &std::time::SystemTime::now());
+    let task = state.get_player(1).unwrap().mission_journal.get_current_tasks()
+        .into_iter().find(|task| task.get_task_id() == 5209).unwrap();
+    assert!(task.completed);
+    assert!(!task.failed, "successful escort completion must not be reclassified as failure");
+    assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|msg| matches!(msg, ClientMessage::SendPacket(packet) if packet.id() == P_FE2CL_REP_PC_TASK_END_FAIL)));
+    begin(&mut state, &clients, 5211);
+}
+
+#[test]
+fn failed_escort_publishes_its_terminal_failure_once() {
+    let (mut state, clients, mut rx) = fixture();
+    state.get_player_mut(1).unwrap().set_hp(1000);
+    begin(&mut state, &clients, 5209);
+    crate::escort::release(&mut state, NPC_ID, true);
+    while rx.try_recv().is_ok() {}
+    Player::tick(&mut state, 1, &std::time::SystemTime::now());
+    let failures = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|msg| matches!(msg, ClientMessage::SendPacket(packet) if packet.id() == P_FE2CL_REP_PC_TASK_END_FAIL)).count();
+    assert_eq!(failures, 1);
+    Player::tick(&mut state, 1, &std::time::SystemTime::now());
+    assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|msg| matches!(msg, ClientMessage::SendPacket(packet) if packet.id() == P_FE2CL_REP_PC_TASK_END_FAIL)));
+    let task = state.get_player(1).unwrap().mission_journal.get_current_tasks()
+        .into_iter().find(|task| task.get_task_id() == 5209).unwrap();
+    assert!(task.failed);
+    assert!(!task.completed);
+}
+
+#[test]
+fn authored_self_success_and_failure_loops_restart_only_after_terminal_state() {
+    for (id, failed) in [(5064, true), (5176, false)] {
+        let (mut state, clients, mut rx) = fixture();
+        let player = state.get_player_mut(1).unwrap();
+        player.mission_journal.remove_task(5208).unwrap(); player.instance_id.map_num = 0;
+        let definition = tdata_get().get_task_definition(id).unwrap();
+        let mut task: Task = definition.into(); task.failed = failed; task.completed = !failed;
+        player.mission_journal.start_editor_task(task, 36).unwrap();
+        while rx.try_recv().is_ok() {}
+        begin(&mut state, &clients, id);
+        let task = state.get_player(1).unwrap().mission_journal.get_current_tasks().into_iter().find(|task| task.get_task_id() == id).unwrap();
+        assert!(!task.failed && !task.completed); assert!(task.fail_time.is_some());
+        assert_eq!(task.remaining_enemy_defeats, definition.obj_enemies);
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|msg| matches!(msg, ClientMessage::SendPacket(packet) if packet.id() == P_FE2CL_REP_PC_TASK_START_SUCC)));
+        let enemy = *definition.obj_enemies.keys().next().unwrap();
+        state.get_player_mut(1).unwrap().mission_journal.mark_enemy_defeated(enemy);
+        let expected = state.get_player(1).unwrap().mission_journal.get_current_tasks().into_iter().find(|task| task.get_task_id() == id).unwrap().remaining_enemy_defeats;
+        begin(&mut state, &clients, id);
+        assert_eq!(state.get_player(1).unwrap().mission_journal.get_current_tasks().into_iter().find(|task| task.get_task_id() == id).unwrap().remaining_enemy_defeats, expected);
+    }
+}
+
+#[test]
 fn escort_cancellation_instance_departure_and_teleport_restore_idle_npc() {
     for mode in 0..3 {
         let (mut state, clients, _) = fixture();
@@ -387,4 +452,53 @@ fn escort_suspends_and_restores_existing_authored_route() {
     let path = state.get_npc(NPC_ID).unwrap().path.as_ref().unwrap();
     assert_eq!(path.get_target_pos(), target);
     assert!(!path.is_started());
+}
+
+
+#[test]
+fn eduardo_defends_the_leader_only_against_an_in_range_mob_and_stays_on_delivery() {
+    use crate::entity::Combatant;
+    let (mut state, _clients, mut rx) = fixture();
+    let player = state.get_player_mut(1).unwrap();
+    player.instance_id.map_num = 11;
+    let instance = player.instance_id;
+    player.mission_journal.remove_task(5208).unwrap();
+    player.set_level(3).unwrap();
+    player.unlock_nano(3).unwrap();
+    assert!(player.mission_journal.start_task(tdata_get().get_task_definition(576).unwrap().into(), 3).unwrap());
+    let player_chunk = player.get_chunk_coords();
+    state.entity_map.update(EntityID::Player(1), Some(player_chunk), false);
+    state.entity_map.untrack(EntityID::NPC(NPC_ID));
+    const MOB: i32 = TARGET_ID + 1;
+    for (id, ty, x) in [(NPC_ID, 1007, 0), (MOB, 59, 200)] {
+        let npc = NPC::new(id, ty, Position { x: BASE.x+x, ..BASE }, 0, instance).unwrap();
+        let chunk = npc.get_chunk_coords();
+        let key = state.entity_map.track(Box::new(npc), TickMode::Never);
+        state.entity_map.update(key, Some(chunk), false);
+    }
+    state.get_player_mut(1).unwrap().target = Some(EntityID::NPC(MOB));
+    crate::escort::start(&mut state, NPC_ID, 1, 576);
+    assert!(tdata_get().get_task_definition(576).unwrap().escort_fights, "authored AI 6");
+    assert!(state.get_npc(NPC_ID).unwrap().mission_escort.as_ref().unwrap().fights);
+    assert!(state.get_combatant(EntityID::NPC(NPC_ID)).is_ok(), "escort registered for combat");
+    assert!(state.get_combatant(EntityID::NPC(MOB)).is_ok(), "hostile registered for combat");
+    let hp = state.get_npc(MOB).unwrap().get_hp();
+    assert!(hp>0 && !state.get_npc(MOB).unwrap().invulnerable, "live vulnerable mob hp={hp}");
+    assert!(state.get_player(1).unwrap().mission_journal.get_current_tasks().iter().any(|t|t.get_task_id()==576 && !t.failed && !t.completed), "escort task active");
+    assert_eq!(state.get_player(1).unwrap().get_position(), BASE);
+    let _ = rx.try_recv();
+    crate::escort::tick(&mut state, NPC_ID);
+    let after = state.get_npc(MOB).unwrap().get_hp();
+    assert!(after < hp);
+    assert!(std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|m| matches!(m, ClientMessage::SendPacket(p) if p.id()==P_FE2CL_NPC_ATTACK_CHARs)));
+    crate::escort::tick(&mut state, NPC_ID);
+    assert_eq!(state.get_npc(MOB).unwrap().get_hp(), after, "authored attack delay");
+    move_player(&mut state, Position { x: BASE.x+1200, ..BASE });
+    state.get_player_mut(1).unwrap().target = None;
+    for _ in 0..12 { crate::escort::tick(&mut state, NPC_ID); }
+    let arrived=state.get_npc(NPC_ID).unwrap().get_position();
+    assert!(arrived.x > BASE.x+500);
+    crate::escort::release(&mut state, NPC_ID, false);
+    assert_eq!(state.get_npc(NPC_ID).unwrap().get_position(), arrived);
 }

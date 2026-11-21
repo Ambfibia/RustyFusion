@@ -335,6 +335,9 @@ pub async fn email_send(
     let result = (async {
         let db = db_get();
         let player = state.get_player(pc_id)?;
+        if player.trade_id.is_some() {
+            return Err(FFError::build(Severity::Warning, "Cannot send mail while trading".to_string()));
+        }
         if player.get_uid() == recipient_uid {
             return Err(FFError::build(
                 Severity::Warning,
@@ -411,36 +414,20 @@ pub async fn email_send(
                 ));
             }
 
-            let player = state.get_player_mut(pc_id)?;
-            let slot = player.get_item_mut(ItemLocation::Inven, slot_num)?;
-            let split = Item::split_items(slot, requested.quantity).ok_or_else(|| {
-                FFError::build(
-                    Severity::Warning,
-                    format!("Couldn't split item in slot {}", slot_num),
-                )
+            // Prepare against a local copy. No inventory mutation before all four
+            // attachments, recipient, text and postage have been validated and stored.
+            let mut source = Some(real);
+            let split = Item::split_items(&mut source, requested.quantity).ok_or_else(|| {
+                FFError::build(Severity::Warning, "Couldn't prepare attachment".to_string())
             })?;
             attachments[idx] = Some(split);
             taken.push((slot_num, split));
             num_attachments += 1;
         }
 
-        // roll the sender's inventory back if anything below fails
-        let refund = |state: &mut ShardServerState, taken: &[(usize, Item)]| {
-            for (slot_num, item) in taken {
-                let Ok(player) = state.get_player_mut(pc_id) else {
-                    return;
-                };
-                if let Ok(slot) = player.get_item_mut(ItemLocation::Inven, *slot_num) {
-                    let mut item = Some(*item);
-                    log_if_failed(Item::transfer_items(&mut item, slot));
-                }
-            }
-        };
-
         let cost = get_email_cost(taros_attached, num_attachments);
         let player = state.get_player(pc_id)?;
         if player.get_taros() < cost {
-            refund(state, &taken);
             return Err(FFError::build(
                 Severity::Warning,
                 format!("Player {} can't afford the {} taro postage", pc_id, cost),
@@ -453,7 +440,6 @@ pub async fn email_send(
             None => None,
         };
         let Some(recipient) = recipient else {
-            refund(state, &taken);
             return Err(FFError::build(
                 Severity::Warning,
                 format!("Email recipient {} doesn't exist", recipient_uid),
@@ -464,7 +450,6 @@ pub async fn email_send(
         if (taros_attached > 0 || num_attachments > 0)
             && player.get_payzone_flag() != recipient.get_payzone_flag()
         {
-            refund(state, &taken);
             error_code = ERROR_CODE_EMAIL_CROSS_TIME;
             return Err(FFError::build(
                 Severity::Warning,
@@ -485,10 +470,16 @@ pub async fn email_send(
         email.send_time = SystemTime::now();
 
         if let Err(e) = db.send_email(&email).await {
-            refund(state, &taken);
             return Err(e);
         }
 
+        // The shard processes this handler exclusively. All fallible validation and
+        // database writes happened above, so commit the prepared inventory change now.
+        for (slot_num, item) in &taken {
+            let player = state.get_player_mut(pc_id)?;
+            let slot = player.get_item_mut(ItemLocation::Inven, *slot_num)?;
+            Item::split_items(slot, item.quantity).expect("validated attachment source");
+        }
         // charge postage only once the email is safely stored
         let player = state.get_player_mut(pc_id)?;
         let new_taros = player.get_taros() - cost;

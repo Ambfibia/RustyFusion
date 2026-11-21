@@ -21,6 +21,7 @@ use crate::{
 
 pub enum SkillResult {
     Damage(sSkillResult_Damage),
+    Leech(SkillResultLeech),
     DotDamage(sSkillResult_DotDamage),
     HealHP(sSkillResult_Heal_HP),
     HealStamina(sSkillResult_Heal_Stamina),
@@ -32,6 +33,15 @@ pub enum SkillResult {
     Move(sSkillResult_Move),
     Resurrect(sSkillResult_Resurrect),
 }
+
+/// Local OpenFusion's explicit type-30 trailer: heal first, damage second.
+#[repr(C, packed(4))]
+#[derive(Debug, Clone, Copy)]
+pub struct SkillResultLeech {
+    pub heal: sSkillResult_Heal_HP,
+    pub damage: sSkillResult_Damage,
+}
+impl FFPacket for SkillResultLeech {}
 
 #[derive(Debug)]
 pub struct Skill {
@@ -54,12 +64,15 @@ impl Skill {
     pub fn get_buff_id(&self) -> Option<BuffID> {
         let buff_id = match self.skill_type {
             SkillType::Run => BuffID::UpMoveSpeed,
+            SkillType::Swim => BuffID::UpSwimSpeed,
             SkillType::Jump => BuffID::UpJumpHeight,
             SkillType::Stealth => BuffID::UpStealth,
             SkillType::Phoenix => BuffID::Phoenix,
             SkillType::ProtectBattery => BuffID::ProtectBattery,
             SkillType::ProtectInfection => BuffID::ProtectInfection,
             SkillType::Snare => BuffID::DnMoveSpeed,
+            SkillType::WeaponSlow => BuffID::DnAttackSpeed,
+            SkillType::KnockDown => BuffID::KnockDown,
             SkillType::Stun => BuffID::Stun,
             SkillType::Sleep => BuffID::Sleep,
             SkillType::MiniMapEnemy => BuffID::MiniMapEnemy,
@@ -72,6 +85,7 @@ impl Skill {
             SkillType::Invulnerable => BuffID::Invulnerable,
             SkillType::BuffHeal => BuffID::Heal,
             SkillType::NanoStimPak => BuffID::StimPakSlot1,
+            SkillType::ExtraBank => BuffID::ExtraBank,
             _ => return None,
         };
 
@@ -130,7 +144,8 @@ impl Skill {
             self.durations[level]
         };
 
-        let buff = BuffInstance::new(ty, value, sub_value, special_value, duration);
+        let mut buff = BuffInstance::new(ty, value, sub_value, special_value, duration);
+        buff.passive_aura = self.passive;
         Ok(buff)
     }
 }
@@ -199,6 +214,7 @@ pub struct BuffInstance {
     onset: Instant,
     expires: Option<Instant>,
     source: Option<EntityID>,
+    passive_aura: bool,
 }
 /// How often a buff that does something over time (rather than just setting a
 /// condition flag) actually does it.
@@ -222,6 +238,7 @@ impl BuffInstance {
             expires,
             onset: Instant::now(),
             source: None,
+            passive_aura: false,
         }
     }
 
@@ -271,10 +288,6 @@ impl BuffStack {
         self.changed = true;
     }
 
-    fn has_stack(&self, buff_type: BuffType) -> bool {
-        self.buffs.iter().any(|b| b.ty == buff_type)
-    }
-
     fn tick(
         &mut self,
         buff_id: BuffID,
@@ -282,6 +295,11 @@ impl BuffStack {
         updates: &mut Vec<BuffUpdate>,
         effects: &mut Vec<BuffEffect>,
     ) {
+        // Expired stacks cannot proc or continue dominating the effective value
+        // for one extra tick. A surviving weaker source needs a Change packet.
+        let before = self.buffs.len();
+        self.buffs.retain(|buff| !buff.is_expired());
+        self.changed |= before != self.buffs.len();
         if !self.buffs.is_empty() {
             if !self.applied {
                 self.on_stack_apply(buff_id, target);
@@ -306,7 +324,6 @@ impl BuffStack {
 
             self.on_stack_tick(buff_id, target);
             self.tick_effects(buff_id, target, effects);
-            self.buffs.retain(|buff| !buff.is_expired());
         }
 
         if self.buffs.is_empty() {
@@ -346,12 +363,13 @@ impl BuffStack {
     }
 
     fn get_max_value(&self) -> i32 {
-        self.buffs.iter().map(|b| b.value).max().unwrap_or(0)
+        self.buffs.iter().filter(|b| !b.is_expired()).map(|b| b.value).max().unwrap_or(0)
     }
 
     fn get_dominant_type(&self) -> BuffType {
         self.buffs
             .iter()
+            .filter(|b| !b.is_expired())
             .max_by_key(|b| b.value)
             .map(|b| b.ty)
             .unwrap_or(BuffType::Nano)
@@ -466,6 +484,21 @@ impl BuffContainer {
         }
     }
 
+    pub fn sync_group_auras(&mut self, desired: &[(BuffID, BuffInstance, EntityID)]) {
+        for (id, stack) in &mut self.buff_stacks {
+            let before = stack.buffs.len();
+            stack.buffs.retain(|old| !old.passive_aura || desired.iter().any(|(want_id, want, source)|
+                want_id == id && old.source == Some(*source) && old.value == want.value));
+            stack.changed |= before != stack.buffs.len();
+        }
+        for (id, buff, source) in desired {
+            if self.buff_stacks.get(id).is_some_and(|stack| stack.buffs.iter().any(|old|
+                old.passive_aura && old.source == Some(*source) && old.value == buff.value)) { continue; }
+            let mut buff = buff.clone(); buff.passive_aura = true;
+            self.add_buff(*id, buff, Some(*source));
+        }
+    }
+
     pub fn tick(&mut self, target: EntityID, effects: &mut Vec<BuffEffect>) -> Vec<BuffUpdate> {
         let mut updates = Vec::new();
         for (buff_id, buff_stack) in self.buff_stacks.iter_mut() {
@@ -479,8 +512,8 @@ impl BuffContainer {
     pub fn has_buff(&self, buff_id: BuffID, buff_type: Option<BuffType>) -> bool {
         match buff_type {
             Some(buff_type) => self.buff_stacks.get(&buff_id)
-                .is_some_and(|stack| stack.has_stack(buff_type)),
-            None => self.buff_stacks.get(&buff_id).is_some_and(|stack| !stack.buffs.is_empty()),
+                .is_some_and(|stack| stack.buffs.iter().any(|b| b.ty == buff_type && !b.is_expired())),
+            None => self.buff_stacks.get(&buff_id).is_some_and(|stack| stack.buffs.iter().any(|b| !b.is_expired())),
         }
     }
 
@@ -501,6 +534,7 @@ impl BuffContainer {
     pub fn get_buff_value(&self, buff_id: BuffID) -> Option<i32> {
         self.buff_stacks
             .get(&buff_id)
+            .filter(|stack| stack.buffs.iter().any(|b| !b.is_expired()))
             .map(|stack| stack.get_max_value())
     }
 
@@ -518,11 +552,46 @@ impl BuffContainer {
         // OpenFusion's getCompositeCondition().
         let mut flags = 0;
         for (buff_id, buff_stack) in &self.buff_stacks {
-            if !buff_stack.buffs.is_empty() {
+            if buff_stack.buffs.iter().any(|b| !b.is_expired()) {
                 flags |= 1 << (*buff_id as i32 - 1);
             }
         }
         flags
+    }
+}
+
+/// Refresh source-owned group passives before entity ticks. Active casts and
+/// item/egg buffs are not touched. Membership follows OpenFusion group targeting;
+/// cross-instance targets cannot receive the aura.
+pub fn refresh_group_auras(state: &mut ShardServerState) {
+    let ids: Vec<_> = state.entity_map.get_player_ids().collect();
+    let mut desired: HashMap<i32, Vec<(BuffID, BuffInstance, EntityID)>> = HashMap::new();
+    for &caster_id in &ids {
+        let Ok(caster) = state.get_player(caster_id) else { continue; };
+        let Some(nano) = caster.get_active_nano() else { continue; };
+        if nano.get_stamina() <= 0 { continue; }
+        let Some(skill) = nano.get_skill() else { continue; };
+        if !skill.passive { continue; }
+        let Some(buff_id) = skill.get_buff_id() else { continue; };
+        if let Ok(own) = skill.make_buff_instance(BuffType::Nano, caster.get_nano_skill_level()) {
+            desired.entry(caster_id).or_default().push((buff_id, own, EntityID::Player(caster_id)));
+        }
+        if caster.is_dead() || skill.target_type != TargetType::CasterPC { continue; }
+        let Some(group_id) = caster.get_group_id() else { continue; };
+        let Ok(buff) = skill.make_buff_instance(BuffType::GroupNano, caster.get_nano_skill_level()) else { continue; };
+        let Some(group) = state.groups.get(&group_id) else { continue; };
+        for id in group.get_member_ids() {
+            let EntityID::Player(target_id) = *id else { continue; };
+            if target_id == caster_id { continue; }
+            let Ok(target) = state.get_player(target_id) else { continue; };
+            if target.is_dead() || target.instance_id != caster.instance_id { continue; }
+            desired.entry(target_id).or_default().push((buff_id, buff.clone(), EntityID::Player(caster_id)));
+        }
+    }
+    for id in ids {
+        if let Ok(player) = state.get_player_mut(id) {
+            player.sync_group_auras(desired.get(&id).map(Vec::as_slice).unwrap_or(&[]));
+        }
     }
 }
 
@@ -542,6 +611,8 @@ pub struct AttackContext {
     pub power: Option<(i32, i32)>,
     /// Bullet slot and descriptor, when this attack is a projectile detonating.
     pub projectile: Option<(i8, sPCBullet)>,
+    /// The GM-only 0104 ATTACK_CHARs request preserves mixed target namespaces.
+    pub char_targets: bool,
 }
 
 /// Everything a skill handler needs to know about whoever cast it. Snapshotted
@@ -566,7 +637,6 @@ struct SkillCast {
 /// A skill effect that lands back on the caster rather than the target.
 #[derive(Debug)]
 enum CasterEffect {
-    Heal(i32),
     Warp(InstanceID, Position),
 }
 
@@ -605,6 +675,11 @@ pub fn do_basic_attack(
         attack_style: attacker.get_style(),
         charged,
     };
+    // OpenFusion pcAttackChars applies the GM player-versus-player formula
+    // without Nano RPS or the NPC level difficulty term.
+    let pc_vs_player_attack = BasicAttack {
+        power, crit_chance: Some(CRIT_CHANCE), attack_style: None, charged,
+    };
     // OpenFusion Combat::npcAttackPc: a mob hits a player with its table power
     // alone, no weapon boost, no nano-style RPS and no difficulty term. A flat
     // power bonus overwhelms low-level players (level-2 power 198 became 648).
@@ -642,6 +717,8 @@ pub fn do_basic_attack(
             (Some(attack), EntityID::Player(_)) => {
                 handle_basic_attack(attacker_id, target, attack, Some(0))
             }
+            (_, EntityID::Player(_)) if ctx.char_targets =>
+                handle_basic_attack(attacker_id, target, &pc_vs_player_attack, Some(0)),
             _ => handle_basic_attack(attacker_id, target, &basic_attack, None),
         };
         match target_id {
@@ -654,6 +731,24 @@ pub fn do_basic_attack(
     let pc_count = pc_attack_results.len();
     let npc_count = npc_attack_results.len();
     if pc_count == 0 && npc_count == 0 {
+        return Ok(());
+    }
+
+    if ctx.char_targets {
+        let EntityID::Player(pc_id) = attacker_id else { unreachable!() };
+        let count = pc_count + npc_count;
+        let mut response = PacketBuilder::new(P_FE2CL_PC_ATTACK_CHARs_SUCC).with(&sP_FE2CL_PC_ATTACK_CHARs_SUCC {
+            iBatteryW: state.get_player(pc_id)?.get_weapon_boosts() as i32, iTargetCnt: count as i32,
+        });
+        let mut broadcast = PacketBuilder::new(P_FE2CL_PC_ATTACK_CHARs).with(&sP_FE2CL_PC_ATTACK_CHARs {
+            iPC_ID: pc_id, iTargetCnt: count as i32,
+        });
+        for result in pc_attack_results.iter().chain(npc_attack_results.iter()) {
+            response.push(result); broadcast.push(result);
+        }
+        if let Some(client) = attacker_client { client.send_payload(response.build()?); }
+        let broadcast = broadcast.build()?;
+        state.entity_map.for_each_around(attacker_id, |client| client.send_payload(broadcast.clone()));
         return Ok(());
     }
 
@@ -819,13 +914,23 @@ pub fn do_skill(
         ),
     );
 
-    let recall = caster
-        .as_any()
-        .downcast_ref::<crate::entity::Player>()
-        .map(|player| {
-            let pre_warp = player.get_pre_warp();
-            (pre_warp.instance_id, pre_warp.position)
-        });
+    // Unstable Power shares Recall's packed self-move result but picks a landing
+    // inside the caster's current instance instead of consulting a saved beacon.
+    const UNSTABLE_POWER: i16 = 287;
+    let recall = caster.as_any().downcast_ref::<crate::entity::Player>().and_then(|player| {
+        if skill.skill_type == SkillType::Recall &&
+            player.get_active_nano().and_then(|nano| nano.selected_skill) == Some(UNSTABLE_POWER) {
+            let instance = player.get_instance_id();
+            crate::tabledata::tdata_get().unstable_destination(player.get_position(), instance.map_num)
+                .map(|point| (instance,point))
+        } else {
+            player.get_recall_point().map(|p| (p.instance_id,p.position))
+        }
+    });
+
+    if matches!(skill.skill_type, SkillType::Recall | SkillType::RecallGroup) && recall.is_none() {
+        return Err(FFError::build(Severity::Warning, "No registered Recall Point in this instance".into()));
+    }
 
     let skill_cast = SkillCast {
         skill,
@@ -881,11 +986,6 @@ pub fn do_skill(
     // done so we never need two mutable borrows at once
     for effect in caster_effects {
         match effect {
-            CasterEffect::Heal(amount) => {
-                if let Ok(caster) = state.get_combatant_mut(caster_id) {
-                    caster.heal(amount);
-                }
-            }
             CasterEffect::Warp(instance_id, pos) => {
                 if let EntityID::Player(pc_id) = caster_id {
                     if let Ok(player) = state.get_player_mut(pc_id) {
@@ -904,6 +1004,18 @@ pub fn do_skill(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Apply caster healing after releasing the target borrow and serialize
+    // actual capped healing and caster HP for each accepted Leech result.
+    for result in &mut skill_results {
+        if let SkillResult::Leech(leech) = result {
+            if let Ok(caster) = state.get_combatant_mut(caster_id) {
+                let amount = leech.heal.iHealHP;
+                leech.heal.iHealHP = caster.heal(amount);
+                leech.heal.iHP = caster.get_hp();
             }
         }
     }
@@ -1106,7 +1218,7 @@ fn handle_skill_cast(
             // zero damage, but enough to take aggro
             to.take_damage(0, Some(from));
 
-            let blocked = to.has_buff(BuffID::Freedom, None);
+            let blocked = to.has_buff(BuffID::Freedom, None) || to.has_buff(BuffID::Invulnerable, None);
             let mut duration_ms = 0;
             if !blocked {
                 if let Some(buff_id) = cast.skill.get_buff_id() {
@@ -1133,22 +1245,16 @@ fn handle_skill_cast(
             )
         }
 
-        // Drain the target's HP and give a portion back to the caster.
+        // Type 30 has a 36-byte heal+damage trailer, not Damage's 20 bytes.
         SkillType::BloodSucking => {
             let heal = value_a;
-            let damage = heal * 2;
-            let dealt = to.take_damage(damage, Some(from));
-
-            (
-                Some(SkillResult::Damage(sSkillResult_Damage {
-                    eCT: target_ct,
-                    iID: target_id,
-                    bProtected: (dealt <= 0) as i32,
-                    iDamage: dealt,
-                    iHP: to.get_hp(),
-                })),
-                Some(CasterEffect::Heal(heal)),
-            )
+            let dealt = to.take_damage(heal * 2, Some(from));
+            (Some(SkillResult::Leech(SkillResultLeech {
+                heal: sSkillResult_Heal_HP { eCT: cast.caster.char_type as i32,
+                    iID: entity_id_to_raw(from), iHealHP: heal, iHP: 0 },
+                damage: sSkillResult_Damage { eCT: target_ct, iID: target_id,
+                    bProtected: (dealt <= 0) as i32, iDamage: dealt, iHP: to.get_hp() },
+            })), None)
         }
 
         // Battery drain only means anything against players.
@@ -1216,13 +1322,17 @@ fn handle_skill_cast(
         }
 
         SkillType::PhoenixGroup => {
-            // The client performs the actual revive; we just confirm it and
-            // report the HP it should come back with.
+            // A real cast authorizes the later HereByPhoenixGroup request.
+            // The authorization is one-shot and cannot be forged by the client.
+            if !to.is_dead() { return Ok((None, None)); }
+            let authorization = BuffInstance::new(BuffType::GroupNano, 0, None, None,
+                Some(Duration::from_secs(10)));
+            to.apply_buff(BuffID::Phoenix, authorization, Some(from));
             (
                 Some(SkillResult::Resurrect(sSkillResult_Resurrect {
                     eCT: target_ct,
                     iID: target_id,
-                    iRegenHP: to.get_hp(),
+                    iRegenHP: to.get_max_hp() / 2,
                 })),
                 None,
             )
@@ -1260,8 +1370,8 @@ fn handle_skill_cast(
             )
         }
 
-        // Retro rockets are fired by the weapon system, not here.
-        SkillType::RetroRocketSelf => (None, None),
+        // These powers move the caster through the client movement controller.
+        SkillType::RetroRocketSelf | SkillType::Dash => (None, None),
 
         other => {
             // everything else is a plain (de)buff: set the condition flag and
@@ -1390,3 +1500,7 @@ mod damage_tests;
 #[cfg(test)]
 #[path = "skills_cc_tests.rs"]
 mod cc_tests;
+
+#[cfg(test)]
+#[path = "skills_buff_tests.rs"]
+mod buff_tests;

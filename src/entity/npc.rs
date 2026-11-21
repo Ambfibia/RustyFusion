@@ -31,7 +31,14 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct NPC {
     pub id: i32,
+    pub authored_id:Option<i32>,
+    pub private_owner:Option<i32>,
+    pub private_actor:Option<usize>,
     pub ty: i32,
+    pub hidden: bool,
+    pub map_icon: bool,
+    pub interactable: bool,
+    pub scale: f32,
     pub spawn_position: Position,
     /// Leash anchor for the current encounter (OpenFusion Mob::roamX/Y/Z).
     pub combat_origin: Option<Position>,
@@ -68,6 +75,11 @@ pub struct PendingCorruption {
     pub target_pc_id: i32,
 }
 impl NPC {
+    pub fn ordinary_visible(&self,player:&super::Player)->bool{
+        if self.private_owner.is_some_and(|owner|owner!=player.get_player_id()){return false;}
+        if self.private_owner.is_some(){return !self.hidden;}
+        player.npc_visibility.get(&self.authored_id.unwrap_or(self.id)).copied().unwrap_or(!self.hidden)
+    }
     /// The NPC table's `m_iPower`, with no flat bonus. OpenFusion's
     /// `Combat::npcAttackPc` hits players with exactly this value.
     pub fn get_table_power(&self) -> i32 {
@@ -84,7 +96,14 @@ impl NPC {
         let stats = tdata_get().get_npc_stats(ty)?;
         Ok(Self {
             id,
+            authored_id:None,
+            private_owner:None,
+            private_actor:None,
             ty,
+            hidden: false,
+            map_icon: true,
+            interactable: true,
+            scale: 1.,
             spawn_position: position,
             combat_origin: None,
             position,
@@ -243,6 +262,10 @@ impl NPC {
     }
 
     fn can_fight(&self) -> bool {
+        if self.hidden||self.private_owner.is_some() { return false; }
+        if self.mission_escort.as_ref().is_some_and(|escort| escort.fights) {
+            return true;
+        }
         // A route only makes a civilian move; it must not turn an AI-less
         // friendly NPC into a combatant (or a target for nearby mobs).
         // Check table stats first because the AI is taken out during tick.
@@ -298,10 +321,11 @@ impl NPC {
         if crate::escort::tick(state, npc_id) {
             return;
         }
+        if crate::mission_stage::tick_actor(state,npc_id){return;}
 
         // tick AI; we don't tick AI while PCs are interacting with the NPC
         let npc = state.get_npc(npc_id).unwrap(); // re-borrow
-        if npc.ai.is_some() && npc.interacting_pcs.is_empty() {
+        if !npc.hidden && npc.ai.is_some() && npc.interacting_pcs.is_empty() {
             let scripting = scripting_get();
             scripting.lock().tick_npc(npc_id, state);
         }
@@ -373,6 +397,21 @@ impl Entity for NPC {
             NPCAppearanceData: self.get_appearance_data(),
         };
         client.send_packet(P_FE2CL_NPC_ENTER, &pkt);
+        let flags = i32::from(self.hidden) | (i32::from(self.map_icon)<<1) | (i32::from(!self.interactable)<<2);
+        client.send_packet(P_FE2CL_NPC_EDITOR_SETTINGS, &crate::net::packet::NpcEditorSettings {id:self.id,flags,scale:self.scale});
+    }
+
+    fn visible_to(&self, observer: &dyn Entity) -> bool {
+        let Some(player)=observer.as_any().downcast_ref::<super::Player>()else{return !self.hidden&&self.private_owner.is_none();};
+        if self.private_owner.is_some_and(|owner|owner!=player.get_player_id()){return false;}
+        self.ordinary_visible(player)||(!player.user_view&&player.perms<=crate::defines::CN_ACCOUNT_LEVEL__GM as i16&&self.private_owner.is_none())
+    }
+    fn send_enter_for(&self,client:&FFClient,observer:&dyn Entity){
+        self.send_enter(client);
+        if let Some(player)=observer.as_any().downcast_ref::<super::Player>(){
+            let hidden=!self.ordinary_visible(player);
+            if hidden!=self.hidden{let flags=i32::from(hidden)|(i32::from(self.map_icon)<<1)|(i32::from(!self.interactable)<<2);client.send_packet(P_FE2CL_NPC_EDITOR_SETTINGS,&crate::net::packet::NpcEditorSettings{id:self.id,flags,scale:self.scale});}
+        }
     }
 
     fn send_exit(&self, client: &FFClient) {
@@ -553,5 +592,15 @@ impl Combatant for NPC {
         if let Some(path) = &self.authored_path {
             self.path = Some(path.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod hidden_tests {
+    use super::*;
+    #[test]
+    fn hidden_mob_cannot_fight(){
+        crate::tabledata::tdata_init().unwrap();let ty=(1..4000).find(|&id|crate::tabledata::tdata_get().get_npc_stats(id).is_ok_and(|s|s.team==CombatantTeam::Mob)).unwrap();
+        let mut npc=NPC::new(991,ty,crate::Position::default(),0,crate::chunk::InstanceID::default()).unwrap();npc.hidden=true;assert!(!npc.can_fight());
     }
 }

@@ -3,7 +3,7 @@
     Similar to mob AI but:
     - Syncs retreat state with pack leader
     - Bi-directional target sync with leader
-    - Follows leader tightly with speed scaled by distance
+    - Follows leader at walk speed while idle, run speed during retreat
     - Falls back to standard mob behavior if leader is dead/gone
 ]]
 
@@ -64,7 +64,9 @@ return function(npc: Npc)
                         b.chase_target(npc)
                     end
                 else
-                    -- Tight follow: leader position + offset, speed scales with distance
+                    -- Formation slots are exact coordinates, not combat targets.
+                    -- Like OpenFusion roamingStep, use full walking speed: a
+                    -- distance-scaled chase cannot keep up with a walking leader.
                     local leader_pos = leader:position()
                     if leader_pos then
                         local offset = npc:get_pack_offset()
@@ -72,12 +74,10 @@ return function(npc: Npc)
                         local ty = leader_pos.y + offset.y
                         local tz = leader_pos.z + offset.z
                         local dist = npc:distance_to(tx, ty, tz)
-                        local tolerance = npc:attack_range() / 2
-                        if dist > tolerance then
+                        if dist > 0 then
                             local max_speed = if leader_retreating or leader:target()
                                 then npc:run_speed() * 2 else npc:walk_speed()
-                            local speed = math.min(dist, max_speed)
-                            npc:move_to(tx, ty, tz, speed)
+                            npc:move_to_exact(tx, ty, tz, max_speed)
                         end
                     end
                 end

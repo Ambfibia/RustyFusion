@@ -125,7 +125,7 @@ ffenum!(BuffID, i32, 26, {
 });
 
 // eTaskTypeProperty.cs
-ffenum!(TaskType, i32, 7, {
+ffenum!(TaskType, i32, 8, {
     Unknown = 0,
     Talk = 1,
     GotoLocation = 2,
@@ -133,6 +133,7 @@ ffenum!(TaskType, i32, 7, {
     Delivery = 4,
     Defeat = 5,
     EscortDefence = 6,
+    SelfCompleting = 7,
 });
 
 // eMissionTypeProperty.cs
@@ -231,6 +232,7 @@ ffenum!(SkillType, i32, 37, {
     // eST__End
     CorruptionAttackWin = 38,
     CorruptionAttackLose = 39,
+    Dash = 40,
 });
 
 // eSkillTargetType.cs

@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use rand::{rngs::ThreadRng, thread_rng, Rng};
+use rand::{rngs::ThreadRng, seq::IteratorRandom, thread_rng, Rng};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{Map, Value};
 use std::{
@@ -29,6 +29,8 @@ use crate::{
 static TABLE_DATA: OnceLock<TableData> = OnceLock::new();
 
 struct XDTData {
+    egg_catalog: crate::tabledata_contracts::egg_tips::EggTipsCatalog,
+    economy: crate::tabledata_contracts::economy::EconomyCatalog,
     vendor_data: HashMap<i32, VendorData>,
     item_data: HashMap<(i16, ItemType), ItemStats>,
     crocpot_data: HashMap<i16, CrocPotData>,
@@ -45,6 +47,8 @@ impl XDTData {
     fn load() -> Result<Self, String> {
         let root = load_json("xdt.json")?;
         Ok(Self {
+            egg_catalog: crate::tabledata_contracts::egg_tips::EggTipsCatalog::from_server_root(&root)?,
+            economy: crate::economy::load(&root)?,
             vendor_data: load_vendor_data(&root)
                 .map_err(|e| format!("Error loading vendor data: {}", e))?,
             item_data: load_item_data(&root)
@@ -92,6 +96,10 @@ fn validate_nano_skills(nano_data: &NanoData, skill_data: &SkillData) -> Result<
 
 #[derive(Debug)]
 struct NPCSpawnData {
+    hidden: bool,
+    map_icon: Option<bool>,
+    interactable: bool,
+    scale: f32,
     path_id: Option<i32>,
     placement_id: Option<i32>,
     group_id: Option<i32>,
@@ -148,6 +156,8 @@ pub struct WarpData {
     pub min_level: i16,
     pub req_task: Option<(i32, i32)>, // mission id, task id
     pub req_item: Option<(ItemType, i16)>,
+    pub req_item_count: u16,
+    pub req_completed_mission: Option<i32>,
     pub req_item_consumed: Option<(ItemType, i16)>,
     pub cost: u32,
 }
@@ -235,6 +245,7 @@ pub struct NPCStats {
     /// Rock-paper-scissors special attack (`m_iCorruptionType`), if any.
     pub corruption: Option<NpcCorruption>,
     pub eruption: Option<NpcCorruption>,
+    pub active_skill: Option<NpcCorruption>,
 }
 
 /// An NPC's corruption attack: the skill it casts and its
@@ -247,11 +258,15 @@ pub struct NpcCorruption {
 
 #[derive(Debug)]
 struct NPCData {
+    speech:crate::tabledata_contracts::npc_speech::NpcSpeech,
+    ambient:Vec<crate::barker::AmbientBarker>,
     name: String,
     stats: NPCStats,
 }
 
 pub struct EggStats {
+    pub nano_potions: u32,
+    pub weapon_boosts: u32,
     pub crate_id: Option<i16>,
     pub effect_id: Option<i32>,
     pub effect_duration: Duration,
@@ -336,7 +351,16 @@ struct EggData {
     eggs: Vec<EggSpawnData>,
 }
 
+#[derive(Deserialize)]
+struct NanoCapsule {
+    #[serde(rename = "CrateID")]
+    crate_id: i16,
+    #[serde(rename = "Nano")]
+    nano_id: i16,
+}
+
 struct DropData {
+    nano_capsules: HashMap<i16, i16>,
     code_items: HashMap<String, Vec<i32>>,
     race_data: HashMap<i32, RaceData>,
     crate_drop_chances: HashMap<i32, CrateDropChance>,
@@ -360,6 +384,7 @@ struct PathData {
 }
 
 pub struct TableData {
+    unstable_landings: HashMap<u32, Vec<Position>>,
     xdt_data: XDTData,
     world_name_data: WorldNameDataContainer,
     npcs: Vec<NPCSpawnData>,
@@ -368,6 +393,12 @@ pub struct TableData {
     egg_data: EggData,
 }
 impl TableData {
+    pub fn economy_loot(&self,category:crate::tabledata_contracts::economy::LootCategory,id:i32,player:&crate::entity::Player)->FFResult<Option<Vec<Item>>>{
+        crate::economy::draw(&self.xdt_data.economy,category,id,player)
+    }
+    pub fn economy_race_loot(&self,id:i32,rank:u8,player:&crate::entity::Player)->FFResult<Option<Vec<Item>>>{
+        crate::economy::draw_rank(&self.xdt_data.economy,crate::tabledata_contracts::economy::LootCategory::Race,id,player,Some(rank))
+    }
     pub fn code_rewards(&self, code: &str) -> FFResult<Option<Vec<Item>>> {
         let Some(refs) = self.drop_data.code_items.get(code) else { return Ok(None); };
         let mut items = Vec::new();
@@ -386,7 +417,14 @@ impl TableData {
     }
 
     fn load() -> Result<Self, String> {
-        let data=Self {
+        let file = std::path::Path::new(&config_get().general.table_data_path.get())
+            .join("unstable_landings.json");
+        let unstable_landings = if file.is_file() {
+            let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}",file.display()))?;
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}",file.display()))?
+        } else { HashMap::new() };
+        let mut data=Self {
+            unstable_landings,
             xdt_data: XDTData::load().map_err(|e| format!("Error loading XDT: {}", e))?,
             world_name_data: load_world_name_data()
                 .map_err(|e| format!("Error loading world name data: {}", e))?,
@@ -395,9 +433,42 @@ impl TableData {
             path_data: load_path_data().map_err(|e| format!("Error loading path data: {}", e))?,
             egg_data: load_egg_data().map_err(|e| format!("Error loading egg data: {}", e))?,
         };
+        for egg in &data.xdt_data.egg_catalog.eggs {
+            if egg.effect_id != 0 && data.get_skill(egg.effect_id as i16).is_err() { return Err(format!("Egg {} has unknown effect {}", egg.id, egg.effect_id)); }
+            if egg.drop_crate_id != 0 && !data.xdt_data.item_data.contains_key(&(egg.drop_crate_id, ItemType::Chest)) { return Err(format!("Egg {} has unknown crate {}", egg.id, egg.drop_crate_id)); }
+            data.egg_data.egg_stats.insert(egg.id, EggStats {
+                crate_id: (egg.drop_crate_id != 0).then_some(egg.drop_crate_id),
+                effect_id: (egg.effect_id != 0).then_some(egg.effect_id),
+                effect_duration: Duration::from_secs(u64::from(egg.duration)),
+                respawn_time: Duration::from_secs(u64::from(egg.regen)),
+                nano_potions: egg.nano_potions, weapon_boosts: egg.weapon_boosts,
+            });
+        }
         for npc in &data.npcs {
             if let Some(id)=npc.path_id {
                 if !data.path_data.npc_routes.contains_key(&id){return Err(format!("NPC type {} references missing path ID {id}",npc.npc_type));}
+            }
+        }
+        crate::economy::validate_items(&data.xdt_data.economy,|id,ty|data.xdt_data.item_data.contains_key(&(id,ty)))?;
+        for task in data.xdt_data.mission_data.task_definitions.values() {
+            for completion in &task.stage.completions{
+                if !data.xdt_data.npc_data.contains_key(&completion.npc){return Err(format!("Task {} references unknown completion NPC {}",task.task_id,completion.npc));}
+                if completion.next_task>0{
+                    let next=data.xdt_data.mission_data.task_definitions.get(&completion.next_task).ok_or_else(||format!("Task {} references unknown next stage {}",task.task_id,completion.next_task))?;
+                    if next.mission_id!=task.mission_id{return Err(format!("Task {} has a completion branch in another mission",task.task_id));}
+                }
+            }
+            for route in task.stage.before.iter().chain(&task.stage.after){
+                let id=route.route.parse::<i32>().map_err(|_|format!("Task {} has an invalid route ID",task.task_id))?;
+                if !data.path_data.npc_routes.contains_key(&id)||!data.npcs.iter().any(|npc|npc.placement_id.and_then(|id|id.checked_add(1))==Some(route.npc_id)){return Err(format!("Task {} references a missing NPC placement or route",task.task_id));}
+                if route.replacement_npc>0&&!data.xdt_data.npc_data.contains_key(&route.replacement_npc){return Err(format!("Task {} references a missing replacement NPC",task.task_id));}
+            }
+            for rule in &task.stage.visibility{if rule.npc_ids.iter().any(|id|!data.npcs.iter().any(|npc|npc.placement_id.and_then(|id|id.checked_add(1))==Some(*id))){return Err(format!("Task {} references a missing visibility NPC placement",task.task_id));}}
+            for item in task.inventory.items().chain(task.stage.completions.iter().flat_map(|c|c.conditions.inventory.items())).chain(task.stage.visibility.iter().flat_map(|v|v.conditions.inventory.items())) {
+                let ty = ItemType::try_from(item.item_type).map_err(|e|format!("Task {}: {e}",task.task_id))?;
+                if !data.xdt_data.item_data.contains_key(&(item.item_id,ty)) {
+                    return Err(format!("Task {} references unknown inventory item {}:{}",task.task_id,item.item_type,item.item_id));
+                }
             }
         }
         Ok(data)
@@ -561,7 +632,7 @@ impl TableData {
     ) -> Vec<NPC> {
         let dat = spawn_data;
         let mut npcs = Vec::new();
-        let npc = match NPC::new(
+        let mut npc = match NPC::new(
             entity_map.gen_next_npc_id(),
             dat.npc_type,
             Position {
@@ -586,6 +657,12 @@ impl TableData {
             }
         };
 
+        npc.hidden=dat.hidden;
+        npc.authored_id=dat.placement_id.and_then(|id|id.checked_add(1));
+        npc.map_icon=dat.map_icon.unwrap_or(true);
+        npc.interactable=dat.interactable;
+        npc.scale=dat.scale;
+
         for follower_data in &dat.followers {
             let id = entity_map.gen_next_npc_id();
             let mut follower = match NPC::new(
@@ -609,6 +686,10 @@ impl TableData {
                 }
             };
 
+            follower.hidden=dat.hidden;
+            follower.map_icon=npc.map_icon;
+            follower.interactable=npc.interactable;
+            follower.scale=dat.scale;
             follower.tight_follow = Some((EntityID::NPC(npc.id), follower_data.offset));
             npcs.push(follower);
         }
@@ -681,6 +762,10 @@ impl TableData {
             eggs.push(egg);
         }
         eggs
+    }
+
+    pub fn nano_capsule(&self, crate_id: i16) -> Option<i16> {
+        self.drop_data.nano_capsules.get(&crate_id).copied()
     }
 
     pub fn get_item_from_crate(&self, crate_id: i16, gender: i32) -> FFResult<Item> {
@@ -885,6 +970,7 @@ impl TableData {
     pub fn get_npc_path(&self, npc_type: i32) -> Option<Path> {
         self.path_data.npc_paths.get(&npc_type).cloned()
     }
+    pub fn get_authored_npc_route(&self,id:i32)->Option<Path>{self.path_data.npc_routes.get(&id).map(Path::once)}
 
     pub fn get_slider_path(&self) -> Path {
         self.path_data.slider_path.clone()
@@ -945,6 +1031,10 @@ impl TableData {
             ))
     }
 
+    pub fn get_npc_ambient(&self,npc_type:i32)->FFResult<&[crate::barker::AmbientBarker]>{
+        self.xdt_data.npc_data.get(&npc_type).map(|npc|npc.ambient.as_slice()).ok_or_else(||FFError::build(Severity::Warning,format!("Unknown NPC type {npc_type}")))
+    }
+    pub fn get_npc_speech(&self,npc_type:i32)->Option<&crate::tabledata_contracts::npc_speech::NpcSpeech>{self.xdt_data.npc_data.get(&npc_type).map(|npc|&npc.speech)}
     pub fn get_npc_stats(&self, npc_type: i32) -> FFResult<&NPCStats> {
         self.xdt_data
             .npc_data
@@ -966,6 +1056,14 @@ impl TableData {
                 Severity::Warning,
                 format!("Reward with id {} doesn't exist", reward_id),
             ))
+    }
+
+    /// Some portal and respawn coordinates are in midair or above poison.
+    /// Only destinations checked against the map's actual collision are valid.
+    pub fn unstable_destination(&self, current: Position, map: u32) -> Option<Position> {
+        self.unstable_landings.get(&map)?.iter().copied()
+            .filter(|point| *point != Position::default() && point.distance_to(&current) >= 150)
+            .choose(&mut thread_rng())
     }
 
     pub fn get_nearest_respawn_point(&self, pos: Position, map_num: u32) -> Option<Position> {
@@ -1100,6 +1198,9 @@ fn load_item_data(
             m_iBatteryDrain: Option<i32>,
             m_iMinReqLev: Option<i32>,
             m_iMentor: Option<i32>,
+            m_iItemType: Option<i32>,
+            m_iLinkSkill: Option<i32>,
+            m_iStimPackAttri: Option<i32>,
             m_iAtkRange: Option<i32>,
             m_iAtkAngle: Option<i32>,
             m_iAtkRate: Option<i32>,
@@ -1156,7 +1257,16 @@ fn load_item_data(
         let item_table = get_object(root, table_key)?;
         let item_data = get_array(item_table, ITEM_TABLE_ITEM_DATA_KEY)?;
         for i in item_data {
-            let data: ItemDataEntry = serde_json::from_value(i.clone())
+            let mut row = i.clone();
+            // Ordinary copies of quest-table items use real inventory slots.
+            // Abstract mission quest counters continue through the separate qitem path.
+            if item_type == ItemType::Quest {
+                let fields = row.as_object_mut().ok_or("Invalid quest item row")?;
+                for (key,value) in [("m_iTradeAble",0),("m_iItemPrice",0),("m_iItemSellPrice",0),("m_iSellAble",0),("m_iStackNumber",99)] {
+                    fields.entry(key).or_insert(value.into());
+                }
+            }
+            let data: ItemDataEntry = serde_json::from_value(row)
                 .map_err(|e| format!("Malformed item data entry ({:?}): {} {}", item_type, e, i))?;
             let key = (data.m_iItemNumber as i16, item_type);
             let data = ItemStats {
@@ -1167,6 +1277,9 @@ fn load_item_data(
                 max_stack_size: data.m_iStackNumber as u16,
                 required_level: data.m_iMinReqLev.unwrap_or(0) as i16,
                 mentor: data.m_iMentor.map(|mentor| mentor as i16),
+                general_kind: data.m_iItemType,
+                linked_skill: data.m_iLinkSkill.filter(|id| *id > 0).map(|id| i16::try_from(id)).transpose().map_err(|_| "Linked general skill exceeds i16")?,
+                stimpack_attribute: data.m_iStimPackAttri,
                 rarity: data.m_iRarity.map(|v| v as i8),
                 gender: data.m_iReqSex.map(|v| v as i8),
                 single_power: data.m_iPointRat,
@@ -1175,7 +1288,12 @@ fn load_item_data(
                     Some(v) => Some(v.try_into().map_err(|e: FFError| e.get_msg().to_string())?),
                     None => None,
                 },
-                projectile_time: data.m_iDeliverTime.map(|v| Duration::from_millis(v as u64)),
+                // Native cnWarHead::InitInfo uses DurationTime in tenths of a second.
+                projectile_time: data.m_iDurationTime.map(|v| Duration::from_millis(v.max(0) as u64 * 100)),
+                attack_range: data.m_iAtkRange.unwrap_or(0).max(0) as u32,
+                effect_area: data.m_iEffectArea.unwrap_or(0).max(0) as u32,
+                target_count: data.m_iTargetNumber.unwrap_or(1).max(1) as usize,
+                attack_delay: Duration::from_millis(data.m_iDelayTime.unwrap_or(10).max(1) as u64 * 100),
                 defense: data.m_iDefenseRat,
                 speed: data.m_iUp_runSpeed,
             };
@@ -1195,6 +1313,7 @@ fn load_item_data(
     load_item_data_for_type(root, &mut map, ItemType::Vehicle)?;
     load_item_data_for_type(root, &mut map, ItemType::General)?;
     load_item_data_for_type(root, &mut map, ItemType::Chest)?;
+    if root.contains_key("m_pQuestItemTable") { load_item_data_for_type(root, &mut map, ItemType::Quest)?; }
     Ok(map)
 }
 
@@ -1220,6 +1339,7 @@ fn load_vendor_data(root: &Map<String, Value>) -> Result<HashMap<i32, VendorData
             .map_err(|e| format!("Malformed vendor data entry: {} {}", e, v))?;
         let key = vendor_data_entry.m_iNpcNumber;
         let vendor_data_entry = VendorItem {
+            native: None,
             sort_number: vendor_data_entry.m_iSortNumber,
             ty: vendor_data_entry
                 .m_iItemType
@@ -1232,6 +1352,13 @@ fn load_vendor_data(root: &Map<String, Value>) -> Result<HashMap<i32, VendorData
             .entry(key)
             .or_insert_with(|| VendorData::new(key))
             .insert(vendor_data_entry);
+    }
+    for listing in crate::economy::load(root)?.vendors {
+        let mut vendor=VendorData::new(listing.id);
+        for (sort,rule) in listing.items.into_iter().enumerate(){
+            vendor.insert(VendorItem {sort_number:sort as i32,ty:rule.item_type.try_into().map_err(|e:FFError|e.get_msg().to_owned())?,id:rule.item_id,native:Some(rule)});
+        }
+        vendor_data.insert(listing.id,vendor);
     }
     // Early-world guide shops have no 0104 VendorTable rows. Their paired
     // later-world shops carry the same guide-specific catalog; preserve the
@@ -1392,6 +1519,10 @@ fn load_instance_data(root: &Map<String, Value>) -> Result<InstanceData, String>
             m_iToZ: i32,
             m_iLimit_Level: i32,
             m_iLimit_TaskID: i32,
+            #[serde(default)]
+            m_iLimit_ItemCount: u16,
+            #[serde(default)]
+            m_iLimit_CompletedMissionID: i32,
             m_iMissionID: i32,
             m_iLimit_ItemType: i32,
             m_iLimit_ItemID: i32,
@@ -1405,6 +1536,9 @@ fn load_instance_data(root: &Map<String, Value>) -> Result<InstanceData, String>
         for v in data {
             let warp_data_entry: WarpDataEntry = serde_json::from_value(v.clone())
                 .map_err(|e| format!("Malformed warp data entry: {} {}", e, v))?;
+            if !(0..=2048).contains(&warp_data_entry.m_iLimit_CompletedMissionID) {
+                return Err("Completed warp mission ID is out of range".into());
+            }
             let key = warp_data_entry.m_iWarpNumber;
             let data_entry = WarpData {
                 pos: Position {
@@ -1417,7 +1551,9 @@ fn load_instance_data(root: &Map<String, Value>) -> Result<InstanceData, String>
                 is_group_warp: warp_data_entry.m_iWarpGroupType != 0,
                 map_num: warp_data_entry.m_iToMapNum as u32,
                 min_level: warp_data_entry.m_iLimit_Level as i16,
-                req_task: if warp_data_entry.m_iMissionID == 0 {
+                req_item_count: warp_data_entry.m_iLimit_ItemCount,
+                req_completed_mission: (warp_data_entry.m_iLimit_CompletedMissionID != 0).then_some(warp_data_entry.m_iLimit_CompletedMissionID),
+                req_task: if warp_data_entry.m_iLimit_TaskID == 0 {
                     None
                 } else {
                     Some((
@@ -1737,6 +1873,7 @@ fn load_mission_data(root: &Map<String, Value>) -> Result<MissionData, String> {
         m_iCSTReqGuide: i16,
         m_iCSUDEFNPCID: i32,
         m_iCSUCheckTimer: u64,
+        m_iSTGrantTimer: u64,
         m_iHTerminatorNPCID: i32,
         m_iRequireInstanceID: u32,
         m_iCSUItemID: [i16; MAX_NEED_SORT_OF_ITEM as usize],
@@ -1802,6 +1939,8 @@ fn load_mission_data(root: &Map<String, Value>) -> Result<MissionData, String> {
 
         // create task definition
         let task_def = TaskDefinition {
+            stage:crate::tabledata_contracts::mission_stage::MissionStage::from_row(v)?,
+            inventory:crate::tabledata_contracts::mission_inventory::MissionInventory::from_row(v)?,
             task_id,
             mission_id,
             task_type: entry
@@ -1840,7 +1979,10 @@ fn load_mission_data(root: &Map<String, Value>) -> Result<MissionData, String> {
                 0 => None,
                 x => Some(x.try_into().map_err(|e: FFError| e.get_msg().to_string())?),
             },
-            obj_time_limit: match entry.m_iCSUCheckTimer {
+            // Four original defeat stages grant a client timer without a
+            // CSU timer. OpenFusion's expiry path uses STGrantTimer; the
+            // authoritative server must still enforce those failure edges.
+            obj_time_limit: match if entry.m_iCSUCheckTimer > 0 { entry.m_iCSUCheckTimer } else { entry.m_iSTGrantTimer } {
                 0 => None,
                 x => Some(Duration::from_secs(x)),
             },
@@ -1848,6 +1990,7 @@ fn load_mission_data(root: &Map<String, Value>) -> Result<MissionData, String> {
                 0 => None,
                 x => Some(x),
             },
+            required_bark:{let requirement:crate::barker::RequiredBark=serde_json::from_value(v.clone()).map_err(|e|e.to_string())?;requirement.validate()?;requirement},
             prereq_map_num: match entry.m_iRequireInstanceID {
                 0 => None,
                 x => Some(x),
@@ -1856,6 +1999,7 @@ fn load_mission_data(root: &Map<String, Value>) -> Result<MissionData, String> {
                 0 => None,
                 x => Some(x),
             },
+            escort_fights: v.get("m_iCSUDEFNPCAI").and_then(Value::as_i64) == Some(6),
             escort_follows_player: entry.m_iCSUDEFNPCID > 0
                 && (v.get("m_iCSUDEPNPCFollow").and_then(Value::as_i64).unwrap_or(0) != 0
                     || (entry.m_iHTaskType == 6 && entry.m_iHTerminatorNPCID > 0)),
@@ -2105,6 +2249,10 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
         m_iAiType: u8,
         m_iBarkerType: usize,
         #[serde(default)]
+        m_iActiveSkill1: i16,
+        #[serde(default)]
+        m_iActiveSkill1Prob: i32,
+        #[serde(default)]
         m_iCorruptionType: i16,
         #[serde(default)]
         m_iCorruptionTypeProb: i32,
@@ -2156,6 +2304,9 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
                 0 => None,
                 x => Some(x),
             },
+            active_skill: (entry.m_iActiveSkill1 > 0 && entry.m_iActiveSkill1Prob > 0).then_some(NpcCorruption {
+                skill_id: entry.m_iActiveSkill1, prob: entry.m_iActiveSkill1Prob,
+            }),
             corruption: (entry.m_iCorruptionType > 0 && entry.m_iCorruptionTypeProb > 0).then_some(
                 NpcCorruption {
                     skill_id: entry.m_iCorruptionType,
@@ -2175,7 +2326,17 @@ fn load_npc_data(root: &Map<String, Value>) -> Result<HashMap<i32, NPCData>, Str
         let npc_string_entry: NPCStringsEntry = serde_json::from_value(npc_strings.clone())
             .map_err(|e| format!("Malformed NPC string entry: {} {}", e, npc_strings))?;
 
-        let npc_data = NPCData {
+        let mut ids=Vec::new();
+        if let Some(id)=v["m_iBarkerNumber"].as_i64().filter(|id|*id>0){ids.push(id);}
+        if let Some(values)=v.get("_ffoneBarkerSets") {for value in values.as_array().ok_or("Barker sets must be a list")? {let id=value.as_i64().filter(|id|*id>0&&*id<=i64::from(i32::MAX/4)).ok_or("Invalid barker set ID")?;if !ids.contains(&id){ids.push(id);}}}
+        let mut ambient=Vec::new();
+        for id in ids {
+            let row=table.get("m_pNpcBarkerData").and_then(Value::as_array).and_then(|rows|rows.get(id as usize)).ok_or_else(||format!("NPC {key} references missing barker set {id}"))?;
+            let conditions:crate::barker::BarkerConditions=serde_json::from_value(row.clone()).map_err(|e|e.to_string())?;conditions.validate()?;
+            let lines=["m_strName","m_strComment","m_strComment1","m_strComment2"].map(|field|row[field].as_str().unwrap_or_default().to_owned());
+            ambient.push(crate::barker::AmbientBarker {set:id as i32,lines,conditions});
+        }
+        let npc_data = NPCData {ambient,speech:crate::tabledata_contracts::npc_speech::NpcSpeech::from_row(v)?,
             stats: npc_stats,
             name: npc_string_entry.m_strName,
         };
@@ -2205,6 +2366,9 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
     const MOB_TABLE_KEY: &str = "mobs";
     const MOB_GROUP_TABLE_KEY: &str = "groups";
 
+    fn unit_scale() -> f32 {1.}
+    fn default_interactable() -> bool {true}
+
     fn load_npc_table(
         table: &Map<String, Value>,
         is_group: bool,
@@ -2221,6 +2385,13 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
 
         #[derive(Deserialize)]
         struct NPCSpawnDataEntry {
+            #[serde(default)]
+            bHidden: bool,
+            bMapIcon: Option<bool>,
+            #[serde(default = "default_interactable")]
+            bInteractable: bool,
+            #[serde(default = "unit_scale")]
+            fScale: f32,
             iPathID: Option<i32>,
             aFollowers: Option<Vec<FollowerDataEntry>>,
             #[serde(deserialize_with = "deserialize_spawn_integer")]
@@ -2240,7 +2411,12 @@ fn load_npcs() -> Result<Vec<NPCSpawnData>, String> {
             let npc_data_entry: NPCSpawnDataEntry = serde_json::from_value(v.clone())
                 .map_err(|e| format!("Malformed NPC data entry: {}", e))?;
             let key: i32 = k.parse().map_err(|e| format!("Malformed NPC key: {}", e))?;
+            if !npc_data_entry.fScale.is_finite() || !(0.01..=100.).contains(&npc_data_entry.fScale) {return Err(format!("Invalid NPC scale at {key}"));}
             let npc_data_entry = NPCSpawnData {
+                hidden: npc_data_entry.bHidden,
+                map_icon: npc_data_entry.bMapIcon,
+                interactable: npc_data_entry.bInteractable,
+                scale: npc_data_entry.fScale,
                 path_id: npc_data_entry.iPathID,
                 placement_id: has_placement_ids.then_some(key),
                 group_id: if is_group { Some(key) } else { None },
@@ -2357,6 +2533,17 @@ fn load_drop_data() -> Result<DropData, String> {
     }
 
     let drop_root = load_json("drops.json")?;
+    let capsules: Vec<NanoCapsule> = drop_root.get("NanoCapsules").cloned()
+        .map(serde_json::from_value).transpose()
+        .map_err(|e| format!("Malformed NanoCapsules table: {e}"))?.unwrap_or_default();
+    let mut nano_capsules = HashMap::new();
+    for capsule in capsules {
+        if capsule.crate_id <= 0 || capsule.nano_id <= 0 ||
+            nano_capsules.insert(capsule.crate_id, capsule.nano_id).is_some() {
+            return Err(format!("Invalid or duplicate Nano capsule {}", capsule.crate_id));
+        }
+    }
+
 
     let crate_drop_chances_table = get_object(&drop_root, CRATE_DROP_CHANCES_TABLE_KEY)?;
     let crate_drop_types_table = get_object(&drop_root, CRATE_DROP_TYPES_TABLE_KEY)?;
@@ -2379,6 +2566,7 @@ fn load_drop_data() -> Result<DropData, String> {
     }
 
     Ok(DropData {
+        nano_capsules,
         code_items: load_code_items(&drop_root, item_references_table)?,
         race_data,
         crate_drop_chances: load_drop_table(crate_drop_chances_table, CRATE_DROP_CHANCES_ID_KEY)?,
@@ -2417,6 +2605,8 @@ fn load_egg_data() -> Result<EggData, String> {
                 .map_err(|e| format!("Malformed egg stats entry: {} {}", e, v))?;
             let key = egg_stats_entry.Id;
             let egg_stats_entry = EggStats {
+                nano_potions: 0,
+                weapon_boosts: 0,
                 crate_id: match egg_stats_entry.DropCrateId {
                     0 => None,
                     x => Some(x),
@@ -2696,6 +2886,50 @@ fn load_world_name_data() -> Result<WorldNameDataContainer, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unstable_nano_randomly_warps_again_on_every_enterable_map() {
+        let tables = tdata_init().unwrap();
+        let mut entrances = std::collections::BTreeMap::new();
+        for (id, warp) in &tables.xdt_data.instance_data.warp_data {
+            if *id > 0 && warp.pos != Position::default() {
+                entrances.entry(warp.map_num).or_insert(warp.pos);
+            }
+        }
+        let mut problems = Vec::new();
+        for (&map, &entrance) in &entrances {
+            let mut current = entrance;
+            for cast in 1..=8 {
+                let Some(next) = tables.unstable_destination(current, map) else {
+                    problems.push((map, cast, current));
+                    break;
+                };
+                assert!(next.distance_to(&current) >= 150);
+                current = next;
+            }
+        }
+        println!("{} eligible maps, 8 consecutive casts per map", entrances.len());
+        assert!(problems.is_empty(), "No successive safe destination: {problems:?}");
+    }
+
+    #[test]
+    fn warp_conditions_load_legacy_defaults_and_validate_authored_limits() {
+        let mut root=serde_json::json!({"m_pInstanceTable":{"m_pInstanceData":[],"m_pWarpData":[{
+            "m_iWarpNumber":1,"m_iWarpGroupType":0,"m_iNpcNumber":10,"m_iIsInstance":1,"m_iToMapNum":3,
+            "m_iToX":1,"m_iToY":2,"m_iToZ":3,"m_iLimit_Level":0,"m_iLimit_TaskID":0,"m_iMissionID":0,
+            "m_iLimit_ItemType":7,"m_iLimit_ItemID":1,"m_iLimit_UseItemType":0,"m_iLimit_UseItemID":0,"m_iCost":0
+        }]}});
+        let load=|root:&Value|load_instance_data(root.as_object().unwrap());
+        let legacy=load(&root).unwrap();let warp=&legacy.warp_data[&1];
+        assert_eq!(warp.req_item_count,0);assert_eq!(warp.req_completed_mission,None);assert_eq!(warp.req_task,None);
+        let row=&mut root["m_pInstanceTable"]["m_pWarpData"][0];
+        row["m_iLimit_ItemCount"]=Value::from(3);row["m_iLimit_CompletedMissionID"]=Value::from(8);
+        row["m_iLimit_TaskID"]=Value::from(77);row["m_iMissionID"]=Value::from(7);
+        let authored=load(&root).unwrap();let warp=&authored.warp_data[&1];
+        assert_eq!(warp.req_item_count,3);assert_eq!(warp.req_completed_mission,Some(8));assert_eq!(warp.req_task,Some((7,77)));
+        for count in [-1,65536] {let mut bad=root.clone();bad["m_pInstanceTable"]["m_pWarpData"][0]["m_iLimit_ItemCount"]=Value::from(count);assert!(load(&bad).is_err());}
+        for mission in [-1,2049] {let mut bad=root.clone();bad["m_pInstanceTable"]["m_pWarpData"][0]["m_iLimit_CompletedMissionID"]=Value::from(mission);assert!(load(&bad).is_err());}
+    }
 
     #[test]
     fn bundled_tabledata_loads_academy_soulo_shell() {
@@ -2980,6 +3214,22 @@ mod tests {
         assert!(conflict.err().unwrap().contains("Conflicting definitions for skill 13"));
     }
 
+    #[test]
+    fn academy_incubator_nanos_use_unstable_tunes_and_defined_skills() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tabledata/xdt.json");
+        let root: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let root = root.as_object().unwrap();
+        let nanos = load_nano_data(root).unwrap();
+        let skills = load_skill_data(root).unwrap();
+        validate_nano_skills(&nanos, &skills).unwrap();
+        let unstable = &nanos.nano_stats[&39];
+        for id in [67, 68] {
+            assert_ne!(nanos.nano_stats[&id].tunes, unstable.tunes);
+            assert_eq!(nanos.nano_stats[&id].tunes, [288, 289, 290]);
+            assert_eq!(nanos.nano_stats[&id].skills, [122; 3]);
+        }
+    }
+
     /// Accepted native identities (FusionForge accepted-native-identities.json
     /// and the 20260913/20260915 Nano publications) as served by the bundled
     /// tabledata. Server-side definitions only; services and placements are
@@ -2993,32 +3243,30 @@ mod tests {
             tdata.get_npc_stats(ty).unwrap();
         }
         assert_eq!(tdata.get_npc_stats(3470).unwrap().service_category, 28);
-        assert_eq!(tdata.get_npc_name(3470).unwrap(), "Уборщик Джонни");
+        assert_eq!(tdata.get_npc_name(3470).unwrap(), "Sweeper Johnny");
         // pre-existing identities keep their numbers
         assert_eq!(tdata.get_npc_name(3463).unwrap(), "Otto");
-        let e = tdata.get_npc_stats(3490).err().unwrap();
-        assert_eq!(e.get_msg(), "NPC stats for type 3490 don't exist");
+        // Later accepted NPC publications use 3490; it is no longer an unknown ID.
+        let e = tdata.get_npc_stats(i32::MAX).err().unwrap();
+        assert_eq!(e.get_msg(), "NPC stats for type 2147483647 don't exist");
 
-        // Unstable Nano 41: tunes 288-290, all granting skill 122
-        let unstable = tdata.get_nano_stats(41).unwrap();
-        assert_eq!(unstable.tunes, [288, 289, 290]);
-        assert_eq!(unstable.skills, [122; 3]);
-        tdata.get_skill(122).unwrap();
-        // Coop keeps its powers under 67; Ben/Ghostfreak/Upgrade share 285-287
-        assert_eq!(tdata.get_nano_stats(67).unwrap().tunes, [210, 211, 212]);
-        for id in 68..=70 {
+        // Progression and optional ownership numbers are independent of mesh, tune and skill IDs.
+        let unstable = tdata.get_nano_stats(39).unwrap();
+        assert_eq!(unstable.tunes, [291, 292, 293]);
+        assert_eq!(unstable.skills, [287; 3]);
+        tdata.get_skill(287).unwrap();
+        assert_eq!(tdata.get_nano_stats(63).unwrap().tunes, [210, 211, 212]); // Coop
+        for id in 64..=66 {
             assert_eq!(tdata.get_nano_stats(id).unwrap().tunes, [285, 286, 287]);
         }
-        // Flapjack/Johnny Bravo active; Johnny Bravo tunes 201-203 reuse skills 13/4/22
-        tdata.get_nano_stats(37).unwrap();
-        assert_eq!(tdata.get_nano_stats(38).unwrap().skills, [13, 4, 22]);
-        // retired alias 52 is an empty slot, Van Kleiss 66 survives
-        assert!(tdata.get_nano_stats(52).is_err());
-        tdata.get_nano_stats(66).unwrap();
-        assert_eq!(tdata.get_nano_book_size(), 71);
+        tdata.get_nano_stats(41).unwrap(); // Flapjack
+        assert_eq!(tdata.get_nano_stats(42).unwrap().skills, [13, 4, 22]); // Johnny Bravo
+        tdata.get_nano_stats(62).unwrap(); // Van Kleiss
+        for id in 1..=68 { tdata.get_nano_stats(id).unwrap(); }
+        assert_eq!(tdata.get_nano_book_size(), 69);
 
         // tune numbers are unique, so rows past 110 no longer collapse onto tune 1
-        for tune in 111..=290 {
+        for tune in 111..=293 {
             tdata.get_nano_tuning(tune).unwrap();
         }
         assert_eq!(tdata.get_nano_tuning(1).unwrap().skill_id, 1);

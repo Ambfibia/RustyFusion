@@ -7,7 +7,7 @@ use crate::{
     defines::*,
     entity::RewardData,
     enums::{ItemType, RewardCategory, RewardType, WeaponTargetMode},
-    error::{FFError, FFResult},
+    error::{FFError, FFResult, Severity},
     net::packet::*,
     tabledata::tdata_get,
     util,
@@ -163,6 +163,9 @@ pub struct ItemStats {
     pub max_stack_size: u16,
     pub required_level: i16,
     pub mentor: Option<i16>,
+    pub general_kind: Option<i32>,
+    pub linked_skill: Option<i16>,
+    pub stimpack_attribute: Option<i32>,
     pub rarity: Option<i8>,
     pub gender: Option<i8>,
     pub single_power: Option<i32>,
@@ -172,6 +175,10 @@ pub struct ItemStats {
     pub target_mode: Option<WeaponTargetMode>,
     /// How long a projectile from this weapon stays in the air.
     pub projectile_time: Option<Duration>,
+    pub attack_range: u32,
+    pub effect_area: u32,
+    pub target_count: usize,
+    pub attack_delay: Duration,
     pub defense: Option<i32>,
     pub speed: Option<i32>,
 }
@@ -181,6 +188,7 @@ pub struct VendorItem {
     pub sort_number: i32,
     pub ty: ItemType,
     pub id: i16,
+    pub native: Option<crate::tabledata_contracts::economy::EconomyItem>,
 }
 
 pub struct VendorData {
@@ -207,13 +215,16 @@ impl VendorData {
     }
 
     pub fn as_arr(&self) -> FFResult<[sItemVendor; SIZEOF_VENDOR_TABLE_SLOT as usize]> {
+        self.as_arr_for(None)
+    }
+    pub fn as_arr_for(&self, player:Option<&crate::entity::Player>) -> FFResult<[sItemVendor; SIZEOF_VENDOR_TABLE_SLOT as usize]> {
         let mut vendor_item_structs = Vec::new();
         // The 0104 reply has 20 slots. OpenFusion sends the first 20 listings
         // even when the source guide catalog contains more rows.
-        for item in self.items.iter().take(SIZEOF_VENDOR_TABLE_SLOT as usize) {
+        for item in self.items.iter().filter(|i|i.native.as_ref().is_none_or(|r|r.visible_unavailable||player.is_none_or(|p|crate::economy::allows(&r.conditions,p)))).take(SIZEOF_VENDOR_TABLE_SLOT as usize) {
             vendor_item_structs.push(sItemVendor {
                 iVendorID: self.vendor_id,
-                fBuyCost: tdata_get().get_item_stats(item.id, item.ty)?.buy_price as f32,
+                fBuyCost: item.native.as_ref().map_or_else(||tdata_get().get_item_stats(item.id,item.ty).map(|s|s.buy_price as f32),|r|Ok(r.value as f32))?,
                 item: sItemBase {
                     iType: item.ty as i16,
                     iID: item.id,
@@ -239,6 +250,17 @@ impl VendorData {
         self.items
             .iter()
             .any(|item| item_id == item.id && item_type == item.ty)
+    }
+    pub fn price_for(&self,item_id:i16,item_type:ItemType,player:&crate::entity::Player)->FFResult<u32>{
+        // Match the visible page sent by as_arr_for: hidden conditional rows do not
+        // consume one of its 20 slots, so a later visible row must remain purchasable.
+        let item=self.items.iter().filter(|i|i.native.as_ref().is_none_or(|r|r.visible_unavailable||crate::economy::allows(&r.conditions,player)))
+            .take(SIZEOF_VENDOR_TABLE_SLOT as usize).find(|i|i.id==item_id&&i.ty==item_type)
+            .ok_or_else(||FFError::build(Severity::Warning,"Vendor does not sell this item".into()))?;
+        if let Some(rule)=&item.native {
+            if !crate::economy::allows(&rule.conditions,player){return Err(FFError::build(Severity::Warning,"Vendor item conditions are not met".into()));}
+            Ok(rule.value as u32)
+        }else{Ok(tdata_get().get_item_stats(item_id,item_type)?.buy_price)}
     }
 }
 

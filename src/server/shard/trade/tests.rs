@@ -239,3 +239,60 @@ fn accepted_cancel_and_missing_context_are_safe() {
     assert!(state.get_player(2).unwrap().trade_id.is_none());
     assert!(trade_confirm_cancel(request, &ClientMap::new(1, &clients), &mut state).is_err());
 }
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn repeated_completed_trades_survive_later_ticks_and_database_reload() {
+    use crate::database::{open_test_sqlite, DbImpl};
+    let (mut state, clients, mut a, mut b) = fixture();
+    std::fs::create_dir_all("target/bug039").unwrap();
+    let db = open_test_sqlite(&format!("target/bug039/repeated-{}.db", Uuid::new_v4())).await;
+    let mut accounts = Vec::new();
+    let traded = item();
+    state.get_player_mut(1).unwrap().set_item(ItemLocation::Inven, 0, Some(traded)).unwrap();
+    for (id, name) in [(1, "From"), (2, "To")] {
+        let account = db.create_account(&format!("repeat_{id}"), "isolated-test-hash").await.unwrap();
+        let player = state.get_player_mut(id).unwrap();
+        player.first_name = "Trade".to_owned(); player.last_name = name.to_owned();
+        db.init_player(account.id, player).await.unwrap();
+        accounts.push(account.id);
+    }
+    let started = std::time::SystemTime::now();
+    for round in 0..16 {
+        offer(&mut state, &clients, 2).unwrap();
+        accept(&mut state, &clients).unwrap();
+        let sender = if round % 2 == 0 { 1 } else { 2 };
+        let request = sP_CL2FE_REQ_PC_TRADE_ITEM_REGISTER {
+            iID_Request: sender, iID_From: 1, iID_To: 2,
+            Item: sItemTrade { iType: traded.ty as i16, iID: traded.id,
+                iOpt: traded.quantity as i32, iInvenNum: 0, iSlotNum: 4 },
+        };
+        trade_item_register(Packet::new(P_CL2FE_REQ_PC_TRADE_ITEM_REGISTER, &request).unwrap(),
+            &ClientMap::new(sender as usize, &clients), &mut state).unwrap();
+        trade_cash_register(Packet::new(P_CL2FE_REQ_PC_TRADE_CASH_REGISTER,
+            &sP_CL2FE_REQ_PC_TRADE_CASH_REGISTER { iID_Request: sender, iID_From: 1, iID_To: 2, iCandy: 25 }).unwrap(),
+            &ClientMap::new(sender as usize, &clients), &mut state).unwrap();
+        drain(&mut a); drain(&mut b);
+        // Alternate final confirmer; resolve must preserve caller/item orientation.
+        trade_confirm_with_db(&ClientMap::new(sender as usize, &clients), &mut state, &db).await.unwrap();
+        trade_confirm_with_db(&ClientMap::new((3 - sender) as usize, &clients), &mut state, &db).await.unwrap();
+        assert_eq!(drain(&mut a).last().unwrap().id(), P_FE2CL_REP_PC_TRADE_CONFIRM_SUCC);
+        assert_eq!(drain(&mut b).last().unwrap().id(), P_FE2CL_REP_PC_TRADE_CONFIRM_SUCC);
+        assert!(state.ongoing_trades.is_empty());
+        for id in [1, 2] {
+            assert!(state.get_player(id).unwrap().trade_id.is_none());
+            Player::tick(&mut state, id, &(started + std::time::Duration::from_secs((round + 1) * 30)));
+            let player = state.get_player(id).unwrap();
+            assert!(player.get_client().is_some());
+            let owns_item = id != sender;
+            assert_eq!(*player.get_item(ItemLocation::Inven, 0).unwrap(), owns_item.then_some(traded));
+            let expected_wallet = if round % 2 == 1 { 1000 } else if id == 1 { 975 } else { 1025 };
+            assert_eq!(player.get_taros(), expected_wallet);
+            let loaded = db.load_player(accounts[(id - 1) as usize], id as i64).await.unwrap().unwrap();
+            assert_eq!(loaded.get_taros(), expected_wallet);
+            assert_eq!(*loaded.get_item(ItemLocation::Inven, 0).unwrap(), owns_item.then_some(traded));
+        }
+        drain(&mut a); drain(&mut b);
+        assert!(trade_confirm_with_db(&ClientMap::new(sender as usize, &clients), &mut state, &db).await.is_err());
+    }
+}

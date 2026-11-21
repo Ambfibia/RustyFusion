@@ -300,7 +300,8 @@ pub fn give_defeat_rewards(player: &mut Player, defeated_type: i32, rng: &mut Th
     let mut gained_boosts = 0;
     match tdata_get()
         .get_mob_reward(defeated_type)
-        .map(|r| r.with_rates(&player.reward_data))
+        .and_then(|mut reward| {if let Some(items)=tdata_get().economy_loot(crate::tabledata_contracts::economy::LootCategory::Mob,defeated_type,player)?{reward.items=items;}Ok(reward)})
+        .map(|r| r.with_rates(&player.effective_reward_data()))
     {
         Ok(reward) => {
             gained_taros = reward.taros;

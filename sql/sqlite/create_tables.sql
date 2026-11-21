@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS Players (
     BatteryW           INTEGER DEFAULT 0 NOT NULL,
     BatteryN           INTEGER DEFAULT 0 NOT NULL,
     Mentor             INTEGER DEFAULT 5 NOT NULL,
+    MentorCount        INTEGER DEFAULT 0 NOT NULL CHECK (MentorCount BETWEEN 0 AND 32767),
     CurrentMissionID   INTEGER DEFAULT 0 NOT NULL,
     WarpLocationFlag   INTEGER DEFAULT 0 NOT NULL,
     SkywayLocationFlag BLOB NOT NULL,

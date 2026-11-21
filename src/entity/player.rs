@@ -36,6 +36,11 @@ use crate::{
 
 use rand::Rng;
 use uuid::Uuid;
+#[path = "player/inventory_actions.rs"]
+mod inventory_actions;
+#[cfg(test)]
+#[path = "player/mission_tests.rs"]
+mod mission_tests;
 
 #[derive(Debug, Clone)]
 pub struct PlayerMetadata {
@@ -389,6 +394,10 @@ pub struct Projectile {
     pub start_pos: Position,
     pub end_pos: Position,
     pub expires: SystemTime,
+    pub instance_id: InstanceID,
+    pub effect_area: u32,
+    pub target_count: usize,
+    pub travel_range: u32,
 }
 impl From<Projectile> for sPCBullet {
     fn from(value: Projectile) -> Self {
@@ -405,6 +414,15 @@ impl From<Projectile> for sPCBullet {
 
 #[derive(Debug, Clone, Default)]
 pub struct PreWarpData {
+    pub instance_id: InstanceID,
+    pub position: Position,
+}
+
+/// A registration is valid only for the current visit to this exact instance.
+/// Kept separately from the lair-return/respawn entrance and never persisted.
+#[derive(Debug, Clone, Copy)]
+pub struct RecallPoint {
+    pub npc_id: i32,
     pub instance_id: InstanceID,
     pub position: Position,
 }
@@ -556,6 +574,10 @@ impl BuddyList {
 
 #[derive(Debug, Clone, Default)]
 pub struct Player {
+    pub recent_barks:HashMap<(i32,i32),Instant>,
+    pub ambient_attempts:HashMap<i32,Instant>,
+    pub ambient_lines:HashMap<i32,Instant>,
+    pub native_speech_until:HashMap<(i32,i32),Instant>,
     id: Option<i32>,
     slot_num: usize,
     uid: i64,
@@ -563,6 +585,9 @@ pub struct Player {
     pub last_name: String,
     client: Option<FFClient>,
     pub perms: i16,
+    pub user_view:bool,
+    pub native_stage:crate::mission_stage::PlayerStage,
+    pub npc_visibility:HashMap<i32,bool>,
     pub show_gm_marker: bool,
     pub invisible: bool,
     pub invulnerable: bool,
@@ -589,6 +614,8 @@ pub struct Player {
     nano_potions: u32,
     weapon_boosts: u32,
     owned_projectiles: HashMap<i8, Projectile>,
+    item_skill_ready_at: HashMap<i16, Instant>,
+    pub last_weapon_attack: Option<SystemTime>,
     next_projectile_id: i8,
     pub buddy_list_synced: bool,
     buddy_list: BuddyList,
@@ -607,6 +634,7 @@ pub struct Player {
     pub group_offered_to: Option<i32>,
     pub vehicle_speed: Option<i32>,
     pre_warp_data: PreWarpData,
+    recall_point: Option<RecallPoint>,
 }
 impl Player {
     pub fn new(uid: i64, slot_num: usize) -> Self {
@@ -682,6 +710,10 @@ impl Player {
     }
 
     pub fn set_instance_id(&mut self, instance_id: InstanceID) {
+        if self.instance_id != instance_id {
+            self.clear_recall_point();
+            self.clear_projectiles();
+        }
         self.instance_id = instance_id;
     }
 
@@ -745,6 +777,17 @@ impl Player {
         self.buffs.set_buff_duration(buff_id, duration)
     }
 
+    pub fn item_skill_is_ready(&self, id: i16) -> bool {
+        self.item_skill_ready_at.get(&id).is_none_or(|ready| Instant::now() >= *ready)
+    }
+    pub fn start_item_skill_cooldown(&mut self, id: i16, duration: Duration) {
+        if let Some(ready) = Instant::now().checked_add(duration) { self.item_skill_ready_at.insert(id, ready); }
+    }
+
+    pub fn sync_group_auras(&mut self, desired: &[(BuffID, BuffInstance, EntityID)]) {
+        self.buffs.sync_group_auras(desired);
+    }
+
     pub fn get_nano_boost(&self) -> bool {
         let Some(slot) = self.nano_data.active_slot else {
             return false;
@@ -757,6 +800,42 @@ impl Player {
 
     /// Index into a skill's per-level value arrays for this player's nano.
     /// A boosted nano uses the top tier.
+    /// Reward Nano bonuses follow the accepted local OpenFusion contract:
+    /// 20% normally, 23% while the active Nano is boosted; eggs are excluded.
+    pub fn effective_reward_data(&self) -> RewardData {
+        let mut data = self.reward_data;
+        let multiplier = if self.get_nano_boost() { 1.23 } else { 1.20 };
+        for (id, rates) in [
+            (BuffID::RewardCash, &mut data.taros),
+            (BuffID::RewardBlob, &mut data.fusion_matter),
+        ] {
+            if self.has_buff(id, None) {
+                rates.combat *= multiplier;
+                rates.missions *= multiplier;
+                rates.racing *= multiplier;
+            }
+        }
+        data
+    }
+
+    /// Revive at the current location. Self Phoenix consumes only the active
+    /// Nano; group resurrection preserves carried Nano stamina.
+    pub fn do_phoenix_revive(&mut self, from_group: bool) -> FFResult<()> {
+        let source = if from_group { BuffType::GroupNano } else { BuffType::Nano };
+        if !self.is_dead() || !self.has_buff(BuffID::Phoenix, Some(source)) {
+            return Err(FFError::build(Severity::Warning, "Phoenix revive is not authorized".to_string()));
+        }
+        if !from_group {
+            let nano = self.get_active_nano_mut().ok_or_else(|| FFError::build(
+                Severity::Warning, "Phoenix requires an active Nano".to_string()))?;
+            nano.set_stamina(0);
+        }
+        self.remove_buff(BuffID::Phoenix, Some(source));
+        self.hp = self.get_max_hp() / 2;
+        self.reset();
+        Ok(())
+    }
+
     pub fn get_nano_skill_level(&self) -> usize {
         if self.get_nano_boost() {
             SKILL_LEVEL_MAX
@@ -766,6 +845,12 @@ impl Player {
     }
 
     pub fn activate_nano(&mut self, slot: usize) -> FFResult<bool> {
+        let nano = self.get_equipped_nano_id(slot)
+            .and_then(|id| self.get_nano(id))
+            .ok_or_else(|| FFError::build(Severity::Warning, format!("No equipped Nano in slot {slot}")))?;
+        if nano.get_stamina() <= NANO_STAMINA_MAX / 5 {
+            return Err(FFError::build(Severity::Warning, "Nano is too tired to summon".into()));
+        }
         self.deactivate_nano();
         self.set_active_nano_slot(Some(slot))?;
         let mut buff_applied = false;
@@ -863,12 +948,12 @@ impl Player {
 
     pub fn get_load_data(&self) -> sPCLoadData2CL {
         sPCLoadData2CL {
-            iUserLevel: 0, // allow anyone to send GM commands; we'll validate perms
+            iUserLevel: self.perms, // native account level; every privileged request is still validated
             PCStyle: self.get_style(),
             PCStyle2: self.get_style_2(),
             iLevel: self.level,
             iMentor: self.guide_data.current_guide as i16,
-            iMentorCount: self.guide_data.total_guides as i16,
+            iMentorCount: self.get_guide_count(),
             iHP: self.hp,
             iBatteryW: self.weapon_boosts as i32,
             iBatteryN: self.nano_potions as i32,
@@ -1132,16 +1217,16 @@ impl Player {
         } else {
             Some((item_id, count))
         };
-        for (idx, slot) in self.inventory.quest.iter_mut().enumerate() {
-            if let Some((qitem_id, _)) = slot {
-                if *qitem_id == item_id {
-                    *slot = new_qitem;
-                    return Ok(idx);
-                }
-            } else {
-                *slot = new_qitem;
-                return Ok(idx);
-            }
+        // OpenFusion Missions::findQSlot searches an existing stack before
+        // considering any empty slot. A hole earlier in the journal inventory
+        // must not create duplicate stacks or leave a consumed stack alive.
+        if let Some(idx) = self.inventory.quest.iter().position(|slot| slot.as_ref().is_some_and(|(id, _)| *id == item_id)) {
+            self.inventory.quest[idx] = new_qitem;
+            return Ok(idx);
+        }
+        if let Some(idx) = self.inventory.quest.iter().position(Option::is_none) {
+            self.inventory.quest[idx] = new_qitem;
+            return Ok(idx);
         }
         Err(FFError::build(
             Severity::Warning,
@@ -1373,6 +1458,7 @@ impl Player {
 
     pub fn set_tutorial_done(&mut self) {
         self.flags.tutorial_flag = true;
+        self.restore_tutorial_missions();
         // unlock buttercup
         let buttercup_stats = tdata_get().get_nano_stats(ID_BUTTERCUP).unwrap();
         self.unlock_nano(ID_BUTTERCUP).unwrap();
@@ -1396,8 +1482,36 @@ impl Player {
         }
     }
 
+    pub(crate) fn restore_tutorial_missions(&mut self) {
+        if self.flags.tutorial_flag {
+            // XDT tasks 2248–2254 complete missions 1 and 2 before leaving the tutorial.
+            for mission in [1, 2] {
+                self.mission_journal.set_mission_completed(mission)
+                    .expect("tutorial missions fit the 0104 quest bitfield");
+            }
+        }
+    }
+
     pub fn get_guide(&self) -> PlayerGuide {
         self.guide_data.current_guide
+    }
+
+    pub fn get_guide_count(&self) -> i16 {
+        self.guide_data.total_guides as i16
+    }
+
+    pub(crate) fn restore_guide(&mut self, guide: PlayerGuide, count: i32) -> FFResult<()> {
+        if !(0..=i32::from(i16::MAX)).contains(&count) {
+            return Err(FFError::build(
+                Severity::Warning,
+                format!("Invalid stored mentor count: {count}"),
+            ));
+        }
+        self.guide_data = GuideData {
+            current_guide: guide,
+            total_guides: count as usize,
+        };
+        Ok(())
     }
 
     pub fn update_guide(&mut self, guide: PlayerGuide) -> usize {
@@ -1556,6 +1670,16 @@ impl Player {
         self.owned_projectiles.remove(&bullet_id)
     }
 
+    pub fn get_projectile(&self, bullet_id: i8) -> Option<Projectile> {
+        self.owned_projectiles.get(&bullet_id).copied()
+    }
+
+    pub fn projectile_count(&self) -> usize { self.owned_projectiles.len() }
+
+    pub fn clear_projectiles(&mut self) {
+        self.owned_projectiles.clear();
+    }
+
     /// Drops projectiles that should have detonated by now, so a client that
     /// never reports a hit can't hold its bullet slots forever.
     pub fn expire_projectiles(&mut self, now: SystemTime) {
@@ -1585,6 +1709,18 @@ impl Player {
 
     pub fn get_pre_warp(&self) -> &PreWarpData {
         &self.pre_warp_data
+    }
+
+    pub fn register_recall_point(&mut self, npc_id: i32, position: Position) {
+        self.recall_point = Some(RecallPoint { npc_id, instance_id: self.instance_id, position });
+    }
+
+    pub fn clear_recall_point(&mut self) {
+        self.recall_point = None;
+    }
+
+    pub fn get_recall_point(&self) -> Option<RecallPoint> {
+        self.recall_point.filter(|point| point.instance_id == self.instance_id)
     }
 
     pub fn start_skyway_ride(&mut self, trip_data: &'static TripData, mut path: Path) {
@@ -1846,6 +1982,14 @@ impl Player {
         let client = player.get_client().unwrap();
         let active_tasks = player.mission_journal.get_current_tasks();
         for task in active_tasks {
+            // Completion/failure remains in the journal until the client starts
+            // its authored successor. A successful escort releases its NPC
+            // before that next packet, so checking it again would emit a
+            // contradictory EscortFailed after TASK_END_SUCC. Failed stages
+            // likewise must not repeat their failure items/replies each tick.
+            if task.completed || task.failed {
+                continue;
+            }
             let task_def = tdata_get().get_task_definition(task.get_task_id()).unwrap();
 
             // check for task failure
@@ -1876,14 +2020,14 @@ impl Player {
 
                     let mut pkt = PacketBuilder::new(P_FE2CL_REP_REWARD_ITEM).with(&qitem_pkt);
 
-                    for (qitem_id, qitem_count_mod) in &task_def.succ_qitems {
+                    for (qitem_id, qitem_count_mod) in &task_def.fail_qitems {
                         let curr_count = player.get_quest_item_count(*qitem_id) as isize;
-                        let new_count = (curr_count + *qitem_count_mod) as usize;
+                        let new_count = (curr_count + *qitem_count_mod).max(0) as usize;
                         let qitem_slot = player.set_quest_item_count(*qitem_id, new_count).unwrap();
                         let qitem_reward = sItemReward {
                             sItem: sItemBase {
-                                iType: ItemType::Quest as i16,
-                                iID: *qitem_id,
+                                iType: if new_count == 0 { 0 } else { ItemType::Quest as i16 },
+                                iID: if new_count == 0 { 0 } else { *qitem_id },
                                 iOpt: new_count as i32,
                                 iTimeLimit: unused!(),
                             },
@@ -1903,6 +2047,7 @@ impl Player {
                     iErrorCode: fail_code as i32,
                 };
                 client.send_packet(P_FE2CL_REP_PC_TASK_END_FAIL, &pkt);
+                crate::mission_stage::reset(state,pc_id,task_def.mission_id);
                 continue;
             }
 
@@ -2007,6 +2152,7 @@ impl Player {
     }
 
     pub fn tick(state: &mut ShardServerState, pc_id: i32, time: &SystemTime) {
+        crate::mission_stage::tick_player(state,pc_id);
         let player_eid = EntityID::Player(pc_id);
         if state.get_player(pc_id).unwrap().is_dead() {
             return;
@@ -2029,6 +2175,7 @@ impl Player {
 
         let player = state.get_player_mut(pc_id).unwrap();
         let condition_bit_flag = player.buffs.get_bit_flags();
+        let buffs_changed = !buff_updates.is_empty();
         if let Some(client) = player.get_client() {
             for update in buff_updates {
                 let mut pkt: sP_FE2CL_PC_BUFF_UPDATE = update.into();
@@ -2037,6 +2184,12 @@ impl Player {
             }
         }
 
+        if buffs_changed {
+            let timeout = sP_FE2CL_CHAR_TIME_BUFF_TIME_OUT { eCT: CharType::Player as i32,
+                iID: pc_id, iConditionBitFlag: condition_bit_flag };
+            state.entity_map.for_each_around(player_eid, |c| c.send_packet(P_FE2CL_CHAR_TIME_BUFF_TIME_OUT, &timeout));
+        }
+        let player = state.get_player_mut(pc_id).unwrap();
         let mut transmit = false;
         transmit |= player.tick_regen(time);
         transmit |= player.tick_nanos();
@@ -2179,8 +2332,9 @@ impl Combatant for Player {
             self.last_attacked_by = Some(source);
         }
 
+        self.remove_buff(BuffID::Sleep, None);
         let init_hp = self.hp;
-        self.hp = clamp_min(self.hp - damage, 0);
+        self.hp = clamp_min(self.hp - damage.max(0), 0);
         init_hp - self.hp
     }
 
@@ -2227,12 +2381,12 @@ impl Entity for Player {
     }
 
     fn get_speed(&self, _running: bool) -> i32 {
-        if let Some(vehicle_speed) = self.vehicle_speed {
-            vehicle_speed
-        } else {
-            let buffed_run_speed = self.buffs.get_buff_value(BuffID::UpMoveSpeed).unwrap_or(0);
-            PLAYER_RUN_SPEED + buffed_run_speed
-        }
+        if self.has_buff(BuffID::Stun, None) || self.has_buff(BuffID::Sleep, None)
+            || self.has_buff(BuffID::KnockDown, None) { return 0; }
+        let positive = self.buffs.get_buff_value(BuffID::UpMoveSpeed).unwrap_or(0);
+        let negative = self.buffs.get_buff_value(BuffID::DnMoveSpeed).unwrap_or(0);
+        self.vehicle_speed.unwrap_or(PLAYER_RUN_SPEED).max(PLAYER_RUN_SPEED + positive)
+            .saturating_sub(negative).max(0)
     }
 
     fn get_chunk_coords(&self) -> ChunkCoords {

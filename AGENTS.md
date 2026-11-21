@@ -1,9 +1,19 @@
 # RustyFusion Agent Instructions
 
-RustyFusion is the primary game server for FFOneClient. All new server behavior,
+RustyFusion is the production server for FFOneUnity. The archived FFOneClient
+checkout is a historical reference. Keep server compilation and runtime
+independent of it.
+All new server behavior,
 network integration and migration fixes belong here. `../OpenFusion` is the
 legacy server retained for inspecting reference code, accepted local extensions,
 behavior and persistence contracts.
+
+Cross-product orchestration and evidence registers live in
+`../FFOneUnity/Docs/Studio`. Use its client-server contract and validation workflow
+for coupled client/server tasks. Delegate gameplay and network work only with one
+integration owner and explicit file ownership; never assume historical audits
+describe current dispatch. Preserve user edits and record unresolved identity
+conflicts before changing tables or saves.
 
 - Support one FFOne / Retrobution 0104 protocol. Do not introduce protocol
   variants or compatibility switches unless explicitly requested by the owner.
@@ -26,4 +36,10 @@ behavior and persistence contracts.
   `cargo check-all` and `cargo test-all` cover all targets. SQLite is the
   default backend; pass `--no-default-features --features postgres` for PostgreSQL.
 - Use isolated databases and distinct local ports for mutating migration tests.
-  Keep disposable test data and reports below ignored `target/`.
+  Keep disposable test data, staged binaries and reports in one task directory
+  below ignored `target/`. Reuse the directory for retries where safe. Remove
+  disposable databases and copied fixtures after the server exits and retain the
+  final report and any linked evidence. Keep configured server databases and saves.
+  Before publishing, verify that the recorded tabledata commit is available to
+  other checkouts. For shared XDT changes, verify the FFOneUnity publication
+  against that revision using its Studio tabledata check.

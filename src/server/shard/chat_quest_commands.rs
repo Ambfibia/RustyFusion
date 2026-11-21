@@ -20,6 +20,7 @@ fn run(tokens:&[&str],client:&FFClient,state:&mut ShardServerState,delete:bool)-
     let Ok(mission)=tdata_get().get_mission_definition(id) else {return send_system_message(client,&format!("Unknown mission ID: {id}"));};
     if delete {
         state.get_player_mut(pc_id)?.mission_journal.clear_mission_completed(id)?;
+        crate::mission_stage::reset(state,pc_id,id);
         return send_system_message(client,&format!("Quest {id} removed from completed missions."));
     }
     if player.mission_journal.is_mission_completed(id)? {return send_system_message(client,&format!("Quest {id} is completed. Use /deletequest {id} first."));}

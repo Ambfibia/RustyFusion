@@ -1,10 +1,18 @@
-/target
+/target/
+/target-*/
+/Logs/
+/.pytest_cache/
+__pycache__/
+.env
+.env.*
+!.env.example
 .vscode/settings.json
 config.toml
 *.log*
 motd.txt*
 *.mmdb
 *.db*
+!/sample.db
 scripts/globals.d.luau
 /backups/
 

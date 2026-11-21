@@ -22,6 +22,9 @@ pub struct MissionDefinition {
 
 #[derive(Debug)]
 pub struct TaskDefinition {
+    pub stage:crate::tabledata_contracts::mission_stage::MissionStage,
+    pub inventory:crate::tabledata_contracts::mission_inventory::MissionInventory,
+    pub required_bark:crate::barker::RequiredBark,
     pub task_id: i32,        // m_iHTaskID
     pub mission_id: i32,     // m_iHMissionID
     pub task_type: TaskType, // m_iHTaskType
@@ -40,8 +43,9 @@ pub struct TaskDefinition {
     pub obj_enemies: HashMap<i32, usize>, // m_iCSUEnemyID -> m_iCSUNumToKill
     pub obj_enemy_id_ordering: Vec<i32>, // m_iCSUEnemyID (needed for loading counts correctly from DB)
     pub obj_escort_npc_type: Option<i32>, // m_iCSUDEFNPCID
+    pub escort_fights: bool, // m_iCSUDEFNPCAI == 6 (friendly combatant)
     pub escort_follows_player: bool, // delivery destination or m_iCSUDEPNPCFollow
-    pub obj_time_limit: Option<Duration>, // m_iCSUCheckTimer
+    pub obj_time_limit: Option<Duration>, // m_iCSUCheckTimer, or authored STGrantTimer fallback
 
     // failure
     pub fail_task_id: Option<i32>,        // m_iFOutgoingTask
@@ -77,6 +81,7 @@ impl TaskDefinition {
 
 #[derive(Debug, Clone)]
 pub struct Task {
+    pub completion_branch:Option<usize>,
     task_id: i32,
     pub remaining_enemy_defeats: HashMap<i32, usize>,
     pub fail_time: Option<SystemTime>,
@@ -125,6 +130,7 @@ impl Task {
 impl From<&TaskDefinition> for Task {
     fn from(task_def: &TaskDefinition) -> Self {
         Task {
+            completion_branch:None,
             task_id: task_def.task_id,
             remaining_enemy_defeats: task_def.obj_enemies.clone(),
             fail_time: task_def.obj_time_limit.map(|d| SystemTime::now() + d),
@@ -287,7 +293,8 @@ impl MissionJournal {
         }
         for running_task in self.get_task_iter() {
             let running_task_def = running_task.get_task_def();
-            if running_task_def.succ_task_id == Some(task_def.task_id) && running_task.completed {
+            let next=running_task.completion_branch.and_then(|i|running_task_def.stage.completions.get(i)).map(|c|c.next_task).or(running_task_def.succ_task_id);
+            if next == Some(task_def.task_id) && running_task.completed {
                 // previous task is completed
                 return true;
             }
@@ -431,6 +438,9 @@ impl MissionJournal {
     }
 
     pub fn complete_task(&mut self, task_id: i32) -> FFResult<()> {
+        self.complete_task_branch(task_id,None)
+    }
+    pub fn complete_task_branch(&mut self, task_id: i32, branch:Option<usize>) -> FFResult<()> {
         let task = self
             .get_task_iter_mut()
             .find(|t| t.get_task_id() == task_id)
@@ -441,6 +451,7 @@ impl MissionJournal {
                 )
             })?;
         task.completed = true;
+        task.completion_branch=branch;
         Ok(())
     }
 

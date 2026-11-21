@@ -12,6 +12,38 @@ use crate::{
     tabledata::tdata_get,
 };
 
+/// 0104 calls the response identity `iMapNum`, but Retrobution stores it
+/// directly in iRXCom and compares it to the selected NPC's network ID.
+pub fn recall_register(pkt: Packet, client: &FFClient, state: &mut ShardServerState) -> FFResult<()> {
+    // PacketReader accepts a prefix; this transaction must reject trailing data too.
+    if pkt.read_bytes().len() != 4 + size_of::<sP_CL2FE_REQ_REGIST_RXCOM>() {
+        client.send_packet(P_FE2CL_REP_REGIST_RXCOM_FAIL, &sP_FE2CL_REP_REGIST_RXCOM_FAIL { iErrorCode: 1 });
+        return Err(FFError::build(Severity::Warning, "Malformed Recall registration".into()));
+    }
+    let request = *pkt.get::<sP_CL2FE_REQ_REGIST_RXCOM>()?;
+    (|| {
+        let pc_id = client.get_player_id()?;
+        state.entity_map.validate_proximity(
+            &[EntityID::Player(pc_id), EntityID::NPC(request.iNPCID)], RANGE_INTERACT,
+        )?;
+        let player = state.get_player(pc_id)?;
+        let npc = state.get_npc(request.iNPCID)?;
+        if player.is_dead() || player.instance_id.map_num == ID_OVERWORLD || npc.is_dead()
+            || !npc.interactable || tdata_get().get_npc_stats(npc.ty)?.service_category != 17 {
+            return Err(FFError::build(Severity::Warning, "Unavailable Recall Point".into()));
+        }
+        let pos = npc.get_position();
+        let npc_id = npc.id;
+        state.get_player_mut(pc_id)?.register_recall_point(npc_id, pos);
+        client.send_packet(P_FE2CL_REP_REGIST_RXCOM, &sP_FE2CL_REP_REGIST_RXCOM {
+            iMapNum: npc_id, iX: pos.x, iY: pos.y, iZ: pos.z,
+        });
+        Ok(())
+    })().catch_fail(|| {
+        client.send_packet(P_FE2CL_REP_REGIST_RXCOM_FAIL, &sP_FE2CL_REP_REGIST_RXCOM_FAIL { iErrorCode: 1 });
+    })
+}
+
 /// Staff may use nano station actions anywhere; everyone else must stand at one.
 fn at_nano_station(state: &ShardServerState, player: &Player) -> bool {
     player.perms as u32 <= CN_ACCOUNT_LEVEL__DEVELOPER
@@ -116,6 +148,9 @@ pub fn nano_active(pkt: Packet, clients: &ClientMap, state: &mut ShardServerStat
         player.deactivate_nano();
         false
     } else {
+        if player.is_dead() || player.skyway_ride.is_some() || player.vehicle_speed.is_some() {
+            return Err(FFError::build(Severity::Warning, "Nano activation is not available".to_owned()));
+        }
         player.activate_nano(pkt.iNanoSlotNum as usize)?
     };
 

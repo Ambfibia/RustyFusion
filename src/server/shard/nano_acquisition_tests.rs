@@ -155,7 +155,6 @@ fn prepare_task(state: &mut ShardServerState, task_id: i32, level: i16, fm: u32)
     for (&id, &count) in &def.obj_qitems {
         player.set_quest_item_count(id, count).unwrap();
     }
-    assert!(def.obj_npc_type.is_none(), "fixture needs an NPC");
 }
 
 fn end_task(
@@ -163,12 +162,22 @@ fn end_task(
     clients: &HashMap<usize, FFClient>,
     task_id: i32,
 ) -> crate::error::FFResult<()> {
+    use crate::{chunk::ChunkCoords, entity::{Entity, EntityID, NPC}};
+    let npc_id = if let Some(kind) = tdata_get().get_task_definition(task_id)?.obj_npc_type {
+        let player = state.get_player(1)?;
+        let at = player.get_position();
+        let instance = player.get_instance_id();
+        let npc = NPC::new(99001, kind, at, 0, instance)?;
+        state.entity_map.track(Box::new(npc), TickMode::Never);
+        state.entity_map.update(EntityID::NPC(99001), Some(ChunkCoords::from_pos_inst(at, instance)), false);
+        99001
+    } else { 0 };
     super::mission::task_end(
         Packet::new(
             P_CL2FE_REQ_PC_TASK_END,
             &sP_CL2FE_REQ_PC_TASK_END {
                 iTaskNum: task_id,
-                iNPC_ID: 0,
+                iNPC_ID: npc_id,
                 iBox1Choice: 0,
                 iBox2Choice: 0,
                 iEscortNPC_ID: 0,
@@ -255,11 +264,23 @@ fn non_growth_nano_keeps_level_and_fm_and_respects_level_requirement() {
             (player.get_level(), player.get_fusion_matter()),
             (level, 123)
         );
-        assert_eq!(player.get_nano(43).is_some(), level == 28);
+        assert_eq!(player.get_nano(38).is_some(), level == 28);
         assert_eq!(
             player.mission_journal.is_mission_completed(843).unwrap(),
             level == 28
         );
+    }
+}
+
+#[test]
+fn non_growth_quest_rewards_preserve_fm_for_each_extra_nano() {
+    for (task, nano, level) in [(5215, 39, 36), (5232, 37, 18), (5237, 38, 28), (5242, 40, 36)] {
+        let (mut state, clients, _) = fixture();
+        prepare_task(&mut state, task, level, 123);
+        end_task(&mut state, &clients, task).unwrap();
+        let player = state.get_player(1).unwrap();
+        assert!(player.get_nano(nano).is_some(), "task {task} did not award Nano {nano}");
+        assert_eq!((player.get_level(), player.get_fusion_matter()), (level, 123), "Nano {nano}");
     }
 }
 

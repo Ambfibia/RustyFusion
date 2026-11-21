@@ -24,6 +24,15 @@ const PLAYER_POS: Position = Position {
 };
 
 #[test]
+fn user_command_toggles_server_visibility_and_rejects_normal_accounts(){
+    let mut f=fixture(crate::defines::CN_ACCOUNT_LEVEL__GM as i16,1);let player=f.state.get_player(1).unwrap();let mut npc=NPC::new(99001,870,PLAYER_POS,0,player.get_instance_id()).unwrap();npc.hidden=true;
+    assert!(npc.visible_to(player));f.chat("/user");assert!(f.state.get_player(1).unwrap().user_view);assert!(!npc.visible_to(f.state.get_player(1).unwrap()));
+    let packets=drain(&mut f.rx);assert!(packets.iter().any(|p|p.id()==P_FE2CL_USER_VIEW));
+    f.chat("/user off");assert!(!f.state.get_player(1).unwrap().user_view);assert!(npc.visible_to(f.state.get_player(1).unwrap()));drain(&mut f.rx);
+    f.state.get_player_mut(1).unwrap().perms=99;f.chat("/user on");assert!(!f.state.get_player(1).unwrap().user_view);assert!(system_messages(&drain(&mut f.rx)).iter().any(|s|s.contains("don't have access")));
+}
+
+#[test]
 fn quest_commands_start_a_mission_and_clear_only_its_completed_flag() {
     let mut f=fixture(50,1);
     let id=1;
@@ -371,17 +380,22 @@ fn whois_requires_access_and_unknown_slash_commands_stay_out_of_chat() {
 fn help_and_redeem_route_for_normal_muted_players_without_broadcast() {
     let mut f = fixture(99, 5);
     f.state.get_player_mut(1).unwrap().freechat_muted = true;
+    let expected_commands = super::chat::registered_command_help_for_test();
+    assert!(!expected_commands.is_empty());
     for command in ["/help", "!help"] {
         f.chat(command);
         let out = drain(&mut f.rx);
         let lines = system_messages(&out);
-        assert_eq!(lines.len(), 20);
+        assert_eq!(lines.len(), expected_commands.len() + 1);
         assert_eq!(lines[0], "Available commands");
+        assert_eq!(&lines[1..], expected_commands.as_slice(), "Every registered command is advertised exactly once");
         assert!(lines.iter().any(|s| s == "/redeem: Redeem a code item"));
         assert!(lines[1..].windows(2).all(|pair| pair[0] < pair[1]));
         // This was the original /help failure: one oversized UTF-16 packet.
         assert!(util::encode_utf16::<512>(&lines.join("\n")).is_err());
-        assert_eq!(out.len(), 20);
+        assert_eq!(out.len(), lines.len(), "Help emits one system packet per line, without an extra broadcast or acknowledgement");
+        assert!(out.iter().all(|packet| packet.id() == P_FE2CL_PC_MOTD_LOGIN));
+        assert!(lines.iter().all(|line| util::encode_utf16::<512>(line).is_ok()));
     }
     for (command, expected) in [("/redeem", "/redeem: No code specified"),
         ("/redeem unknown", "/redeem: Unknown code"),

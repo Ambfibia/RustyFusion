@@ -15,9 +15,8 @@ use crate::{
     tabledata::tdata_get,
 };
 
-/// Picks up an E.G.G. The client only shows the buff icon when we reply with a
-/// skill ID, so the reply is skipped entirely for eggs that have no effect
-/// (crate-only eggs), same as OpenFusion.
+/// Picks up an E.G.G. Every accepted request is acknowledged, including
+/// reward-only eggs, so the client can correlate its authored pickup notice.
 pub fn shiny_pickup(
     pkt: Packet,
     clients: &ClientMap,
@@ -46,8 +45,16 @@ pub fn shiny_pickup(
         let effect_id = stats.effect_id;
         let effect_duration = stats.effect_duration;
         let respawn_time = stats.respawn_time;
+        let nano_potions = stats.nano_potions;
+        let weapon_boosts = stats.weapon_boosts;
 
         let player = state.get_player(pc_id)?;
+        let native_items=tdata_get().economy_loot(crate::tabledata_contracts::economy::LootCategory::Egg,egg_type,player)?;
+        if let Some(items)=&native_items {
+            let actions=items.iter().map(|i|crate::tabledata_contracts::mission_inventory::InventoryAction{operation:crate::tabledata_contracts::mission_inventory::InventoryOperation::Add,target:crate::tabledata_contracts::mission_inventory::InventoryTarget::Inventory,item:crate::tabledata_contracts::mission_inventory::MissionItem{item_type:i.ty as i16,item_id:i.id,count:i.quantity as u32,..Default::default()}}).collect();
+            player.plan_mission_inventory(&crate::tabledata_contracts::mission_inventory::MissionInventory{start:actions,..Default::default()},false,&[])?;
+        }
+        if native_items.is_none() && crate_id.is_some() { player.find_free_slot(ItemLocation::Inven)?; }
         if player.instance_id != egg_instance
             || player.get_position().distance_to(&egg_pos) > RANGE_INTERACT
         {
@@ -68,16 +75,32 @@ pub fn shiny_pickup(
         }
 
         if let Some(effect_id) = effect_id {
-            log_if_failed(apply_egg_effect(
+            let applied = log_if_failed(apply_egg_effect(
                 pc_id,
                 egg_id,
                 effect_id as i16,
                 effect_duration_secs(effect_duration),
                 state,
-            ));
+            )).is_some();
+            if !applied { client.send_packet(P_FE2CL_REP_SHINY_PICKUP_SUCC, &sP_FE2CL_REP_SHINY_PICKUP_SUCC { iSkillID: 0, eCSTB: 0 }); }
+        } else {
+            client.send_packet(P_FE2CL_REP_SHINY_PICKUP_SUCC, &sP_FE2CL_REP_SHINY_PICKUP_SUCC { iSkillID: 0, eCSTB: 0 });
         }
 
-        if let Some(crate_id) = crate_id {
+        if nano_potions > 0 || weapon_boosts > 0 {
+            let player = state.get_player_mut(pc_id)?;
+            player.set_nano_potions(player.get_nano_potions().saturating_add(nano_potions));
+            player.set_weapon_boosts(player.get_weapon_boosts().saturating_add(weapon_boosts));
+            let reward = sP_FE2CL_REP_REWARD_ITEM {
+                m_iCandy: player.get_taros() as i32, m_iFusionMatter: player.get_fusion_matter() as i32,
+                m_iBatteryN: player.get_nano_potions() as i32, m_iBatteryW: player.get_weapon_boosts() as i32,
+                iItemCnt: 0, iFatigue: 100, iFatigue_Level: 1, iNPC_TypeID: unused!(), iTaskID: unused!(),
+            };
+            client.send_packet(P_FE2CL_REP_REWARD_ITEM, &reward);
+        }
+
+        if let Some(items)=native_items {crate::economy::give_items(state.get_player_mut(pc_id)?,&items)?;}
+        else if let Some(crate_id) = crate_id {
             log_if_failed(give_egg_crate(pc_id, crate_id, state));
         }
 
@@ -108,7 +131,7 @@ fn apply_egg_effect(
     let player_eid = EntityID::Player(pc_id);
     let egg_eid = EntityID::Egg(egg_id);
 
-    let (result, buff_id) = if skill.passive {
+    let (result, buff_id) = if skill.get_buff_id().is_some() {
         let player = state.get_player_mut(pc_id)?;
         // The E.G.G.'s own duration wins over whatever the skill table says.
         let buff_id =
@@ -154,10 +177,8 @@ fn apply_egg_effect(
                 )
             }
             other => {
-                return Err(FFError::build(
-                    Severity::Warning,
-                    format!("E.G.G. skill type {:?} is not supported", other),
-                ));
+                let _ = other;
+                return apply_other_egg_skill(pc_id, egg_id, skill_id, skill, state);
             }
         }
     };
@@ -197,6 +218,32 @@ fn apply_egg_effect(
         }
     }
 
+    Ok(())
+}
+
+fn apply_other_egg_skill(pc_id: i32, egg_id: i32, skill_id: i16, skill: &'static skills::Skill, state: &mut ShardServerState) -> FFResult<()> {
+    let player_id = EntityID::Player(pc_id);
+    let results = skills::do_skill(player_id, &[player_id], skill, 0, state)?;
+    let player = state.get_player(pc_id)?;
+    if let Some(client) = player.get_client() {
+        client.send_packet(P_FE2CL_REP_SHINY_PICKUP_SUCC, &sP_FE2CL_REP_SHINY_PICKUP_SUCC { iSkillID: skill_id, eCSTB: 0 });
+    }
+    if results.is_empty() { return Ok(()); }
+    let mut builder = PacketBuilder::new(P_FE2CL_NPC_SKILL_HIT).with(&sP_FE2CL_NPC_SKILL_HIT {
+        iNPC_ID: egg_id, iSkillID: skill_id, iValue1: unused!(), iValue2: unused!(), iValue3: unused!(),
+        eST: skill.skill_type as i32, iTargetCnt: results.len() as i32,
+    });
+    for result in results {
+        use skills::SkillResult::*;
+        match result {
+            Damage(r) => builder.push(&r), Leech(r) => builder.push(&r), DotDamage(r) => builder.push(&r), HealHP(r) => builder.push(&r),
+            HealStamina(r) => builder.push(&r), StaminaSelf(r) => builder.push(&r), DamageAndDebuff(r) => builder.push(&r),
+            Buff(r) => builder.push(&r), BatteryDrain(r) => builder.push(&r), DamageAndMove(r) => builder.push(&r),
+            Move(r) => builder.push(&r), Resurrect(r) => builder.push(&r),
+        };
+    }
+    let packet = builder.build()?;
+    state.entity_map.for_each_around(player_id, |client| { client.send_payload(packet.clone()); });
     Ok(())
 }
 

@@ -28,6 +28,8 @@ mod chat;
 mod chat_command_tests;
 mod combat;
 #[cfg(test)]
+mod weapon_combat_tests;
+#[cfg(test)]
 mod nano_attack_tests;
 mod egg;
 mod email;
@@ -43,8 +45,14 @@ mod xdt_identity_tests;
 mod login;
 mod mission;
 #[cfg(test)]
+mod instant_mission_tests;
+#[cfg(test)]
+mod mission_stage_tests;
+#[cfg(test)]
 mod escort_tests;
 mod nano;
+#[cfg(test)]
+mod recall_tests;
 #[cfg(test)]
 mod nano_tune_tests;
 mod npc;
@@ -175,6 +183,7 @@ pub fn handle_packet<'a>(
             P_CL2FE_REQ_SHINY_PICKUP => egg::shiny_pickup(pkt, &clients, state),
             //
             P_CL2FE_REQ_NPC_INTERACTION => npc::npc_interaction(pkt, clients.get_sender(), state),
+            P_CL2FE_REQ_AMBIENT_BARK => npc::ambient_bark(pkt,clients.get_sender(),state),
             P_CL2FE_REQ_BARKER => npc::npc_bark(pkt, clients.get_sender(), state),
             P_CL2FE_REQ_PC_BARBER_OPEN => crate::barber::open(pkt, clients.get_sender(), state),
             P_CL2FE_REQ_PC_BARBER_CONFIRM => crate::barber::confirm(pkt, &clients, state),
@@ -202,6 +211,7 @@ pub fn handle_packet<'a>(
             P_CL2FE_DOT_DAMAGE_ONOFF => crate::infection::on_off(pkt, &clients, state),
             P_CL2FE_REQ_PC_ATTACK_CHARs => combat::pc_attack_pcs(pkt, &clients, state),
             P_CL2FE_REQ_NANO_SKILL_USE => combat::nano_skill_use(pkt, &clients, state),
+            P_CL2FE_REQ_REGIST_RXCOM => nano::recall_register(pkt, clients.get_sender(), state),
             P_CL2FE_REQ_PC_ROCKET_STYLE_READY => {
                 combat::pc_rocket_style_ready(pkt, &clients, state)
             }
@@ -226,7 +236,7 @@ pub fn handle_packet<'a>(
             P_CL2FE_REQ_PC_BANK_CLOSE => item::bank_close(pkt, &clients, state),
             P_CL2FE_REQ_PC_VENDOR_START => item::vendor_start(pkt, clients.get_sender(), state),
             P_CL2FE_REQ_PC_VENDOR_TABLE_UPDATE => {
-                item::vendor_table_update(pkt, clients.get_sender())
+                item::vendor_table_update(pkt, clients.get_sender(),state)
             }
             P_CL2FE_REQ_PC_VENDOR_ITEM_BUY => {
                 item::vendor_item_buy(pkt, clients.get_sender(), state, time)

@@ -10,6 +10,53 @@ use crate::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+mod invite_contract_tests {
+    use super::*;
+    use crate::{
+        chunk::{ChunkCoords, InstanceID, TickMode},
+        entity::Player,
+        net::{ClientMetadata, ClientType, FFClient},
+        tabledata::tdata_init,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn rejected_targets_do_not_reserve_an_invitation_and_refusal_allows_retry() {
+        tdata_init().unwrap();
+        let mut state = ShardServerState::default();
+        let mut connections = HashMap::new();
+        let mut receivers = Vec::new();
+        for id in [1, 2] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            receivers.push(rx);
+            let client = FFClient::new(tx, ClientMetadata::new(
+                format!("127.0.0.1:{}", 39200 + id).parse().unwrap(),
+                Some(ClientType::GameClient { account_id: id as i64, serial_key: id as i64, pc_id: Some(id) }),
+            ));
+            let mut player = Player::new(id as i64, 0);
+            player.set_player_id(id); player.set_client(client.clone());
+            let chunk = ChunkCoords::from_pos_inst(player.get_position(), InstanceID::default());
+            let entity = state.entity_map.track(Box::new(player), TickMode::Always);
+            state.entity_map.update(entity, Some(chunk), false);
+            connections.insert(id as usize, client);
+        }
+        for target in [i32::MAX, 1] {
+            let packet = Packet::new(P_CL2FE_REQ_PC_GROUP_INVITE, &sP_CL2FE_REQ_PC_GROUP_INVITE { iID_To: target }).unwrap();
+            assert!(pc_group_invite(packet, &ClientMap::new(1, &connections), &mut state).is_err());
+            assert_eq!(state.get_player(1).unwrap().group_offered_to, None);
+        }
+        for _ in 0..2 {
+            let packet = Packet::new(P_CL2FE_REQ_PC_GROUP_INVITE, &sP_CL2FE_REQ_PC_GROUP_INVITE { iID_To: 2 }).unwrap();
+            pc_group_invite(packet, &ClientMap::new(1, &connections), &mut state).unwrap();
+            assert_eq!(state.get_player(1).unwrap().group_offered_to, Some(2));
+            let packet = Packet::new(P_CL2FE_REQ_PC_GROUP_INVITE_REFUSE, &sP_CL2FE_REQ_PC_GROUP_INVITE_REFUSE { iID_From: 1 }).unwrap();
+            pc_group_invite_refuse(packet, &ClientMap::new(2, &connections), &mut state).unwrap();
+            assert_eq!(state.get_player(1).unwrap().group_offered_to, None);
+        }
+    }
+}
+
 pub fn pc_group_invite(
     pkt: Packet,
     clients: &ClientMap,
@@ -28,7 +75,9 @@ pub fn pc_group_invite(
         }
 
         let target_pc_id = pkt.iID_To;
-        player.group_offered_to = Some(target_pc_id);
+        if target_pc_id == pc_id {
+            return Err(FFError::build(Severity::Warning, "Cannot invite self".to_string()));
+        }
         let target_player = state.get_player(target_pc_id)?;
         if target_player.group_id.is_some() {
             return Err(FFError::build(
@@ -40,6 +89,7 @@ pub fn pc_group_invite(
         let target_client = target_player.get_client().unwrap();
         let pkt = sP_FE2CL_PC_GROUP_INVITE { iHostID: pc_id };
         target_client.send_packet(P_FE2CL_PC_GROUP_INVITE, &pkt);
+        state.get_player_mut(pc_id)?.group_offered_to = Some(target_pc_id);
         Ok(())
     })()
     .catch_fail(|| {
@@ -198,6 +248,16 @@ pub fn npc_group_invite(
     let client = clients.get_sender();
     let pc_id = client.get_player_id()?;
     let pkt: &sP_CL2FE_REQ_NPC_GROUP_INVITE = pkt.get()?;
+    (|| {
+    state.entity_map.validate_proximity(&[EntityID::Player(pc_id), EntityID::NPC(pkt.iNPC_ID)], crate::defines::RANGE_INTERACT)?;
+    let target = state.get_npc(pkt.iNPC_ID)?;
+    let stats = crate::tabledata::tdata_get().get_npc_stats(target.ty)?;
+    if target.mission_escort.as_ref().is_some_and(|escort| escort.player_id != pc_id) {
+        return Err(FFError::build(Severity::Warning, "NPC escort belongs to another player".into()));
+    }
+    if stats.team != crate::enums::CombatantTeam::Friendly || !(stats.service_category == 6 || (stats.ai_type > 0 && stats.ai_type < 11)) || target.hidden || !target.interactable || target.private_owner.is_some() {
+        return Err(FFError::build(Severity::Warning, "NPC cannot join a social group".into()));
+    }
     let player = state.get_player_mut(pc_id)?;
 
     let group_id = player.group_id.unwrap_or(Uuid::new_v4());
@@ -248,6 +308,7 @@ pub fn npc_group_invite(
     state.get_player_mut(pc_id).unwrap().group_id = Some(group_id);
     state.get_npc_mut(target_npc_id).unwrap().group_id = Some(group_id);
     Ok(())
+    })().catch_fail(|| client.send_packet(P_FE2CL_REP_NPC_GROUP_INVITE_FAIL, &sP_FE2CL_REP_NPC_GROUP_INVITE_FAIL { iErrorCode: 1 }))
 }
 
 pub fn npc_group_kick(
@@ -258,6 +319,7 @@ pub fn npc_group_kick(
     let client = clients.get_sender();
     let pc_id = client.get_player_id()?;
     let pkt: &sP_CL2FE_REQ_NPC_GROUP_KICK = pkt.get()?;
+    (|| {
     let player = state.get_player(pc_id)?;
 
     let group_id = player.group_id.ok_or_else(|| {
@@ -278,4 +340,5 @@ pub fn npc_group_kick(
 
     target_npc.group_id = None;
     helpers::remove_group_member(target_npc.get_id(), group_id, state)
+    })().catch_fail(|| client.send_packet(P_FE2CL_REP_NPC_GROUP_KICK_FAIL, &sP_FE2CL_REP_NPC_GROUP_KICK_FAIL { iErrorCode: 1 }))
 }

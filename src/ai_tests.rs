@@ -785,7 +785,56 @@ fn pack_followers_walk_with_their_roaming_leader() {
     // and it keeps its place in the formation
     let leader = state.get_npc(leader_id).unwrap().get_position();
     let follower = state.get_npc(follower_id).unwrap().get_position();
-    assert!(follower.distance_to(&(leader + offset)) <= 200);
+    assert!(follower.distance_to(&(leader + offset)) <= 200,
+        "follower {follower:?} lost formation behind leader {leader:?}");
+}
+
+#[test]
+fn pack_followers_keep_formation_during_a_continuous_walk_in_either_tick_order() {
+    for (leader_id, follower_id, leader_first) in [
+        (2_000_001_020, 2_000_001_021, true),
+        (2_000_001_022, 2_000_001_023, false),
+    ] {
+        let (mut state, mut rx) = fixture(leader_id, ROAMING_MOB, 3000);
+        let offset = add_follower(&mut state, leader_id, follower_id);
+        let destination = Position { y: BASE.y + 2000, ..BASE };
+        let mut path = Path::new_single(destination, 300);
+        path.start();
+        let leader = state.get_npc_mut(leader_id).unwrap();
+        leader.ai = None; // An uninterrupted authored walk makes lag deterministic.
+        leader.path = Some(path);
+
+        for step in 0..(5 * crate::defines::SHARD_TICKS_PER_SECOND) {
+            for id in if leader_first { [leader_id, follower_id] } else { [follower_id, leader_id] } {
+                tick(&mut state, id);
+            }
+            let leader = state.get_npc(leader_id).unwrap().get_position();
+            let follower = state.get_npc(follower_id).unwrap().get_position();
+            assert!(follower.distance_to(&(leader + offset)) <= 200,
+                "lost formation at tick {step}, leader_first={leader_first}: leader={leader:?}, follower={follower:?}");
+        }
+        let packets = drain(&mut rx);
+        let follower_moves: Vec<_> = only(&packets, P_FE2CL_NPC_MOVE).into_iter()
+            .filter_map(|packet| {
+                let movement = *PacketReader::new(packet).get_struct::<sP_FE2CL_NPC_MOVE>().unwrap();
+                (movement.iNPC_ID == follower_id).then_some(movement)
+            }).collect();
+        assert!(!follower_moves.is_empty());
+        for movement in follower_moves {
+            assert_eq!({ movement.iSpeed }, 300, "keep pace with the walking leader");
+            assert_eq!({ movement.iMoveStyle }, 0);
+        }
+
+        // Once the leader stops, the follower reaches the exact formation slot;
+        // move_towards would stop one collision radius short of it.
+        let leader = state.get_npc(leader_id).unwrap().get_position();
+        state.get_npc_mut(leader_id).unwrap().path = None;
+        for _ in 0..(3 * crate::defines::SHARD_TICKS_PER_SECOND) {
+            tick(&mut state, follower_id);
+        }
+        let follower = state.get_npc(follower_id).unwrap().get_position();
+        assert_eq!(follower, leader + offset);
+    }
 }
 
 #[test]

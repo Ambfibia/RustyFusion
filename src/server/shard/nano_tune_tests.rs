@@ -19,9 +19,9 @@ use crate::{
     tabledata::{tdata_get, tdata_init},
 };
 
-// Nano 38 (real rows): tune 201 -> skill 13, tune 202 -> skill 4 (passive);
+// Johnny Bravo (real rows): tune 201 -> skill 13, tune 202 -> skill 4 (passive);
 // both cost 5 of general item 1.
-const NANO: i16 = 38;
+const NANO: i16 = 42;
 const TUNE_ACTIVE: i16 = 201;
 const TUNE_PASSIVE: i16 = 202;
 const REQ_ITEM: i16 = 1;

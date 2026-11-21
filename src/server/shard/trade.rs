@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use crate::{
-    database::{db_get, DbImpl as _},
+    database::db_get,
     defines::*,
     entity::{Entity, EntityID},
     enums::*,
@@ -481,6 +481,12 @@ pub fn trade_confirm_cancel(
 }
 
 pub async fn trade_confirm(clients: &ClientMap<'_>, state: &mut ShardServerState) -> FFResult<()> {
+    trade_confirm_with_db(clients, state, db_get()).await
+}
+
+async fn trade_confirm_with_db(
+    clients: &ClientMap<'_>, state: &mut ShardServerState, db: &impl crate::database::DbImpl,
+) -> FFResult<()> {
     let client = clients.get_sender();
     let pc_id = client.get_player_id()?;
     let player = state.get_player(pc_id)?;
@@ -533,7 +539,6 @@ pub async fn trade_confirm(clients: &ClientMap<'_>, state: &mut ShardServerState
         let player_taros = player.get_taros();
         let player_other_taros = player_other.get_taros();
 
-        let db = db_get();
         if let Err(error) = db.save_players(&[&player, &player_other]).await {
             let abort = sP_FE2CL_REP_PC_TRADE_CONFIRM_ABORT {
                 iID_Request: pc_id,

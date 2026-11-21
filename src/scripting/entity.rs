@@ -2,11 +2,11 @@ use std::time::Duration;
 
 use mlua::prelude::*;
 
+use super::with_active_shard;
 use crate::{
     entity::{Entity, EntityID},
     enums::{BuffID, BuffType},
     skills::BuffInstance,
-    state::ShardServerState,
     Position,
 };
 
@@ -14,39 +14,23 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub(super) struct EntityScriptContext {
     entity_id: EntityID,
-    state: *mut ShardServerState,
 }
 impl EntityScriptContext {
-    pub fn new(entity_id: EntityID, state: &mut ShardServerState) -> Self {
-        Self {
-            entity_id,
-            state: state as *mut ShardServerState,
-        }
+    pub fn new(entity_id: EntityID) -> Self {
+        Self { entity_id }
     }
 
     pub fn id(&self) -> EntityID {
         self.entity_id
     }
 
-    fn with_state<T>(&self, f: impl FnOnce(&mut ShardServerState) -> LuaResult<T>) -> LuaResult<T> {
-        // SAFETY: see unsafe impl Send below.
-        // These wrappers help avoid aliasing issues by ensuring we only have one mutable reference
-        // to state at a time. DO NOT directly dereference self.state outside of these wrappers.
-        let state = unsafe { &mut *self.state };
-        f(state)
-    }
-
-    fn with_entity<T>(&self, f: impl FnOnce(&mut dyn Entity) -> LuaResult<T>) -> LuaResult<T> {
-        self.with_state(|state| {
+    fn with_entity<T>(&self, lua: &Lua, f: impl FnOnce(&mut dyn Entity) -> LuaResult<T>) -> LuaResult<T> {
+        with_active_shard(lua, |state| {
             let entity = state.get_entity_mut(self.entity_id)?;
             f(entity)
         })
     }
 }
-
-// SAFETY: EntityScriptContext is only used within a single synchronous resume() call.
-// The state pointer is guaranteed valid for that duration.
-unsafe impl Send for EntityScriptContext {}
 
 impl FromLua for EntityScriptContext {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
@@ -62,6 +46,12 @@ impl FromLua for EntityScriptContext {
 impl LuaUserData for EntityScriptContext {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         luau_class!("Entity", {
+            // A retained target handle can outlive a player's acknowledged exit.
+            // Callers can choose retreat without dereferencing a missing entity.
+            luau_method!(methods, "exists" -> "boolean", |lua, this, ()| with_active_shard(lua, |state| {
+                Ok(state.entity_map.get_entity_raw(this.entity_id).is_some())
+            }));
+
             luau_method!(methods, "is_player" -> "boolean", |_, this, ()| {
                 Ok(matches!(this.entity_id, EntityID::Player(_)))
             });
@@ -78,11 +68,11 @@ impl LuaUserData for EntityScriptContext {
                 Ok(matches!(this.entity_id, EntityID::Egg(_)))
             });
 
-            luau_method!(methods, "position" -> "Position", |_, this, ()| this.with_entity(|entity| {
+            luau_method!(methods, "position" -> "Position", |lua, this, ()| this.with_entity(lua, |entity| {
                 Ok(entity.get_position())
             }));
 
-            luau_method!(methods, "level" -> "number", |_, this, ()| this.with_entity(|entity| {
+            luau_method!(methods, "level" -> "number", |lua, this, ()| this.with_entity(lua, |entity| {
                 if let Some(combatant) = entity.as_combatant() {
                     Ok(combatant.get_level())
                 } else {
@@ -90,7 +80,7 @@ impl LuaUserData for EntityScriptContext {
                 }
             }));
 
-            luau_method!(methods, "hp" -> "number", |_, this, ()| this.with_entity(|entity| {
+            luau_method!(methods, "hp" -> "number", |lua, this, ()| this.with_entity(lua, |entity| {
                 if let Some(combatant) = entity.as_combatant() {
                     Ok(combatant.get_hp())
                 } else {
@@ -98,7 +88,7 @@ impl LuaUserData for EntityScriptContext {
                 }
             }));
 
-            luau_method!(methods, "max_hp" -> "number", |_, this, ()| this.with_entity(|entity| {
+            luau_method!(methods, "max_hp" -> "number", |lua, this, ()| this.with_entity(lua, |entity| {
                 if let Some(combatant) = entity.as_combatant() {
                     Ok(combatant.get_max_hp())
                 } else {
@@ -106,7 +96,7 @@ impl LuaUserData for EntityScriptContext {
                 }
             }));
 
-            luau_method!(methods, "is_dead" -> "boolean", |_, this, ()| this.with_entity(|entity| {
+            luau_method!(methods, "is_dead" -> "boolean", |lua, this, ()| this.with_entity(lua, |entity| {
                 if let Some(combatant) = entity.as_combatant() {
                     Ok(combatant.is_dead())
                 } else {
@@ -114,23 +104,23 @@ impl LuaUserData for EntityScriptContext {
                 }
             }));
 
-            luau_method!(methods, "reset" -> "()", |_, this, ()| this.with_entity(|entity| {
+            luau_method!(methods, "reset" -> "()", |lua, this, ()| this.with_entity(lua, |entity| {
                 if let Some(combatant) = entity.as_combatant_mut() {
                     combatant.reset();
                 }
                 Ok(())
             }));
 
-            luau_method!(methods, "target" -> "Entity?", |_, this, ()| this.with_state(|state| {
+            luau_method!(methods, "target" -> "Entity?", |lua, this, ()| with_active_shard(lua, |state| {
                 let entity = state.get_entity(this.entity_id)?;
                 if let Some(combatant) = entity.as_combatant() {
-                    Ok(combatant.get_target().map(|target_id| EntityScriptContext::new(target_id, state)))
+                    Ok(combatant.get_target().map(EntityScriptContext::new))
                 } else {
                     Ok(None)
                 }
             }));
 
-            luau_method!(methods, "has_buff" -> "boolean", |_, this, buff_id: i32| this.with_entity(|entity| {
+            luau_method!(methods, "has_buff" -> "boolean", |lua, this, buff_id: i32| this.with_entity(lua, |entity| {
                 if let Some(combatant) = entity.as_combatant() {
                     let buff_id: BuffID = buff_id.try_into().map_err(|_| LuaError::runtime(format!("Invalid buff ID: {}", buff_id)))?;
                     Ok(combatant.has_buff(buff_id, None))
@@ -139,7 +129,7 @@ impl LuaUserData for EntityScriptContext {
                 }
             }));
 
-            luau_method!(methods, "apply_buff" -> "boolean", |_, this, (buff_id, values, duration, source): (i32, Vec<i32>, Option<f32>, Option<EntityScriptContext>)| this.with_state(|state| {
+            luau_method!(methods, "apply_buff" -> "boolean", |lua, this, (buff_id, values, duration, source): (i32, Vec<i32>, Option<f32>, Option<EntityScriptContext>)| with_active_shard(lua, |state| {
                 let entity = state.get_entity_mut(this.entity_id)?;
                 if let Some(combatant) = entity.as_combatant_mut() {
                     let buff_id: BuffID = buff_id.try_into().map_err(|_| LuaError::runtime(format!("Invalid buff ID: {}", buff_id)))?;
@@ -157,13 +147,13 @@ impl LuaUserData for EntityScriptContext {
 
             // Helpers
 
-            luau_method!(methods, "distance_to" -> "number", |_, this, (x, y, z): (i32, i32, i32)| this.with_entity(|entity| {
+            luau_method!(methods, "distance_to" -> "number", |lua, this, (x, y, z): (i32, i32, i32)| this.with_entity(lua, |entity| {
                 let pos = entity.get_position();
                 let target = Position { x, y, z };
                 Ok(pos.distance_to(&target))
             }));
 
-            luau_method!(methods, "distance_to_entity" -> "number", |_, this, target: EntityScriptContext| this.with_state(|state| {
+            luau_method!(methods, "distance_to_entity" -> "number", |lua, this, target: EntityScriptContext| with_active_shard(lua, |state| {
                 let pos = state.get_entity(this.entity_id)?.get_position();
                 let target_entity = state.entity_map.get_entity_raw(target.entity_id).ok_or_else(|| LuaError::runtime("Target entity not found"))?;
                 let target_pos = target_entity.get_position();
@@ -175,8 +165,8 @@ impl LuaUserData for EntityScriptContext {
             Ok(this.entity_id == other.entity_id)
         });
 
-        methods.add_meta_method(LuaMetaMethod::ToString, |_, this, ()| {
-            this.with_entity(|entity| Ok(format!("{}", entity)))
+        methods.add_meta_method(LuaMetaMethod::ToString, |lua, this, ()| {
+            this.with_entity(lua, |entity| Ok(format!("{}", entity)))
         });
     }
 }

@@ -153,7 +153,23 @@ impl SqliteDatabase {
         // Additive migration also runs for existing databases.
         conn.interact(|conn| Self::exec(conn, "create_redeemed_codes", &[]))
             .await??;
+        conn.interact(|conn|Self::exec(conn,"create_native_mission_state",&[])).await??;
+        conn.interact(Self::migrate_mentor_count).await??;
         Ok(Self { pool, path })
+    }
+
+    fn migrate_mentor_count(conn: &mut Connection) -> FFResult<()> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_count: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('Players') WHERE lower(name) = 'mentorcount')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_count {
+            Self::exec_in(&tx, "migrate_mentor_count", &[])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn read_sql(name: &str) -> FFResult<&'static str> {
@@ -293,6 +309,7 @@ impl SqliteDatabase {
 
     fn save_player_sync(tx: &rusqlite::Transaction, player: &Player) -> FFResult<()> {
         let pc_uid = player.get_uid();
+        Self::exec_in(tx,"save_native_mission_state",&[&pc_uid,&player.native_stage.serialize()?])?;
 
         let position = if player.instance_id.instance_num.is_some() {
             player.get_pre_warp().position
@@ -331,6 +348,7 @@ impl SqliteDatabase {
                 &skyway_bytes.as_slice(),
                 &tip_bytes.as_slice(),
                 &quest_bytes.as_slice(),
+                &Int::from(player.get_guide_count()),
             ],
         )?;
 
@@ -515,9 +533,7 @@ impl SqliteDatabase {
         player.flags = player_flags;
 
         let guide: PlayerGuide = (row.get::<Int>("Mentor") as i16).try_into()?;
-        if guide != PlayerGuide::Computress {
-            player.update_guide(guide);
-        }
+        player.restore_guide(guide, row.try_get("MentorCount")?)?;
 
         let skyway_bytes: Vec<u8> = row.get("SkywayLocationFlag");
         player.flags.skyway_flags =
@@ -532,8 +548,10 @@ impl SqliteDatabase {
         let quest_bytes: Vec<u8> = row.get("Quests");
         player.mission_journal.completed_mission_flags =
             Bitfield::from_bytes(&quest_bytes, SIZEOF_QUESTFLAG_NUMBER as usize)?;
+        player.restore_tutorial_missions();
 
         let running_quests = Self::query(conn, "load_running_quests", &[&pc_uid])?;
+        if let Some(row)=Self::query(conn,"load_native_mission_state",&[&pc_uid])?.first(){player.native_stage=crate::mission_stage::PlayerStage::load(&row.get::<String>("State"))?;}
         for quest in &running_quests {
             let task_id: Int = quest.get("TaskID");
             let task_def = tdata_get().get_task_definition(task_id)?;
@@ -541,6 +559,7 @@ impl SqliteDatabase {
             let npc_count_2: Int = quest.get("RemainingNPCCount2");
             let npc_count_3: Int = quest.get("RemainingNPCCount3");
             let mut task: Task = task_def.into();
+            if let Some(branch)=player.native_stage.branches.get(&task_id){task.completed=true;task.completion_branch=Some(*branch);}
             task.fail_time = None;
             task.set_remaining_enemy_defeats([
                 npc_count_1 as usize,
@@ -1223,11 +1242,16 @@ mod test {
     use super::*;
 
     fn init_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         let sql = std::fs::read_to_string("sql/sqlite/create_tables.sql").unwrap();
         let sql = sql.replace("?1", "0");
         conn.execute_batch(&sql).unwrap();
+        // Production runs these additive migrations for both fresh and
+        // existing databases before preparing any player persistence query.
+        for migration in ["create_redeemed_codes", "create_native_mission_state"] {
+            SqliteDatabase::exec(&mut conn, migration, &[]).unwrap();
+        }
         conn
     }
 
@@ -1241,7 +1265,13 @@ mod test {
     #[test]
     fn test_all_sql_files_prepare() {
         let conn = init_db();
-        let skip = |name: &str| name == "create_tables.sql" || name == "reset_db.sql";
+        // The mentor migration requires a legacy schema, exercised by mentor_persistence_tests.
+        let skip = |name: &str| {
+            matches!(
+                name,
+                "create_tables.sql" | "reset_db.sql" | "migrate_mentor_count.sql"
+            )
+        };
 
         let overrides: std::collections::HashSet<String> = std::fs::read_dir("sql/sqlite")
             .unwrap()

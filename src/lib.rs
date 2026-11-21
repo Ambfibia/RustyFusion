@@ -3,6 +3,9 @@
 
 use std::ops::Add;
 
+#[cfg(test)]
+mod instance_route_tests;
+
 use vecmath::{vec3_add, vec3_len, vec3_scale, vec3_sub, Vector3};
 
 #[macro_export]
@@ -56,6 +59,8 @@ pub mod database;
 pub mod geo;
 pub mod monitor;
 pub mod tabledata;
+pub mod tabledata_contracts;
+pub mod economy;
 
 pub mod ai;
 pub mod chunk;
@@ -66,7 +71,9 @@ pub mod email;
 pub mod entity;
 pub mod item;
 pub mod mission;
+pub mod barker;
 pub mod escort;
+pub mod mission_stage;
 pub mod nano;
 pub mod path;
 pub mod racing;
@@ -74,7 +81,7 @@ pub mod scripting;
 pub mod skills;
 pub mod trade;
 
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq,serde::Serialize,serde::Deserialize)]
 pub struct Position {
     pub x: i32,
     pub y: i32,

@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::database::{Database, DbImpl};
 use crate::defines::DB_VERSION;
 use crate::entity::Player;
+use crate::enums::PlayerGuide;
 
 #[macro_export]
 macro_rules! for_each_db_test {
@@ -155,6 +156,10 @@ pub async fn test_player_save_reload<D: DbImpl>(db: &Database<D>) {
     // mutate then save
     let mut p = db.load_player(acc.id, uid).await.unwrap().unwrap();
     p.set_taros(12345);
+    assert_eq!(p.get_guide(), PlayerGuide::Computress);
+    assert_eq!(p.get_guide_count(), 0);
+    p.update_guide(PlayerGuide::Dexter);
+    p.update_guide(PlayerGuide::Ben);
     db.save_player(&p).await.expect("save_player");
 
     let reloaded = db.load_player(acc.id, uid).await.unwrap().unwrap();
@@ -163,6 +168,8 @@ pub async fn test_player_save_reload<D: DbImpl>(db: &Database<D>) {
         12345,
         "taros should persist across save/load"
     );
+    assert_eq!(reloaded.get_guide(), PlayerGuide::Ben);
+    assert_eq!(reloaded.get_guide_count(), 2);
 }
 
 /// Post-ITEM_MOVE slot contents (equip, inventory, bank) survive a reload

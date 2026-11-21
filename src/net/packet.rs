@@ -388,6 +388,7 @@ pub enum PacketID {
     // Retrobution (FFOne) extension
     P_CL2FE_REQ_PC_BARBER_OPEN = 0x130000a5,
     P_CL2FE_REQ_PC_BARBER_CONFIRM = 0x130000a6,
+    P_CL2FE_REQ_AMBIENT_BARK = 0x130000a8,
     P_CL2FE_REQ_PRESENT_NPC_TYPES = 0x130000a7, // 318767271
 
     P_FE2CL_ERROR = 0x31000000,                                // 822083584
@@ -701,6 +702,12 @@ pub enum PacketID {
     P_FE2CL_REP_PC_BARBER_CONFIRM = 0x31000139,
     P_FE2CL_PC_CHANGE_STYLE = 0x3100013a,
     P_FE2CL_NPC_MAP_SNAPSHOT = 0x3100013b,
+    P_FE2CL_AMBIENT_BARK = 0x3100013d,
+    P_FE2CL_NPC_EDITOR_SETTINGS = 0x3100013c,
+    P_FE2CL_USER_VIEW = 0x3100013e,
+    P_FE2CL_COMPLETION_BRANCH = 0x3100013f,
+    P_FE2CL_NPC_SPEECH = 0x31000140,
+    P_FE2CL_NPC_MAP_INVALIDATE = 0x31000141,
     P_FE2CL_REP_PRESENT_NPC_TYPES = 0x31000137, // 822083895
 
     P_LS2CL_REP_LOGIN_SUCC = 0x21000001,            // 553648129
@@ -1339,6 +1346,27 @@ impl FFPacket for NpcMapSnapshotHeader {}
 #[derive(Debug, Copy, Clone, Default)]
 pub struct NpcMapSnapshotEntry { pub id: i32, pub npc_type: i32, pub x: i32, pub y: i32, pub z: i32 }
 impl FFPacket for NpcMapSnapshotEntry {}
+
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone)]
+pub struct NpcEditorSettings {pub id:i32,pub flags:i32,pub scale:f32}
+impl FFPacket for NpcEditorSettings {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone)]
+pub struct NativeUserView {pub enabled:i32}
+impl FFPacket for NativeUserView {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone)]
+pub struct NativeCompletionBranch {pub task:i32,pub variant:i32,pub npc:i32,pub next_task:i32}
+impl FFPacket for NativeCompletionBranch {}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone)]
+pub struct NativeNpcSpeech{pub npc:i32,pub kind:i32,pub line:i32}
+impl FFPacket for NativeNpcSpeech{}
+#[repr(C, packed(4))]
+#[derive(Debug, Copy, Clone)]
+pub struct NativeMapInvalidation{pub revision:i32}
+impl FFPacket for NativeMapInvalidation{}
 #[repr(C, packed(4))]
 #[derive(Debug, Copy, Clone, Default)]
 pub struct BarberOpenRequest { pub npc_id: i32 }
@@ -1363,3 +1391,9 @@ impl FFPacket for BarberReply {}
 #[derive(Debug, Copy, Clone, Default)]
 pub struct BarberStyleBroadcast { pub pc_id: i32, pub style: sPCStyle }
 impl FFPacket for BarberStyleBroadcast {}
+
+#[repr(C,packed(4))]
+#[derive(Debug,Copy,Clone)]
+pub struct NativeAmbientBark {pub npc_id:i32,pub set:i32,pub line:i32}
+
+impl FFPacket for NativeAmbientBark {}

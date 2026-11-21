@@ -109,6 +109,17 @@ impl PostgresDatabase {
         }
 
         Self::exec(&mut db_client, "create_redeemed_codes", &[]).await?;
+        Self::exec(&mut db_client,"create_native_mission_state",&[]).await?;
+        let has_count: bool = db_client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'players'::regclass AND attname = 'mentorcount' AND NOT attisdropped)",
+                &[],
+            )
+            .await?
+            .get(0);
+        if !has_count {
+            Self::exec(&mut db_client, "migrate_mentor_count", &[]).await?;
+        }
         Ok(Self {
             pool,
             config: db_config,
@@ -185,6 +196,7 @@ impl PostgresDatabase {
         let save_nano = Self::prep(client, "save_nano").await?;
         let save_running_quest = Self::prep(client, "save_running_quest").await?;
         let pc_uid = player.get_uid();
+        Self::exec(client,"save_native_mission_state",&[&pc_uid,&player.native_stage.serialize()?]).await?;
 
         let position = if player.instance_id.instance_num.is_some() {
             player.get_pre_warp().position
@@ -224,6 +236,7 @@ impl PostgresDatabase {
                     .completed_mission_flags
                     .to_bytes()
                     .as_slice(),
+                &Int::from(player.get_guide_count()),
             ],
         )
         .await?;
@@ -403,10 +416,7 @@ impl PostgresDatabase {
         player.flags = player_flags;
 
         let guide: PlayerGuide = (row.get::<_, Int>("Mentor") as i16).try_into()?;
-        // TODO get total number of guides from DB (currently not stored)
-        if guide != PlayerGuide::Computress {
-            player.update_guide(guide);
-        }
+        player.restore_guide(guide, row.try_get("MentorCount")?)?;
 
         let skyway_bytes: &[u8] = row.get("SkywayLocationFlag");
         player.flags.skyway_flags =
@@ -421,8 +431,10 @@ impl PostgresDatabase {
         let quest_bytes: &[u8] = row.get("Quests");
         player.mission_journal.completed_mission_flags =
             Bitfield::from_bytes(quest_bytes, SIZEOF_QUESTFLAG_NUMBER as usize)?;
+        player.restore_tutorial_missions();
 
         let running_quests = Self::query(client, "load_running_quests", &[&pc_uid]).await?;
+        if let Some(row)=Self::query(client,"load_native_mission_state",&[&pc_uid]).await?.first(){player.native_stage=crate::mission_stage::PlayerStage::load(row.get::<_,&str>("state"))?;}
         for quest in running_quests {
             let task_id: Int = quest.get("TaskID");
             let task_def = tdata_get().get_task_definition(task_id)?;
@@ -430,6 +442,7 @@ impl PostgresDatabase {
             let npc_count_2: Int = quest.get("RemainingNPCCount2");
             let npc_count_3: Int = quest.get("RemainingNPCCount3");
             let mut task: Task = task_def.into();
+            if let Some(branch)=player.native_stage.branches.get(&task_id){task.completed=true;task.completion_branch=Some(*branch);}
             task.fail_time = None;
             task.set_remaining_enemy_defeats([
                 npc_count_1 as usize,

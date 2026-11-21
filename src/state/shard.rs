@@ -346,6 +346,7 @@ impl ShardServerState {
     }
 
     pub fn tick_entities(&mut self, time: SystemTime) {
+        crate::skills::refresh_group_auras(self);
         let eids: Vec<EntityID> = self.entity_map.get_tickable_ids().collect();
         for eid in eids {
             self.tick_entity(eid, &time);

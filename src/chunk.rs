@@ -256,6 +256,13 @@ impl EntityMap {
     }
 
     pub fn validate_proximity(&self, ids: &[EntityID], range: u32) -> FFResult<()> {
+        for observer in ids.iter().filter_map(|id| self.registry.get(id)).filter(|e| matches!(e.entity.get_id(), EntityID::Player(_))) {
+            for target in ids.iter().filter_map(|id| self.registry.get(id)) {
+                if !target.entity.visible_to(observer.entity.as_ref()) {
+                    return Err(FFError::build(Severity::Warning, "Hidden NPC is not available to this player".into()));
+                }
+            }
+        }
         let mut locations = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(entry) = self.registry.get(id) {
@@ -418,7 +425,7 @@ impl EntityMap {
             if let Some(from_client) = from.get_client() {
                 // possible for the ID to be unregistered if the instance was cleaned up
                 if let Some(to) = self.get_entity_raw(*e) {
-                    to.send_exit(&from_client);
+                    if to.visible_to(from) {to.send_exit(&from_client);}
                 }
             }
 
@@ -427,7 +434,7 @@ impl EntityMap {
             if let Some(from) = self.get_entity_raw(*e) {
                 if let Some(from_client) = from.get_client() {
                     let to = self.get_entity_raw(id).unwrap();
-                    to.send_exit(&from_client);
+                    if to.visible_to(from) {to.send_exit(&from_client);}
                 }
             }
         }
@@ -438,14 +445,14 @@ impl EntityMap {
             let from = self.get_entity_raw(id).unwrap();
             if let Some(from_client) = from.get_client() {
                 let to = self.get_entity_raw(*e).unwrap();
-                to.send_enter(&from_client);
+                if to.visible_to(from) {to.send_enter_for(&from_client,from);}
             }
 
             // them to us
             let from = self.get_entity_raw(*e).unwrap();
             if let Some(from_client) = from.get_client() {
                 let to = self.get_entity_raw(id).unwrap();
-                to.send_enter(&from_client);
+                if to.visible_to(from) {to.send_enter_for(&from_client,from);}
             }
         }
 
@@ -473,7 +480,7 @@ impl EntityMap {
         for eid in self.get_around_entity(id).iter() {
             let e = self.registry.get(eid).unwrap().entity.as_ref();
             if let Some(client) = e.get_client() {
-                f(&client);
+                if self.registry.get(&id).is_some_and(|source| source.entity.visible_to(e)) {f(&client);}
             }
         }
     }
@@ -674,6 +681,12 @@ impl EntityMap {
                 map_num: instance_id.map_num,
                 instance_num: None,
             };
+            // Empty authored maps have no NPC template chunks at startup.
+            // OpenFusion's createInstance copies an empty template list in this
+            // case; the player's private chunk map still has a valid lifetime.
+            if !self.chunk_maps.contains_key(&main_instance) {
+                return self.chunk_maps.get_mut(&instance_id).unwrap();
+            }
             let mut npc_count = 0;
             let mut id_mappings = HashMap::new();
             let mut tight_follow_mappings = HashMap::new();
@@ -918,6 +931,33 @@ mod tests {
         let map = EntityMap::default();
         assert_eq!(map.get_num_loaded_chunks(), 0);
         assert_eq!(map.get_num_loaded_entities(), 0);
+    }
+
+    #[test]
+    fn empty_private_instance_loads_cleans_up_and_can_be_entered_again() {
+        let mut map = EntityMap::default();
+        let instance = InstanceID {
+            channel_num: 1,
+            map_num: 1,
+            instance_num: Some(7),
+        };
+        let player = MockEntity::new_player(1, pos_for_chunk(64, 64), instance);
+        let (player_id, chunk) = place_entity(&mut map, player);
+        assert_eq!(map.get_num_base_instances(), 0);
+        assert_eq!(map.get_num_instances(), 1);
+        assert_eq!(map.get_num_loaded_chunks(), 9);
+        assert_eq!(map.get_num_loaded_entities(), 1);
+
+        map.update(player_id, None, false);
+        assert_eq!(map.get_num_loaded_chunks(), 0);
+        assert!(map.garbage_collect_instances().is_empty());
+        assert_eq!(map.get_num_instances(), 0);
+
+        map.update(player_id, Some(chunk), false);
+        assert_eq!(map.get_num_base_instances(), 0);
+        assert_eq!(map.get_num_instances(), 1);
+        assert_eq!(map.get_num_loaded_chunks(), 9);
+        assert_eq!(map.get_num_loaded_entities(), 1);
     }
 
     #[test]

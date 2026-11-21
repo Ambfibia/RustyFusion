@@ -45,6 +45,21 @@ fn snare_slows_an_existing_mob_path_and_removal_restores_it() {
 }
 
 #[test]
+fn snare_on_player_uses_the_authored_slow_until_removal() {
+    let npc_id = 2_000_000_194;
+    let (mut state, _) = fixture(npc_id);
+    let skill = tdata_get().get_skill(171).unwrap();
+    let base_speed = state.get_player(PC_ID).unwrap().get_speed(true);
+    do_skill(EntityID::NPC(npc_id), &[EntityID::Player(PC_ID)], skill, 0, &mut state).unwrap();
+
+    let player = state.get_player_mut(PC_ID).unwrap();
+    assert_ne!(player.get_condition_bit_flag() & (1 << 7), 0);
+    assert_eq!(player.get_speed(true), base_speed - skill.values_a[0]);
+    player.remove_buff(BuffID::DnMoveSpeed, None);
+    assert_eq!(player.get_speed(true), base_speed);
+}
+
+#[test]
 fn numbuh_two_eruption_hits_the_pinned_ground_and_can_be_avoided_or_cancelled() {
     let npc_id = 2_000_000_191;
     let (mut state, mut rx) = fixture(npc_id);
@@ -73,6 +88,32 @@ fn numbuh_two_eruption_hits_the_pinned_ground_and_can_be_avoided_or_cancelled() 
     assert!(!crate::eruption::finish(npc_id, &mut state).unwrap());
     assert_eq!(count(&drain(&mut rx), P_FE2CL_NPC_SKILL_CANCEL), 1);
     assert!(state.get_npc(npc_id).unwrap().eruption.is_none());
+    crate::corruption::FORCED_ROLL.with(|r| r.set(None));
+}
+
+#[test]
+fn mission_3337_avoided_mega_emits_exact_empty_npc_hit_frame() {
+    let npc_id = 2_000_000_193;
+    let (mut state, mut rx) = fixture(npc_id);
+    let npc = state.get_npc_mut(npc_id).unwrap();
+    npc.ty = 3337; npc.target_id = Some(EntityID::Player(PC_ID));
+    let attack = tdata_get().get_npc_stats(3337).unwrap().eruption.unwrap();
+    assert_eq!((attack.skill_id, attack.prob), (176, 100_000));
+    crate::corruption::FORCED_ROLL.with(|r| r.set(Some(0)));
+    assert!(crate::eruption::try_begin(npc_id, &mut state).unwrap());
+    let mut escaped = state.get_player(PC_ID).unwrap().get_position(); escaped.x += 400;
+    state.get_player_mut(PC_ID).unwrap().set_position(escaped);
+    let hp = state.get_player(PC_ID).unwrap().get_hp();
+    assert!(crate::eruption::finish(npc_id, &mut state).unwrap());
+    assert_eq!(state.get_player(PC_ID).unwrap().get_hp(), hp);
+    let packets = drain(&mut rx);
+    let hits: Vec<_> = packets.iter().filter(|p| p.id() == P_FE2CL_NPC_SKILL_HIT).collect();
+    assert_eq!(hits.len(), 1);
+    let packet = hits[0];
+    let hit = *packet.get::<sP_FE2CL_NPC_SKILL_HIT>().unwrap();
+    assert_eq!(({hit.iNPC_ID}, {hit.iSkillID}, {hit.eST}, {hit.iTargetCnt}), (npc_id, 176, 1, 0));
+    assert_eq!(size_of::<sP_FE2CL_NPC_SKILL_HIT>(), 28);
+    assert_eq!(packet.read_bytes().len(), 4 + 28); // ID + header, no result trailer
     crate::corruption::FORCED_ROLL.with(|r| r.set(None));
 }
 

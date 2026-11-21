@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use rand::seq::IteratorRandom;
 
 use crate::{
-    entity::{EntityID, Entity},
+    entity::{EntityID, Entity, Combatant},
     error::*,
     net::{
         packet::{PacketID::*, *},
@@ -22,6 +22,10 @@ pub fn npc_interaction(
     let pc_id = client.get_player_id()?;
     let npc_id = pkt.iNPC_ID;
 
+    let observer=state.get_player(pc_id)?;
+    if pkt.bFlag!=0{state.entity_map.validate_proximity(&[EntityID::Player(pc_id),EntityID::NPC(npc_id)],crate::defines::RANGE_INTERACT)?;}
+    if pkt.bFlag!=0 && !state.get_npc(npc_id)?.interactable {return Err(FFError::build(Severity::Warning,"NPC interaction is disabled".into()));}
+    if !state.get_npc(npc_id)?.visible_to(observer) {return Err(FFError::build(Severity::Warning,"Hidden NPC interaction rejected".into()));}
     let npc = state.get_npc_mut(npc_id)?;
     if pkt.bFlag == 0 {
         if !npc.interacting_pcs.remove(&pc_id) {
@@ -43,6 +47,7 @@ pub fn npc_interaction(
         );
     }
 
+    if pkt.bFlag!=0{native_speech(client,state,npc_id,0)?;}
     Ok(())
 }
 
@@ -72,7 +77,7 @@ pub fn npc_bark(pkt: Packet, client: &FFClient, state: &mut ShardServerState) ->
         if let EntityID::NPC(npc_id) = npc_id {
             let npc = state.get_npc(npc_id).unwrap();
             let npc_stats = tdata_get().get_npc_stats(npc.ty).unwrap();
-            if npc_stats.bark_type.is_some_and(|bt| bt <= barks.len()) {
+            if npc.visible_to(state.get_player(pc_id)?) && npc_stats.bark_type.is_some_and(|bt| bt <= barks.len()) {
                 compatible_barks.push((npc_id, npc_stats.bark_type.unwrap() - 1));
             }
         }
@@ -129,10 +134,11 @@ pub fn present_npc_types(
     }
     player.last_npc_type_sync = Some(now);
     let instance_id = player.instance_id;
+    let observer=state.get_player(pc_id)?;
 
     let npc_ids = state
         .entity_map
-        .find_npcs(|npc| npc.instance_id == instance_id);
+        .find_npcs(|npc| npc.ty > 0 && npc.instance_id == instance_id && npc.visible_to(observer));
     let mut npc_types: Vec<i32> = npc_ids
         .into_iter()
         .filter_map(|npc_id| state.get_npc(npc_id).ok().map(|npc| npc.ty))
@@ -172,8 +178,7 @@ pub fn present_npc_types(
 
     // The type list cannot express moved/added JSON placements. Publish a complete,
     // instance-scoped friendly-NPC snapshot using bounded ordered chunks.
-    let mut entries: Vec<_> = state.entity_map.find_npcs(|npc| npc.instance_id == instance_id
-        && npc.team != crate::enums::CombatantTeam::Mob).into_iter()
+    let mut entries: Vec<_> = state.entity_map.find_npcs(|npc| npc.ty > 0 && npc.instance_id == instance_id && npc.map_icon && npc.visible_to(observer)).into_iter()
         .filter_map(|id| state.get_npc(id).ok().map(|npc| {
             let pos=npc.get_position();
             NpcMapSnapshotEntry { id:npc.id, npc_type:npc.ty, x:pos.x, y:pos.y, z:pos.z }
@@ -189,4 +194,36 @@ pub fn present_npc_types(
     }
 
     Ok(())
+}
+
+/// A client schedules the attempt; the shard approves the speaker and picks the line.
+pub fn ambient_bark(pkt:Packet,client:&FFClient,state:&mut ShardServerState)->FFResult<()> {
+    let request=*pkt.get::<NativeAmbientBark>()?;let pc=client.get_player_id()?;
+    state.entity_map.validate_proximity(&[EntityID::Player(pc),EntityID::NPC(request.npc_id)],1000)?;
+    let npc=state.get_npc(request.npc_id)?;let player=state.get_player(pc)?;
+    if npc.is_dead()||!npc.visible_to(player){return Ok(());}
+    let npc_type=npc.ty;
+    if tdata_get().get_npc_speech(npc_type).is_some_and(|s|s.use_background){return native_speech(client,state,request.npc_id,1);}
+    let Some(set)=tdata_get().get_npc_ambient(npc_type)?.iter().find(|s|s.set==request.set && s.conditions.allows(player))else{return Ok(());};
+    let now=Instant::now();
+    if player.ambient_attempts.get(&request.npc_id).is_some_and(|at|now.duration_since(*at)<Duration::from_secs(15)){return Ok(());}
+    let lines=(0..4).filter(|&slot|!set.lines[slot].trim().is_empty()&&player.ambient_lines.get(&(set.set*4+slot as i32)).is_none_or(|at|now.duration_since(*at)>=Duration::from_secs(600)));
+    let Some(slot)=lines.choose(&mut rand::thread_rng())else{return Ok(());};
+    let player=state.get_player_mut(pc)?;
+    player.ambient_attempts.insert(request.npc_id,now);
+    player.ambient_lines.insert(set.set*4+slot as i32,now);
+    player.recent_barks.insert((npc_type,set.set*4+slot as i32),now);
+    client.send_packet(P_FE2CL_AMBIENT_BARK,&NativeAmbientBark {npc_id:request.npc_id,set:set.set,line:slot as i32});Ok(())
+}
+fn native_speech(client:&FFClient,state:&mut ShardServerState,id:i32,kind:i32)->FFResult<()>{
+    let pc=client.get_player_id()?;let player=state.get_player(pc)?;let npc=state.get_npc(id)?;
+    let Some(speech)=tdata_get().get_npc_speech(npc.ty).filter(|s|if kind==0{s.use_click}else{s.use_background})else{return Ok(());};
+    if !npc.visible_to(player){return Ok(());}
+    let now=Instant::now();let cooldown=if kind==0{1}else{15};
+    if player.native_speech_until.get(&(id,kind)).is_some_and(|until|*until>now){return Ok(());}
+    if player.ambient_attempts.get(&id).is_some_and(|at|now.duration_since(*at)<Duration::from_secs(cooldown)){return Ok(());}
+    let lines=if kind==0{&speech.click}else{&speech.background};
+    let Some(line)=lines.iter().filter(|line|(!line.en.trim().is_empty()||!line.ru.trim().is_empty())&&crate::mission_stage::conditions_allowed(player,&line.conditions)&&(kind==0||player.ambient_lines.get(&line.id).is_none_or(|at|now.duration_since(*at)>=Duration::from_secs(600)))).choose(&mut rand::thread_rng())else{return Ok(());};
+    let ty=npc.ty;let player=state.get_player_mut(pc)?;player.ambient_attempts.insert(id,now);player.ambient_lines.insert(line.id,now);player.recent_barks.insert((ty,line.id),now);player.native_speech_until.insert((id,kind),now+Duration::from_secs(u64::from(line.pause_seconds).max(cooldown)));
+    client.send_packet(P_FE2CL_NPC_SPEECH,&NativeNpcSpeech{npc:id,kind,line:line.id});Ok(())
 }

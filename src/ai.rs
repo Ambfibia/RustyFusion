@@ -100,6 +100,25 @@ pub fn return_home(npc_id: i32, state: &mut ShardServerState) -> FFResult<()> {
     Ok(())
 }
 
+/// Original ActiveSkill1 is a targeted strike alongside Mega, corruption and the basic attack.
+/// The caller has already rolled the latter two specials. Normalize against their remaining weight.
+pub fn try_active_skill(npc_id: i32, state: &mut ShardServerState) -> FFResult<bool> {
+    let npc = state.get_npc(npc_id)?;
+    let stats = tdata_get().get_npc_stats(npc.ty)?;
+    let (Some(attack), Some(EntityID::Player(target))) = (stats.active_skill, npc.target_id) else { return Ok(false); };
+    let remaining = 2_000_000 - stats.corruption.map_or(0, |x| x.prob) - stats.eruption.map_or(0, |x| x.prob);
+    if remaining <= 0 || i64::from(crate::corruption::roll()) * i64::from(remaining) >= i64::from(attack.prob) * 2_000_000 {
+        return Ok(false);
+    }
+    let skill = tdata_get().get_skill(attack.skill_id)?;
+    let player = state.get_player(target)?;
+    if player.is_dead() || skill.get_buff_id().is_some_and(|buff| player.has_buff(buff, None)) { return Ok(true); }
+    let position = player.get_position();
+    let results = skills::do_skill(EntityID::NPC(npc_id), &[EntityID::Player(target)], skill, 0, state)?;
+    crate::eruption::broadcast_hit(npc_id, attack.skill_id, position, skill.skill_type as i32, results, state)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 #[path = "ai_tests.rs"]
 mod tests;

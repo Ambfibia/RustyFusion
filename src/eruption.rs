@@ -130,7 +130,7 @@ pub fn finish(npc_id: i32, state: &mut ShardServerState) -> FFResult<bool> {
     Ok(true)
 }
 
-fn broadcast_hit(
+pub(crate) fn broadcast_hit(
     npc_id: i32,
     skill_id: i16,
     position: Position,
@@ -150,6 +150,7 @@ fn broadcast_hit(
     for result in results {
         match result {
             SkillResult::Damage(r) => packet.push(&r),
+            SkillResult::Leech(r) => packet.push(&r),
             SkillResult::DotDamage(r) => packet.push(&r),
             SkillResult::HealHP(r) => packet.push(&r),
             SkillResult::HealStamina(r) => packet.push(&r),
